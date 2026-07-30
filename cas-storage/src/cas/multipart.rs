@@ -3,7 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::metastore::{BLOCKID_SIZE, BaseMetaTree, BlockID, FsError, MetaError, PTR_SIZE};
+use crate::metastore::{
+    BLOCKID_SIZE, BaseMetaTree, BlockID, CONTENT_HASH_SIZE, ContentHash, FsError, MetaError,
+    PTR_SIZE,
+};
 
 #[derive(Debug)]
 pub struct MultiPart {
@@ -12,7 +15,7 @@ pub struct MultiPart {
     bucket: String,
     key: String,
     upload_id: String,
-    hash: BlockID,
+    hash: ContentHash,
     blocks: Vec<BlockID>,
 }
 
@@ -23,7 +26,7 @@ impl MultiPart {
         bucket: String,
         key: String,
         upload_id: String,
-        hash: BlockID,
+        hash: ContentHash,
         blocks: Vec<BlockID>,
     ) -> Self {
         Self {
@@ -41,6 +44,17 @@ impl MultiPart {
         &self.blocks
     }
 
+    /// MD5 digest of this part's content -- the part's ETag, and one input to
+    /// the completed object's multipart ETag.
+    pub fn hash(&self) -> ContentHash {
+        self.hash
+    }
+
+    /// Size of this part in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.into()
     }
@@ -54,7 +68,8 @@ impl From<&MultiPart> for Vec<u8> {
                 + mp.bucket.len()
                 + mp.key.len()
                 + mp.upload_id.len()
-                + (1 + mp.blocks.len()) * BLOCKID_SIZE,
+                + CONTENT_HASH_SIZE
+                + mp.blocks.len() * BLOCKID_SIZE,
         );
 
         out.extend_from_slice(&mp.size.to_le_bytes());
@@ -65,7 +80,7 @@ impl From<&MultiPart> for Vec<u8> {
         out.extend_from_slice(mp.key.as_bytes());
         out.extend_from_slice(&mp.upload_id.len().to_le_bytes());
         out.extend_from_slice(mp.upload_id.as_bytes());
-        out.extend_from_slice(&mp.hash);
+        out.extend_from_slice(mp.hash.as_slice());
         out.extend_from_slice(&mp.blocks.len().to_le_bytes());
         for block in &mp.blocks {
             out.extend_from_slice(block);
@@ -79,7 +94,7 @@ impl TryFrom<&[u8]> for MultiPart {
     type Error = FsError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let needed = 5 * PTR_SIZE + 8 + BLOCKID_SIZE;
+        let needed = 5 * PTR_SIZE + 8 + CONTENT_HASH_SIZE;
         if value.len() < needed {
             return Err(FsError::Truncated {
                 record: "MultiPart",
@@ -142,7 +157,7 @@ impl TryFrom<&[u8]> for MultiPart {
                 .try_into()
                 .unwrap(),
         );
-        let needed = 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE;
+        let needed = 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE;
         if value.len() < needed {
             return Err(FsError::Truncated {
                 record: "MultiPart",
@@ -163,8 +178,8 @@ impl TryFrom<&[u8]> for MultiPart {
         // ---- tfstor-extension: END ----
 
         let block_len = usize::from_le_bytes(
-            value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE
-                ..8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE]
+            value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE
+                ..8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE]
                 .try_into()
                 .unwrap(),
         );
@@ -173,7 +188,8 @@ impl TryFrom<&[u8]> for MultiPart {
             + bucket_len
             + key_len
             + upload_id_len
-            + (1 + block_len) * BLOCKID_SIZE;
+            + CONTENT_HASH_SIZE
+            + block_len * BLOCKID_SIZE;
         if value.len() < needed {
             return Err(FsError::Truncated {
                 record: "MultiPart",
@@ -182,7 +198,8 @@ impl TryFrom<&[u8]> for MultiPart {
             });
         }
         let mut blocks = Vec::with_capacity(block_len);
-        for chunk in value[8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE..]
+        for chunk in value
+            [8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE..]
             .chunks_exact(BLOCKID_SIZE)
         {
             blocks.push(chunk.try_into().unwrap());
@@ -194,10 +211,12 @@ impl TryFrom<&[u8]> for MultiPart {
             bucket,
             key,
             upload_id,
-            hash: value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len
-                ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE]
-                .try_into()
-                .unwrap(),
+            hash: ContentHash(
+                value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len
+                    ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ),
             blocks,
         })
     }

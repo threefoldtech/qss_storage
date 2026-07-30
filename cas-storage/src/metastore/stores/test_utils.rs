@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::metastore::{BaseMetaTree, BlockID, MetaError, MetaTreeExt, Object, ObjectData};
+use crate::metastore::{
+    BaseMetaTree, BlockID, ContentHash, MetaError, MetaTreeExt, Object, ObjectData,
+};
 
 pub trait TestStore {
     fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError>;
@@ -82,7 +84,7 @@ pub fn test_num_keys(store: &impl TestStore) {
     for key in &test_keys {
         let obj = Object::new(
             1024,
-            BlockID::from([1; 16]),
+            ContentHash::from([1; 16]),
             ObjectData::SinglePart {
                 blocks: vec![BlockID::from([1; 16])],
             },
@@ -108,7 +110,7 @@ pub fn test_get_bucket_keys(store: &impl TestStore) {
     for key in &test_keys {
         let obj = Object::new(
             1024,
-            BlockID::from([1; 16]),
+            ContentHash::from([1; 16]),
             ObjectData::SinglePart {
                 blocks: vec![BlockID::from([1; 16])],
             },
@@ -154,7 +156,7 @@ pub fn test_range_filter(store: &impl TestStore) {
     for (key, data) in &test_data {
         let obj = Object::new(
             data.len() as u64,
-            BlockID::from([1; 16]),
+            ContentHash::from([1; 16]),
             ObjectData::SinglePart {
                 blocks: vec![BlockID::from([1; 16])],
             },

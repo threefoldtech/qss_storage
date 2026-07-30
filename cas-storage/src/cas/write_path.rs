@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::buffered_byte_stream::BufferedByteStream;
 use super::byte_stream::AsyncByteStream;
 use super::fs::CasFS;
-use crate::metastore::{BlockID, MetaError, Object, ObjectData};
+use crate::metastore::{BlockID, ContentHash, MetaError, Object, ObjectData};
 use crate::metrics::SharedMetrics;
 use faster_hex::hex_string;
 use futures::{
@@ -75,7 +75,7 @@ pub(super) async fn store_object(
     bucket_name: &str,
     key: &str,
     data: AsyncByteStream,
-) -> io::Result<(Vec<BlockID>, BlockID, u64)> {
+) -> io::Result<(Vec<BlockID>, ContentHash, u64)> {
     let old_obj_meta = match fs.get_object_meta(bucket_name, key) {
         Ok(Some(obj_meta)) => Some(obj_meta),
         _ => None,
@@ -229,7 +229,7 @@ pub(super) async fn store_object(
     tracing::Span::current().record("size", size);
     tracing::Span::current().record("blocks", blocks.len());
 
-    Ok((blocks, content_hash.finalize().into(), size))
+    Ok((blocks, ContentHash(content_hash.finalize().into()), size))
 }
 
 pub(super) async fn store_single_object_and_meta(
@@ -243,7 +243,10 @@ pub(super) async fn store_single_object_and_meta(
         store_object(fs, bucket_name, key, data).await?
     } else {
         tracing::warn!(%key, "Skipping store for empty blob");
-        (Vec::new(), [0; 16], 0)
+        // An empty object still has a content hash: the MD5 of no bytes,
+        // which is the ETag d41d8cd98f00b204e9800998ecf8427e that clients
+        // expect for a zero-length object.
+        (Vec::new(), ContentHash(Md5::digest(b"").into()), 0)
     };
     let obj = fs
         .create_object_meta(
@@ -263,7 +266,7 @@ pub(super) fn store_inlined_object(
     key: &str,
     data: Vec<u8>,
 ) -> Result<Object, MetaError> {
-    let content_hash = Md5::digest(&data).into();
+    let content_hash = ContentHash(Md5::digest(&data).into());
     let size = data.len() as u64;
     fs.create_object_meta(
         bucket_name,

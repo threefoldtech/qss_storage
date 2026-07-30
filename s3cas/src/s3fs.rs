@@ -28,7 +28,7 @@ use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 
 use crate::metrics::SharedMetrics;
-use cas_storage::{BlockID, ObjectData};
+use cas_storage::{BlockID, ContentHash, MultiPart, ObjectData};
 use cas_storage::{BlockStream, CasFS, parse_range_request};
 
 const MAX_KEYS: i32 = 1000;
@@ -53,27 +53,25 @@ impl S3FS {
 
         Self { casfs, metrics }
     }
+}
 
-    // Compute the e_tag of the multpart upload. Per the S3 standard (according to minio), the
-    // e_tag of a multipart uploaded object is the Md5 of the Md5 of the parts.
-    fn calculate_multipart_hash(&self, blocks: &[BlockID]) -> io::Result<([u8; 16], usize)> {
-        let mut hasher = Md5::new();
-        let mut size = 0;
-        let block_map = self.casfs.block_tree()?;
+/// Compute the content hash and total size of a completed multipart upload.
+///
+/// Per the S3 convention the ETag of a multipart object is the MD5 of the
+/// concatenated MD5 digests of the parts -- not of the object bytes, and not
+/// of the block addresses. Each part's digest is already stored in its
+/// `MultiPart` record by `upload_part`. The "-{part count}" suffix that
+/// completes the ETag is added by `Object::format_e_tag`.
+fn calculate_multipart_hash(parts: &[MultiPart]) -> (ContentHash, u64) {
+    let mut hasher = Md5::new();
+    let mut size: u64 = 0;
 
-        for block in blocks {
-            let block_info = match block_map.get_block(block).expect("Block data is corrupt") {
-                Some(block_info) => block_info,
-                None => {
-                    return Err(io::Error::new(io::ErrorKind::NotFound, "Block  not found"));
-                }
-            };
-            size += block_info.size();
-            hasher.update(block);
-        }
-
-        Ok((hasher.finalize().into(), size))
+    for part in parts {
+        hasher.update(part.hash().as_slice());
+        size += part.size() as u64;
     }
+
+    (ContentHash(hasher.finalize().into()), size)
 }
 
 fn fmt_content_range(start: u64, end_inclusive: u64, size: u64) -> String {
@@ -101,7 +99,7 @@ impl S3 for S3FS {
             return Err(err);
         };
 
-        let mut blocks = vec![];
+        let mut parts = vec![];
         let mut cnt: i32 = 0;
         for part in multipart_upload.parts.iter().flatten() {
             // validate part number
@@ -134,19 +132,23 @@ impl S3 for S3FS {
                     return Err(s3_error!(InvalidArgument, "Part not uploaded"));
                 }
             };
-            blocks.extend_from_slice(mp.blocks());
+            parts.push(mp);
         }
 
-        let (content_hash, size) = try_!(self.calculate_multipart_hash(&blocks));
+        let (content_hash, size) = calculate_multipart_hash(&parts);
+        let blocks: Vec<BlockID> = parts
+            .iter()
+            .flat_map(|mp| mp.blocks().iter().copied())
+            .collect();
 
         let object_meta = try_!(self.casfs.create_object_meta(
             &bucket,
             &key,
-            size as u64,
+            size,
             content_hash,
             ObjectData::MultiPart {
                 blocks,
-                parts: cnt as usize
+                parts: parts.len()
             },
         ));
 
@@ -718,7 +720,7 @@ impl S3 for S3FS {
             blocks
         ));
 
-        let e_tag = ETag::Strong(hex_string(&hash));
+        let e_tag = ETag::Strong(hash.to_hex());
 
         let output = UploadPartOutput {
             e_tag: Some(e_tag),

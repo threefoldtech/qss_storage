@@ -75,6 +75,7 @@ pub use metastore::{
     BlockID,
     BlockTree,
     BucketMeta,
+    ContentHash,
     // Storage backends
     Durability,
     FjallStore,

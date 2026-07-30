@@ -6,7 +6,8 @@
 //! scenario below measures the backend and nothing else.
 
 use cas_storage::{
-    Block, BlockID, BucketMeta, FjallStore, FjallStoreNotx, MetaStore, Object, ObjectData,
+    Block, BlockID, BucketMeta, ContentHash, FjallStore, FjallStoreNotx, MetaStore, Object,
+    ObjectData,
 };
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::RngExt;
@@ -52,13 +53,13 @@ fn create_test_object(size: usize) -> Vec<u8> {
     }
     black_box(data);
 
-    // Create a dummy block ID
-    let block_id: BlockID = std::array::from_fn(|i| i as u8);
+    // Create a dummy content hash
+    let content_hash = ContentHash(std::array::from_fn(|i| i as u8));
 
     // Create object with SinglePart data
     let obj = Object::new(
         size as u64,
-        block_id,
+        content_hash,
         ObjectData::SinglePart { blocks: vec![] },
     );
     obj.to_vec()

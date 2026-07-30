@@ -8,7 +8,7 @@ use md5::{Digest, Md5};
 use tracing::debug;
 
 use crate::storage::{Storage, StorageError};
-use cas_storage::{MetaError, MetaTreeExt, Object, ObjectData};
+use cas_storage::{ContentHash, MetaError, MetaTreeExt, Object, ObjectData};
 
 /// Properties for a namespace
 #[derive(Debug, Clone)]
@@ -243,7 +243,7 @@ impl Namespace {
 
         // Proceed with setting the key
         let data = value.to_vec();
-        let hash = Md5::digest(&data).into();
+        let hash = ContentHash(Md5::digest(&data).into());
         let size = data.len() as u64;
         let obj_meta = Object::new(size, hash, ObjectData::Inline { data });
         self.tree.read().unwrap().insert(key, obj_meta.to_vec())?;
@@ -337,7 +337,7 @@ impl Namespace {
             Some(obj) => {
                 if let Some(data) = obj.inlined() {
                     // check the hash
-                    let hash: [u8; 16] = Md5::digest(data).into();
+                    let hash = ContentHash(Md5::digest(data).into());
                     if hash != *obj.hash() {
                         Ok(Some(false))
                     } else {

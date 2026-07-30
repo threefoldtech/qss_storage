@@ -5,9 +5,8 @@ use std::{
 };
 
 use chrono::{SecondsFormat, TimeZone, Utc};
-use faster_hex::hex_string;
 
-use super::{BLOCKID_SIZE, BlockID, FsError, PTR_SIZE};
+use super::{BLOCKID_SIZE, BlockID, CONTENT_HASH_SIZE, ContentHash, FsError, PTR_SIZE};
 
 /// Represents an object in the storage system with its metadata and content (for Inline objects).
 ///
@@ -26,8 +25,8 @@ pub struct Object {
     size: u64,
     /// Creation time as a Unix timestamp (seconds since epoch)
     ctime: i64,
-    /// Unique hash identifier for the object
-    hash: BlockID,
+    /// MD5 digest of the object's content (the S3 ETag source)
+    hash: ContentHash,
     /// The actual data or references to data blocks
     data: ObjectData,
 }
@@ -103,12 +102,12 @@ impl Object {
     ///
     /// # Arguments
     /// * `size` - Total size of the object in bytes
-    /// * `hash` - Unique hash identifier for the object
+    /// * `hash` - MD5 content digest of the object (the ETag source)
     /// * `object_data` - The data storage strategy and content/references
     ///
     /// # Returns
     /// A new Object instance
-    pub fn new(size: u64, hash: BlockID, object_data: ObjectData) -> Self {
+    pub fn new(size: u64, hash: ContentHash, object_data: ObjectData) -> Self {
         let object_type = match &object_data {
             ObjectData::SinglePart { .. } => ObjectType::Single,
             ObjectData::MultiPart { .. } => ObjectType::Multipart,
@@ -149,17 +148,17 @@ impl Object {
     /// A formatted ETag string
     pub fn format_e_tag(&self) -> String {
         if let ObjectData::MultiPart { parts, .. } = &self.data {
-            format!("{}-{}", hex_string(&self.hash), parts)
+            format!("{}-{}", self.hash.to_hex(), parts)
         } else {
-            hex_string(&self.hash)
+            self.hash.to_hex()
         }
     }
 
-    /// Returns the unique hash identifier of the object.
+    /// Returns the MD5 content digest of the object.
     ///
     /// # Returns
-    /// A reference to the object's BlockID (hash)
-    pub fn hash(&self) -> &BlockID {
+    /// A reference to the object's ContentHash (the ETag source)
+    pub fn hash(&self) -> &ContentHash {
         &self.hash
     }
 
@@ -232,7 +231,7 @@ impl Object {
     /// # Returns
     /// The number of bytes needed for serialization
     fn num_bytes(&self) -> usize {
-        let mandatory_fields_size = 17 + BLOCKID_SIZE;
+        let mandatory_fields_size = 17 + CONTENT_HASH_SIZE;
         match &self.data {
             ObjectData::SinglePart { blocks } => {
                 mandatory_fields_size + PTR_SIZE + (blocks.len() * BLOCKID_SIZE)
@@ -286,7 +285,7 @@ impl Object {
 /// - 1 byte for object type
 /// - 8 bytes for size
 /// - 8 bytes for creation time
-/// - BLOCKID_SIZE bytes for hash
+/// - CONTENT_HASH_SIZE bytes for hash
 /// - Variant-specific data based on the object type
 impl From<&Object> for Vec<u8> {
     fn from(o: &Object) -> Self {
@@ -296,7 +295,7 @@ impl From<&Object> for Vec<u8> {
         raw_data.extend_from_slice(&o.object_type.as_u8().to_le_bytes());
         raw_data.extend_from_slice(&o.size.to_le_bytes());
         raw_data.extend_from_slice(&o.ctime.to_le_bytes());
-        raw_data.extend_from_slice(&o.hash);
+        raw_data.extend_from_slice(o.hash.as_slice());
 
         // Write variant-specific data
         match &o.data {
@@ -329,7 +328,7 @@ impl From<&Object> for Vec<u8> {
 /// # Returns
 /// The minimum number of bytes needed for the common fields
 fn minimum_raw_object_size() -> usize {
-    17 + BLOCKID_SIZE + PTR_SIZE
+    17 + CONTENT_HASH_SIZE + PTR_SIZE
 }
 
 /// Maps a record whose actual length disagrees with the length its own header
@@ -384,9 +383,9 @@ impl TryFrom<&[u8]> for Object {
         let ctime = i64::from_le_bytes(value[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        // etag: BLOCKID_SIZE bytes
-        let e_tag = value[pos..pos + BLOCKID_SIZE].try_into().unwrap();
-        pos += BLOCKID_SIZE;
+        // etag: CONTENT_HASH_SIZE bytes
+        let e_tag = ContentHash(value[pos..pos + CONTENT_HASH_SIZE].try_into().unwrap());
+        pos += CONTENT_HASH_SIZE;
 
         let data = match object_type {
             ObjectType::Single | ObjectType::Multipart => {
@@ -457,7 +456,7 @@ mod tests {
                 ObjectType::Single,
                 Object::new(
                     1024,
-                    [1; BLOCKID_SIZE],
+                    ContentHash([1; CONTENT_HASH_SIZE]),
                     ObjectData::SinglePart {
                         blocks: vec![[2; BLOCKID_SIZE], [3; BLOCKID_SIZE]],
                     },
@@ -467,7 +466,7 @@ mod tests {
                 ObjectType::Multipart,
                 Object::new(
                     2048,
-                    [4; BLOCKID_SIZE],
+                    ContentHash([4; CONTENT_HASH_SIZE]),
                     ObjectData::MultiPart {
                         blocks: vec![[5; BLOCKID_SIZE], [6; BLOCKID_SIZE]],
                         parts: 2,
@@ -478,7 +477,7 @@ mod tests {
                 ObjectType::Inline,
                 Object::new(
                     5,
-                    [7; BLOCKID_SIZE],
+                    ContentHash([7; CONTENT_HASH_SIZE]),
                     ObjectData::Inline {
                         data: vec![1, 2, 3, 4, 5],
                     },

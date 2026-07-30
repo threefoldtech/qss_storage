@@ -127,6 +127,39 @@ async fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().await
 }
 
+/// The SDK hands back the ETag exactly as it appears in the header, quotes
+/// included for a strong ETag, so every assertion here strips them first.
+fn unquote_e_tag(e_tag: &str) -> &str {
+    e_tag.trim_matches('"')
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A single-part ETag is the MD5 of the object content: 32 lowercase hex
+/// digits, no suffix.
+fn assert_single_part_e_tag(e_tag: &str) {
+    let hash = unquote_e_tag(e_tag);
+    assert_eq!(hash.len(), 32, "ETag is not a 32 hex digit MD5: {e_tag:?}");
+    assert!(is_lower_hex(hash), "ETag is not lowercase hex: {e_tag:?}");
+}
+
+/// A multipart ETag is the MD5 of the concatenated part MD5s, suffixed with
+/// the number of parts: `"{32 hex}-{N}"`.
+fn assert_multipart_e_tag(e_tag: &str, expected_parts: usize) {
+    let value = unquote_e_tag(e_tag);
+    let (hash, parts) = value
+        .split_once('-')
+        .unwrap_or_else(|| panic!("multipart ETag has no part count suffix: {e_tag:?}"));
+    assert_eq!(hash.len(), 32, "ETag is not a 32 hex digit MD5: {e_tag:?}");
+    assert!(is_lower_hex(hash), "ETag is not lowercase hex: {e_tag:?}");
+    let parts: usize = parts
+        .parse()
+        .unwrap_or_else(|_| panic!("multipart ETag part count is not a number: {e_tag:?}"));
+    assert_eq!(parts, expected_parts, "wrong part count in ETag {e_tag:?}");
+}
+
 async fn create_bucket(c: &Client, bucket: &str) -> Result<()> {
     let location = BucketLocationConstraint::from(REGION);
     let cfg = CreateBucketConfiguration::builder()
@@ -179,13 +212,17 @@ async fn do_test_put_delete_object(
     {
         // put the object
         let body = ByteStream::from_static(content.as_bytes());
-        c.put_object()
+        let put = c
+            .put_object()
             .bucket(bucket)
             .key(key)
             .body(body)
             //.checksum_crc32_c(crc32c.as_str())
             .send()
             .await?;
+
+        // a single part object gets the plain MD5 of its content as ETag
+        assert_single_part_e_tag(put.e_tag().expect("put returns an ETag"));
 
         // get the object
         let ans = c
@@ -204,6 +241,28 @@ async fn do_test_put_delete_object(
         assert_eq!(content_length, content.len());
         //assert_eq!(checksum_crc32c, crc32c);
         assert_eq!(body.as_ref(), content.as_bytes());
+    }
+
+    {
+        // an empty object still gets the MD5 of zero bytes as ETag
+        let empty_key = "empty.txt";
+        let put = c
+            .put_object()
+            .bucket(bucket)
+            .key(empty_key)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await?;
+        assert_eq!(
+            unquote_e_tag(put.e_tag().expect("put returns an ETag")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+
+        c.delete_object()
+            .bucket(bucket)
+            .key(empty_key)
+            .send()
+            .await?;
     }
 
     {
@@ -538,8 +597,12 @@ async fn do_test_multipart(engine: StorageEngine) -> Result<()> {
             .send()
             .await?;
 
+        // an uploaded part is identified by the plain MD5 of its content
+        let part_e_tag = ans.e_tag.unwrap_or_default();
+        assert_single_part_e_tag(&part_e_tag);
+
         let part = CompletedPart::builder()
-            .e_tag(ans.e_tag.unwrap_or_default())
+            .e_tag(part_e_tag)
             .part_number(part_number)
             .build();
 
@@ -547,11 +610,12 @@ async fn do_test_multipart(engine: StorageEngine) -> Result<()> {
     };
 
     {
+        let part_count = upload_parts.len();
         let upload = CompletedMultipartUpload::builder()
             .set_parts(Some(upload_parts))
             .build();
 
-        let _ = c
+        let ans = c
             .complete_multipart_upload()
             .bucket(bucket)
             .key(key)
@@ -559,6 +623,13 @@ async fn do_test_multipart(engine: StorageEngine) -> Result<()> {
             .upload_id(upload_id)
             .send()
             .await?;
+
+        // the completed object carries the multipart ETag: MD5 of the
+        // concatenated part MD5s, suffixed with the part count
+        assert_multipart_e_tag(
+            ans.e_tag().expect("complete multipart returns an ETag"),
+            part_count,
+        );
     }
 
     {

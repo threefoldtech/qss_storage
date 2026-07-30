@@ -8,8 +8,8 @@ use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
-    BaseMetaTree, BlockID, BlockTree, BucketMeta, Durability, FjallStore, FjallStoreNotx,
-    MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
+    BaseMetaTree, BlockID, BlockTree, BucketMeta, ContentHash, Durability, FjallStore,
+    FjallStoreNotx, MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
 use super::byte_stream::AsyncByteStream;
@@ -164,7 +164,7 @@ impl CasFS {
         bucket_name: &str,
         key: &str,
         size: u64,
-        hash: BlockID,
+        hash: ContentHash,
         object_data: ObjectData,
     ) -> Result<Object, MetaError> {
         let obj_meta = Object::new(size, hash, object_data);
@@ -213,7 +213,7 @@ impl CasFS {
         size: usize,
         part_number: i64,
         upload_id: String,
-        hash: BlockID,
+        hash: ContentHash,
         blocks: Vec<BlockID>,
     ) -> Result<(), MetaError> {
         let mp_map = self.shared.multipart_tree();
@@ -310,7 +310,7 @@ impl CasFS {
         bucket_name: &str,
         key: &str,
         data: AsyncByteStream,
-    ) -> io::Result<(Vec<BlockID>, BlockID, u64)> {
+    ) -> io::Result<(Vec<BlockID>, ContentHash, u64)> {
         super::write_path::store_object(self, bucket_name, key, data).await
     }
 
@@ -499,6 +499,36 @@ mod tests {
 
         let stored_block = block_tree.get_block(&new_obj.blocks()[0]).unwrap().unwrap();
         assert_eq!(stored_block.rc(), 2);
+    }
+
+    /// The well known MD5 of zero bytes, which is the ETag S3 clients expect
+    /// for an empty object.
+    const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+    #[tokio::test]
+    async fn test_store_empty_object() {
+        for engine in TEST_ENGINES {
+            let (fs, _dir) = setup_test_fs(engine);
+            do_test_store_empty_object(fs).await;
+        }
+    }
+
+    async fn do_test_store_empty_object(fs: CasFS) {
+        const BUCKET_NAME: &str = "test_bucket";
+        const KEY: &str = "empty";
+        fs.create_bucket(BUCKET_NAME).unwrap();
+
+        let stream = AsyncByteStream::new(stream::empty());
+        let obj = fs
+            .store_single_object_and_meta(BUCKET_NAME, KEY, stream, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(obj.size(), 0);
+        assert!(obj.blocks().is_empty());
+        // The empty object is not stored, but it still hashes to the MD5 of
+        // no bytes rather than to a zero sentinel.
+        assert_eq!(obj.format_e_tag(), EMPTY_MD5);
     }
 
     #[tokio::test]

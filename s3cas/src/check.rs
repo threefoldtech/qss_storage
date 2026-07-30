@@ -9,6 +9,7 @@ use md5::{Digest, Md5};
 use crate::metrics::SharedMetrics;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
+use cas_storage::ContentHash;
 use cas_storage::RangeRequest;
 use cas_storage::StorageEngine;
 
@@ -60,7 +61,7 @@ pub async fn check_integrity(args: CheckConfig) -> Result<()> {
         return Ok(());
     };
 
-    let hash: [u8; 16] = Md5::digest(data).into();
+    let hash = ContentHash(Md5::digest(data).into());
     if hash != *obj_meta.hash() {
         eprintln!("check failed: hash mismatch");
     } else {
