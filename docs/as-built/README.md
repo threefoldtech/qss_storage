@@ -72,6 +72,12 @@ path whose own error message is wrong about why it cannot be implemented, with a
 few-line fix available in the same file. Suggested order of work is at the end
 of [04-code-health.md](./04-code-health.md#suggested-order-of-work).
 
+**Update 2026-07-30:** a remediation pass on the `development` branch fixed
+H1, H2, H5, H6, H8, B2, B3, P3, P4, and P6, recorded H3/H4 in ADR 0002, and
+additionally revived the dead benchmark suite and fixed a port race in the
+respd test harness. Live status table at the top of
+[04-code-health.md](./04-code-health.md#resolution-status-2026-07-30-branch-development).
+
 Verification state at time of writing, on this branch:
 
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean

@@ -17,6 +17,55 @@ Everything below is beyond what the gating lints catch.
 
 ---
 
+## Resolution status (2026-07-30, branch `development`)
+
+A remediation pass worked through the suggested order of work. The sections
+below are kept as written (point-in-time record); this table is the live
+status. Commits are on `development`.
+
+| Finding | Status | Commit(s) |
+|---------|--------|-----------|
+| H1 reachable panic | **Fixed** -- `FjallStore::num_keys` delegates to `read_tx().len()`; regression test in the shared backend battery | `58ca932` |
+| H2 transmute + Send/Sync | **Addressed** -- SAFETY argument written, field order marked load-bearing, `unsafe impl Sync` deleted (auto impl suffices), `Send` kept with an honest argument | `16591a5` |
+| H3 pointer-width format | **Recorded** -- folded into ADR 0002 as decision 6 (u64 fields in the same format break); implementation pending with that ADR | `9dabfe1` |
+| H4 MD5 cross-tenant substitution | **Recorded** -- ADR 0002 amended: migration is now a prerequisite for untrusted multi-tenancy; interim mitigations stated | `9dabfe1` |
+| H5 BlockStream Sync | **Fixed** -- deleted; static assertion in its place | `16591a5` |
+| H6 unchecked UTF-8 | **Fixed** -- all six sites validate; `range_filter` sites log-and-skip (trait signature unchanged, see EXTENSIONS.md) | `16591a5` |
+| (H2 adjacent) FjallNoTransaction unsafe impls | **Fixed** -- both redundant, deleted with static assertions | `a5722c8` |
+| H7 Content-MD5 unverified | Open | -- |
+| H8 num_keys unwrap | **Fixed** -- returns `Result`; no in-tree caller needed changes | `58ca932` |
+| H9 async_trait in metrics | Open (s3fs.rs occurrence stays, forced by s3s) | -- |
+| H10 truncating casts | Open | -- |
+| H11 module style | Open (cosmetic) | -- |
+| H12 Durability naming | Open -- needs decision | -- |
+| B1 duplicated backends | Open -- needs decision (upstream PR vs accept) | -- |
+| B2 oversized functions | **Fixed** -- `from_frame` 388 -> 47-line dispatch table with per-command parsers; `process` -> 10-line delegate to `Session` | `721b53a`, `cfb271b` |
+| B3 edition split / toolchain | **Fixed** -- workspace on edition 2024, toolchain pinned 1.97 | `e4a795b`, `0777c36` |
+| B4 pedantic backlog | Open | -- |
+| P1 ADRs describe unmerged layout | **Resolved on `development`** -- merged at `9a2d8c8`; `main` stays stale until development merges back | `9a2d8c8` |
+| P2 main red in CI | Same as P1 -- green on `development` | `9a2d8c8` |
+| P3 missing CI gates | **Mostly fixed** -- fmt gate added, toolchain pin honored, CI runs on development, stray checkout dropped; `release.yaml` still builds without testing | `0777c36`, `50ec0ec` |
+| P4 .gitignore | **Fixed** -- `/data` ignored | `0777c36` |
+| P5 dangling deadlock-fix doc | Open | -- |
+| P6 DBSIZE untested / naming | **Fixed** -- `test_dbsize` added; former-name note in EXTENSIONS.md | `cfb271b`, `9dabfe1` |
+
+Found and fixed during the pass, beyond the original findings:
+
+- The criterion benchmarks were dead code: not a workspace member, no
+  `[[bench]]` target anywhere, still importing pre-refactor paths. Now a
+  `qss-benches` workspace member crate; both binaries compile, run, and are
+  covered by the clippy gate (`cd535e3`).
+- respd's integration test harness had a real port-allocation race
+  (bind-drop-rebind), the cause of a rare one-in-N test failure. The listener
+  is now bound once and moved into the server thread; sleep-based readiness
+  waits removed. Suite wall time 19s -> ~1s (`cfb271b`).
+
+Verification on `development` after the pass: fmt clean, clippy
+`-D warnings` clean including benches, 47 tests passing (twice), both bench
+binaries run to completion.
+
+---
+
 ## Correctness and soundness
 
 ### H1. `unimplemented!()` reachable on default flags -- CONFIRMED
