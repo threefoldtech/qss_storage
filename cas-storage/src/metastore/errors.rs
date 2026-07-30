@@ -3,30 +3,71 @@ use std::fmt;
 
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone)]
+/// Errors produced when decoding on-disk records.
+///
+/// Every variant carries enough detail to tell an operator *what* was
+/// malformed, so a corrupted or foreign-format store surfaces as a described
+/// error instead of a panic or a generic "corrupt object".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsError {
-    MalformedObject,
+    /// The record is shorter than the format requires.
+    Truncated {
+        record: &'static str,
+        needed: usize,
+        got: usize,
+    },
+    /// The record contains bytes past its self-described end.
+    TrailingBytes { record: &'static str, extra: usize },
+    /// A string field did not contain valid UTF-8.
+    InvalidUtf8 {
+        record: &'static str,
+        field: &'static str,
+    },
+    /// The object type discriminant is not a known variant.
+    UnknownObjectType(u8),
+    /// A block-id width byte is not one of the supported widths.
+    InvalidIdWidth(u8),
+    /// A length or count field does not fit the platform's usize.
+    LengthOverflow {
+        record: &'static str,
+        field: &'static str,
+    },
 }
 
 impl Display for FsError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Cas FS error: {}",
-            match self {
-                FsError::MalformedObject => &"corrupt object",
-            }
-        )
-    }
-}
-
-impl std::error::Error for FsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            &FsError::MalformedObject => None,
+            FsError::Truncated {
+                record,
+                needed,
+                got,
+            } => write!(
+                f,
+                "Cas FS error: truncated {record} record: need at least {needed} bytes, got {got}"
+            ),
+            FsError::TrailingBytes { record, extra } => write!(
+                f,
+                "Cas FS error: {record} record has {extra} trailing bytes"
+            ),
+            FsError::InvalidUtf8 { record, field } => write!(
+                f,
+                "Cas FS error: {record} record field {field} is not valid UTF-8"
+            ),
+            FsError::UnknownObjectType(t) => {
+                write!(f, "Cas FS error: unknown object type {t}")
+            }
+            FsError::InvalidIdWidth(w) => {
+                write!(f, "Cas FS error: invalid block id width {w}")
+            }
+            FsError::LengthOverflow { record, field } => write!(
+                f,
+                "Cas FS error: {record} record field {field} does not fit in usize"
+            ),
         }
     }
 }
+
+impl std::error::Error for FsError {}
 
 // Define the error type
 #[derive(Debug)]
@@ -42,10 +83,19 @@ pub enum MetaError {
     PersistError(String),
     BlockNotFound,
     OtherDBError(String),
+    /// A stored record failed to decode; carries the decode error.
+    Corruption(FsError),
 }
 
 // Implement the std::error::Error trait
-impl Error for MetaError {}
+impl Error for MetaError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            MetaError::Corruption(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 // Implement the Display trait for custom error messages
 impl fmt::Display for MetaError {
@@ -62,7 +112,14 @@ impl fmt::Display for MetaError {
             MetaError::PersistError(ref s) => write!(f, "Persist error: {s}"),
             MetaError::BlockNotFound => write!(f, "Block not found"),
             MetaError::OtherDBError(ref s) => write!(f, "Other DB error: {s}"),
+            MetaError::Corruption(ref e) => write!(f, "Corrupt record: {e}"),
         }
+    }
+}
+
+impl From<FsError> for MetaError {
+    fn from(e: FsError) -> Self {
+        MetaError::Corruption(e)
     }
 }
 

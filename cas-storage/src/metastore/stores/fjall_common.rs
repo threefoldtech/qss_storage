@@ -353,12 +353,14 @@ impl<F: FjallFlavor> MetaTreeExt for FjallTreeOf<F> {
             Box::new(pairs)
         };
 
-        // Upstream used `String::from_utf8_unchecked` on the raw key. The key
-        // comes straight off disk, so a corrupt or truncated record turns into
-        // undefined behaviour instead of a bad result. `range_filter` yields an
-        // infallible item type, so a key that is not valid UTF-8 is skipped and
-        // logged -- the same treatment the iterator above already gives to keys
-        // the backend fails to read (`filter_map(|g| g.into_inner().ok())`).
+        // Upstream used `String::from_utf8_unchecked` on the raw key and
+        // `unwrap()`ed the value decode. Both come straight off disk, so a
+        // corrupt or truncated record turned into undefined behaviour or a
+        // panic instead of a bad result. `range_filter` yields an infallible
+        // item type, so a key that is not valid UTF-8 and a value that fails to
+        // decode are both skipped and logged -- the same treatment the iterator
+        // above already gives to keys the backend fails to read
+        // (`filter_map(|g| g.into_inner().ok())`).
         Box::new(skip_filtered.filter_map(|(raw_key, raw_value)| {
             let key = match String::from_utf8(raw_key.to_vec()) {
                 Ok(key) => key,
@@ -367,7 +369,13 @@ impl<F: FjallFlavor> MetaTreeExt for FjallTreeOf<F> {
                     return None;
                 }
             };
-            let obj = Object::try_from(&*raw_value).unwrap();
+            let obj = match Object::try_from(&*raw_value) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    tracing::error!("Skipping key {} with an undecodable object: {}", key, e);
+                    return None;
+                }
+            };
             Some((key, obj))
         }))
     }

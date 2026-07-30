@@ -60,18 +60,19 @@ back out of a database file, where corruption, a truncated write or a format
 change breaks the invariant, and the penalty is undefined behaviour rather
 than an error. All six now validate:
 
-- `metastore/bucket_meta.rs` (bucket name) -> `FsError::MalformedObject`
-- `cas/multipart.rs` (bucket, key, upload_id) -> `FsError::MalformedObject`
+- `metastore/bucket_meta.rs` (bucket name) -> `FsError::InvalidUtf8`
+- `cas/multipart.rs` (bucket, key, upload_id) -> `FsError::InvalidUtf8`
 - `metastore/stores/fjall_common.rs` (`range_filter` key; was one copy per
   backend before the dedup below)
 
-The first two sit in `TryFrom` impls and simply return the error. The two
-`range_filter` sites do not: the trait method yields an infallible
+The first two sit in `TryFrom` impls and simply return the error. The
+`range_filter` site does not: the trait method yields an infallible
 `(String, Object)` item, so changing the signature would ripple into
 `s3cas::s3fs`. There, a key that is not valid UTF-8 is logged and skipped,
 which is how the same iterator already handles keys the backend fails to read
-(`filter_map(|g| g.into_inner().ok())` a few lines above). Anyone changing
-`range_filter` to be fallible should revisit both.
+(`filter_map(|g| g.into_inner().ok())` a few lines above). The value decode in
+the same closure is skipped and logged for the same reason. Anyone changing
+`range_filter` to be fallible should revisit all three.
 
 ### `SAFETY` argument for the `'static` transaction transmute
 `FjallStore::begin_transaction` launders a `SingleWriterWriteTx<'_>` to

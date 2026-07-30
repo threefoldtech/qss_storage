@@ -54,19 +54,30 @@ impl TryFrom<&[u8]> for Block {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() < PTR_SIZE + 1 {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::Truncated {
+                record: "Block",
+                needed: PTR_SIZE + 1,
+                got: value.len(),
+            });
         }
         let size = usize::from_le_bytes(value[..PTR_SIZE].try_into().unwrap());
 
         let vec_size =
             u8::from_le_bytes(value[PTR_SIZE..PTR_SIZE + 1].try_into().unwrap()) as usize;
         if value.len() < PTR_SIZE + 1 + vec_size {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::Truncated {
+                record: "Block",
+                needed: PTR_SIZE + 1 + vec_size,
+                got: value.len(),
+            });
         }
         let path = value[PTR_SIZE + 1..PTR_SIZE + 1 + vec_size].to_vec();
 
         if value.len() != PTR_SIZE * 2 + 1 + vec_size {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::TrailingBytes {
+                record: "Block",
+                extra: value.len().abs_diff(PTR_SIZE * 2 + 1 + vec_size),
+            });
         }
 
         Ok(Block {

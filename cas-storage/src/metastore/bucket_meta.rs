@@ -85,11 +85,18 @@ impl TryFrom<&[u8]> for BucketMeta {
     type Error = FsError;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() < 8 + PTR_SIZE {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::Truncated {
+                record: "BucketMeta",
+                needed: 8 + PTR_SIZE,
+                got: value.len(),
+            });
         }
         let name_len = usize::from_le_bytes(value[8..8 + PTR_SIZE].try_into().unwrap());
         if value.len() != 8 + PTR_SIZE + name_len {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::TrailingBytes {
+                record: "BucketMeta",
+                extra: value.len().abs_diff(8 + PTR_SIZE + name_len),
+            });
         }
         Ok(BucketMeta {
             ctime: i64::from_le_bytes(value[..8].try_into().unwrap()),
@@ -100,8 +107,12 @@ impl TryFrom<&[u8]> for BucketMeta {
             // be broken by corruption, a truncated write, or a format change. The
             // cost of validating a bucket name is irrelevant next to undefined
             // behaviour, so validate and report a malformed record instead.
-            name: String::from_utf8(value[8 + PTR_SIZE..].to_vec())
-                .map_err(|_| FsError::MalformedObject)?,
+            name: String::from_utf8(value[8 + PTR_SIZE..].to_vec()).map_err(|_| {
+                FsError::InvalidUtf8 {
+                    record: "BucketMeta",
+                    field: "name",
+                }
+            })?,
             // ---- tfstor-extension: END ----
         })
     }

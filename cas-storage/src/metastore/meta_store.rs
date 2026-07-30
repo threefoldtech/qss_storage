@@ -187,21 +187,19 @@ impl MetaStore {
     /// # Note
     /// This method currently loads all buckets into memory at once.
     /// TODO: This should be paginated and return a stream for better scalability.
+    ///
+    /// A record that fails to decode fails the whole listing: silently dropping
+    /// it would report a bucket as gone while its tree and data are still there.
     pub fn list_buckets(&self) -> Result<Vec<BucketMeta>, MetaError> {
         let bucket = self.get_allbuckets_tree()?;
-        let buckets = bucket
+        bucket
             .iter_all()
-            .filter_map(|result| {
-                let (_, value) = match result {
-                    Ok(kv) => kv,
-                    Err(_) => return None,
-                };
-
-                let bucket_meta = BucketMeta::try_from(&*value).ok()?;
-                Some(bucket_meta) // Just return the BucketMeta without the key
+            .map(|result| {
+                let (_, value) = result?;
+                // Just return the BucketMeta without the key
+                BucketMeta::try_from(&*value).map_err(MetaError::from)
             })
-            .collect();
-        Ok(buckets)
+            .collect()
     }
 
     /// Inserts a metadata Object into the specified bucket.
@@ -238,7 +236,7 @@ impl MetaStore {
         let bucket = self.get_bucket_ext(bucket_name)?;
         match bucket.get(key.as_bytes())? {
             Some(data) => {
-                let obj = Object::try_from(&*data).expect("Malformed object");
+                let obj = Object::try_from(&*data)?;
                 Ok(Some(obj))
             }
             None => Ok(None),
@@ -285,7 +283,7 @@ impl MetaStore {
             None => return Ok(vec![]),
         };
 
-        let obj = Object::try_from(&*raw_object).expect("Malformed object");
+        let obj = Object::try_from(&*raw_object)?;
         let mut to_delete: Vec<Block> = Vec::with_capacity(obj.blocks().len());
 
         tracing::debug!(
@@ -302,7 +300,7 @@ impl MetaStore {
         for block_id in obj.blocks() {
             match block_tree.get(block_id)? {
                 Some(block_data) => {
-                    let mut block = Block::try_from(&*block_data).expect("Corrupted block data");
+                    let mut block = Block::try_from(&*block_data)?;
 
                     // If this is the last reference to the block, delete it
                     if block.rc() == 1 {
@@ -418,7 +416,7 @@ impl BlockTree {
     pub fn get_block(&self, key: &[u8]) -> Result<Option<Block>, MetaError> {
         match self.tree.get(key)? {
             Some(data) => {
-                let block = Block::try_from(&*data).expect("Malformed block");
+                let block = Block::try_from(&*data)?;
                 Ok(Some(block))
             }
             None => Ok(None),
@@ -495,7 +493,7 @@ impl BlockTree {
                 // Deserialize the block
                 Block::try_from(&*value)
                     .map(|block| (block_id, block))
-                    .map_err(|e| MetaError::OtherDBError(e.to_string()))
+                    .map_err(MetaError::from)
             }
             Err(e) => Err(e),
         }))
@@ -563,8 +561,7 @@ impl Transaction {
         match self.backend.get(DEFAULT_BLOCK_TREE, &block_hash)? {
             // Block exists
             Some(block_data) => {
-                let mut block = Block::try_from(&*block_data as &[u8])
-                    .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+                let mut block = Block::try_from(&*block_data as &[u8])?;
 
                 // If the key doesn't have this block, increment the reference count
                 if !key_has_block {

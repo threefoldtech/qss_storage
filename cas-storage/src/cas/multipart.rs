@@ -79,14 +79,24 @@ impl TryFrom<&[u8]> for MultiPart {
     type Error = FsError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 5 * PTR_SIZE + 8 + BLOCKID_SIZE {
-            return Err(FsError::MalformedObject);
+        let needed = 5 * PTR_SIZE + 8 + BLOCKID_SIZE;
+        if value.len() < needed {
+            return Err(FsError::Truncated {
+                record: "MultiPart",
+                needed,
+                got: value.len(),
+            });
         }
 
         let bucket_len =
             usize::from_le_bytes(value[8 + PTR_SIZE..8 + 2 * PTR_SIZE].try_into().unwrap());
-        if value.len() < 8 + 3 * PTR_SIZE + bucket_len {
-            return Err(FsError::MalformedObject);
+        let needed = 8 + 3 * PTR_SIZE + bucket_len;
+        if value.len() < needed {
+            return Err(FsError::Truncated {
+                record: "MultiPart",
+                needed,
+                got: value.len(),
+            });
         }
         // ---- tfstor-extension: BEGIN ----
         // Upstream used `String::from_utf8_unchecked` for the three string fields
@@ -98,7 +108,10 @@ impl TryFrom<&[u8]> for MultiPart {
         // short, so validation costs nothing worth having.
         let bucket =
             String::from_utf8(value[8 + 2 * PTR_SIZE..8 + 2 * PTR_SIZE + bucket_len].to_vec())
-                .map_err(|_| FsError::MalformedObject)?;
+                .map_err(|_| FsError::InvalidUtf8 {
+                    record: "MultiPart",
+                    field: "bucket",
+                })?;
         // ---- tfstor-extension: END ----
 
         let key_len = usize::from_le_bytes(
@@ -106,14 +119,22 @@ impl TryFrom<&[u8]> for MultiPart {
                 .try_into()
                 .unwrap(),
         );
-        if value.len() < 8 + 4 * PTR_SIZE + bucket_len + key_len {
-            return Err(FsError::MalformedObject);
+        let needed = 8 + 4 * PTR_SIZE + bucket_len + key_len;
+        if value.len() < needed {
+            return Err(FsError::Truncated {
+                record: "MultiPart",
+                needed,
+                got: value.len(),
+            });
         }
         // ---- tfstor-extension: BEGIN ----
         let key = String::from_utf8(
             value[8 + 3 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len + key_len].to_vec(),
         )
-        .map_err(|_| FsError::MalformedObject)?;
+        .map_err(|_| FsError::InvalidUtf8 {
+            record: "MultiPart",
+            field: "key",
+        })?;
         // ---- tfstor-extension: END ----
 
         let upload_id_len = usize::from_le_bytes(
@@ -121,8 +142,13 @@ impl TryFrom<&[u8]> for MultiPart {
                 .try_into()
                 .unwrap(),
         );
-        if value.len() < 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE {
-            return Err(FsError::MalformedObject);
+        let needed = 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE;
+        if value.len() < needed {
+            return Err(FsError::Truncated {
+                record: "MultiPart",
+                needed,
+                got: value.len(),
+            });
         }
         // ---- tfstor-extension: BEGIN ----
         let upload_id = String::from_utf8(
@@ -130,7 +156,10 @@ impl TryFrom<&[u8]> for MultiPart {
                 ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len]
                 .to_vec(),
         )
-        .map_err(|_| FsError::MalformedObject)?;
+        .map_err(|_| FsError::InvalidUtf8 {
+            record: "MultiPart",
+            field: "upload_id",
+        })?;
         // ---- tfstor-extension: END ----
 
         let block_len = usize::from_le_bytes(
@@ -139,14 +168,18 @@ impl TryFrom<&[u8]> for MultiPart {
                 .try_into()
                 .unwrap(),
         );
-        if value.len()
-            < 8 + 5 * PTR_SIZE
-                + bucket_len
-                + key_len
-                + upload_id_len
-                + (1 + block_len) * BLOCKID_SIZE
-        {
-            return Err(FsError::MalformedObject);
+        let needed = 8
+            + 5 * PTR_SIZE
+            + bucket_len
+            + key_len
+            + upload_id_len
+            + (1 + block_len) * BLOCKID_SIZE;
+        if value.len() < needed {
+            return Err(FsError::Truncated {
+                record: "MultiPart",
+                needed,
+                got: value.len(),
+            });
         }
         let mut blocks = Vec::with_capacity(block_len);
         for chunk in value[8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE..]
@@ -200,7 +233,7 @@ impl MultiPartTree {
             Ok(None) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mp = MultiPart::try_from(value.as_ref()).expect("Corrupted multipart data");
+        let mp = MultiPart::try_from(value.as_ref())?;
         Ok(Some(mp))
     }
 }

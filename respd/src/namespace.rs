@@ -254,7 +254,7 @@ impl Namespace {
     fn get_object(&self, key: &[u8]) -> Result<Option<Object>, MetaError> {
         match self.tree.read().unwrap().get(key)? {
             Some(data) => {
-                let obj = Object::try_from(&*data).expect("Malformed object");
+                let obj = Object::try_from(&*data)?;
                 Ok(Some(obj))
             }
             None => Ok(None),

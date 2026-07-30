@@ -332,6 +332,23 @@ fn minimum_raw_object_size() -> usize {
     17 + BLOCKID_SIZE + PTR_SIZE
 }
 
+/// Maps a record whose actual length disagrees with the length its own header
+/// fields describe onto the matching decode error.
+fn length_mismatch(expected: usize, got: usize) -> FsError {
+    if got < expected {
+        FsError::Truncated {
+            record: "Object",
+            needed: expected,
+            got,
+        }
+    } else {
+        FsError::TrailingBytes {
+            record: "Object",
+            extra: got - expected,
+        }
+    }
+}
+
 /// Implements deserialization of an Object from a byte slice.
 ///
 /// This implementation validates the input format and extracts all object fields.
@@ -340,7 +357,11 @@ impl TryFrom<&[u8]> for Object {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() < minimum_raw_object_size() {
-            return Err(FsError::MalformedObject);
+            return Err(FsError::Truncated {
+                record: "Object",
+                needed: minimum_raw_object_size(),
+                got: value.len(),
+            });
         }
 
         // object type: 1 byte
@@ -351,7 +372,7 @@ impl TryFrom<&[u8]> for Object {
             0 => ObjectType::Single,
             1 => ObjectType::Multipart,
             2 => ObjectType::Inline,
-            _ => return Err(FsError::MalformedObject),
+            t => return Err(FsError::UnknownObjectType(t)),
         };
         pos += 1;
 
@@ -380,7 +401,7 @@ impl TryFrom<&[u8]> for Object {
                     expected_len += PTR_SIZE;
                 }
                 if value.len() != expected_len {
-                    return Err(FsError::MalformedObject);
+                    return Err(length_mismatch(expected_len, value.len()));
                 }
 
                 let mut blocks = Vec::with_capacity(block_len);
@@ -408,7 +429,7 @@ impl TryFrom<&[u8]> for Object {
                 // check the expected length
                 let expected_len = pos + data_len as usize;
                 if value.len() != expected_len {
-                    return Err(FsError::MalformedObject);
+                    return Err(length_mismatch(expected_len, value.len()));
                 }
 
                 // data: data_len bytes
@@ -516,7 +537,11 @@ mod tests {
         // Test too short input
         assert!(matches!(
             Object::try_from(&[0u8; 15][..]),
-            Err(FsError::MalformedObject)
+            Err(FsError::Truncated {
+                record: "Object",
+                got: 15,
+                ..
+            })
         ));
 
         // Test invalid object type
@@ -524,7 +549,7 @@ mod tests {
         bad_type[0] = 255;
         assert!(matches!(
             Object::try_from(bad_type.as_slice()),
-            Err(FsError::MalformedObject)
+            Err(FsError::UnknownObjectType(255))
         ));
 
         // Test incorrect length for blocks
@@ -532,7 +557,21 @@ mod tests {
         bad_blocks.truncate(bad_blocks.len() - 1);
         assert!(matches!(
             Object::try_from(bad_blocks.as_slice()),
-            Err(FsError::MalformedObject)
+            Err(FsError::Truncated {
+                record: "Object",
+                ..
+            })
+        ));
+
+        // Test trailing bytes after the blocks
+        let mut extra_blocks = Vec::from(&create_test_objects()[0].1);
+        extra_blocks.push(0);
+        assert!(matches!(
+            Object::try_from(extra_blocks.as_slice()),
+            Err(FsError::TrailingBytes {
+                record: "Object",
+                extra: 1
+            })
         ));
     }
 
