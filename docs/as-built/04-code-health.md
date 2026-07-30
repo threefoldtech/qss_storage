@@ -27,7 +27,7 @@ status. Commits are on `development`.
 |---------|--------|-----------|
 | H1 reachable panic | **Fixed** -- `FjallStore::num_keys` delegates to `read_tx().len()`; regression test in the shared backend battery | `58ca932` |
 | H2 transmute + Send/Sync | **Addressed** -- SAFETY argument written, field order marked load-bearing, `unsafe impl Sync` deleted (auto impl suffices), `Send` kept with an honest argument | `16591a5` |
-| H3 pointer-width format | **Fixed** -- format v1: all length/count fields are `u64`, `PTR_SIZE` and `constants.rs` deleted, records length-exact, block-id lists self-describing (width byte); golden byte vectors pin the layout. No backward compatibility: pre-v1 stores read as decode errors until the store header lands | `617f865` |
+| H3 pointer-width format | **Fixed** -- format v1: all length/count fields are `u64`, `PTR_SIZE` and `constants.rs` deleted, records length-exact, block-id lists self-describing (width byte); golden byte vectors pin the layout. No backward compatibility: pre-v1 stores read as decode errors until the store header lands | `a0c6471` |
 | H4 MD5 cross-tenant substitution | **Recorded** -- ADR 0002 amended: migration is now a prerequisite for untrusted multi-tenancy; interim mitigations stated | `9dabfe1` |
 | H5 BlockStream Sync | **Fixed** -- deleted; static assertion in its place | `16591a5` |
 | H6 unchecked UTF-8 | **Fixed** -- all six sites validate; `range_filter` sites log-and-skip (trait signature unchanged, see EXTENSIONS.md) | `16591a5` |
