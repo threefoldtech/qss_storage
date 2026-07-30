@@ -87,7 +87,7 @@ impl NamespaceCache {
 
         // Sync properties with metadata
         if let Ok(meta) = self.storage.get_namespace_meta(&name) {
-            let _ = namespace.sync_properties_from_meta(&meta);
+            namespace.sync_properties_from_meta(&meta);
         }
 
         // Store in cache
@@ -135,7 +135,7 @@ impl NamespaceCache {
 
                 // Sync properties with metadata
                 if let Ok(meta) = self.storage.get_namespace_meta(&name) {
-                    let _ = namespace.sync_properties_from_meta(&meta);
+                    namespace.sync_properties_from_meta(&meta);
                 }
 
                 // Store in cache
@@ -196,15 +196,11 @@ impl Namespace {
     /// Sync properties with the persistent metadata
     /// This is called when the namespace is loaded to ensure in-memory properties
     /// reflect the persistent metadata
-    pub fn sync_properties_from_meta(
-        &self,
-        meta: &crate::storage::NamespaceMeta,
-    ) -> Result<(), MetaError> {
+    pub fn sync_properties_from_meta(&self, meta: &crate::storage::NamespaceMeta) {
         let mut props = self.properties.write().unwrap();
         props.worm = meta.worm;
         props.locked = meta.locked;
         props.public = meta.public;
-        Ok(())
     }
 
     pub fn flush(&self, namespace_cache: &NamespaceCache) -> Result<()> {

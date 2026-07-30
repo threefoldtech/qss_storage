@@ -5,7 +5,7 @@ use crate::metastore::MetaError;
 
 #[tracing::instrument(skip(fs), fields(bucket = %bucket, key = %key, blocks_deleted))]
 pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result<(), MetaError> {
-    let path_map = fs.path_tree()?;
+    let path_map = fs.path_tree();
 
     let block_tree = fs.shared.block_tree();
     let blocks_to_delete = fs.namespace.delete_object(bucket, key, &block_tree)?;

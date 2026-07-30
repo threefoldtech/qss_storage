@@ -23,8 +23,8 @@ use aws_sdk_s3::types::CompletedPart;
 use aws_sdk_s3::types::CreateBucketConfiguration;
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use std::convert::TryInto;
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 use tracing::{debug, error};
@@ -65,7 +65,7 @@ use std::sync::Mutex as StdMutex;
 static CONFIG_SIZE: StdMutex<Option<usize>> = StdMutex::new(None);
 static CONFIG_ENGINE: StdMutex<Option<s3cas::cas::StorageEngine>> = StdMutex::new(None);
 
-static CONFIG: Lazy<SdkConfig> = Lazy::new(|| {
+static CONFIG: LazyLock<SdkConfig> = LazyLock::new(|| {
     setup_tracing();
 
     // Fake credentials
@@ -133,7 +133,7 @@ fn setup_test(
 }
 
 async fn serial() -> MutexGuard<'static, ()> {
-    static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     LOCK.lock().await
 }
 

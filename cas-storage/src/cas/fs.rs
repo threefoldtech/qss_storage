@@ -76,6 +76,11 @@ impl std::fmt::Display for StorageEngine {
 
 pub type ObjectPaths = (Object, Vec<(PathBuf, usize)>);
 
+/// Storage key of one part of a multipart upload.
+fn part_key(bucket: &str, key: &str, upload_id: &str, part_number: i64) -> String {
+    format!("{bucket}-{key}-{upload_id}-{part_number}")
+}
+
 impl CasFS {
     /// Build a `CasFS` for one namespace, sharing a block/path/multipart
     /// store across namespaces via `shared`.
@@ -208,8 +213,8 @@ impl CasFS {
         self.verify_on_read
     }
 
-    pub(super) fn path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
-        Ok(self.shared.path_tree())
+    pub(super) fn path_tree(&self) -> Arc<dyn BaseMetaTree> {
+        self.shared.path_tree()
     }
 
     pub fn fs_root(&self) -> &PathBuf {
@@ -280,10 +285,6 @@ impl CasFS {
         super::delete_path::bucket_delete(self, bucket_name).await
     }
 
-    fn part_key(&self, bucket: &str, key: &str, upload_id: &str, part_number: i64) -> String {
-        format!("{bucket}-{key}-{upload_id}-{part_number}")
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn insert_multipart_part(
         &self,
@@ -296,7 +297,7 @@ impl CasFS {
         blocks: Vec<BlockId>,
     ) -> Result<(), MetaError> {
         let mp_map = self.shared.multipart_tree();
-        let storage_key = self.part_key(&bucket, &key, &upload_id, part_number);
+        let storage_key = part_key(&bucket, &key, &upload_id, part_number);
 
         tracing::debug!(
             "CasFS: insert_multipart_part storage_key={}, size={}, blocks={}",
@@ -319,7 +320,7 @@ impl CasFS {
         part_number: i64,
     ) -> Result<Option<MultiPart>, MetaError> {
         let mp_map = self.shared.multipart_tree();
-        let part_key = self.part_key(bucket, key, upload_id, part_number);
+        let part_key = part_key(bucket, key, upload_id, part_number);
 
         tracing::debug!("CasFS: get_multipart_part storage_key={}", part_key);
 
@@ -344,7 +345,7 @@ impl CasFS {
         part_number: i64,
     ) -> Result<(), MetaError> {
         let mp_map = self.shared.multipart_tree();
-        let part_key = self.part_key(bucket, key, upload_id, part_number);
+        let part_key = part_key(bucket, key, upload_id, part_number);
 
         tracing::debug!("CasFS: remove_multipart_part storage_key={}", part_key);
 
@@ -413,7 +414,7 @@ mod tests {
     use crate::hasher::Hasher;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
     use tempfile::tempdir;
 
     const TEST_ENGINES: [StorageEngine; 2] = [StorageEngine::Fjall, StorageEngine::FjallNotx];
@@ -431,7 +432,7 @@ mod tests {
             .collect()
     }
 
-    static METRICS: Lazy<SharedMetrics> = Lazy::new(SharedMetrics::default);
+    static METRICS: LazyLock<SharedMetrics> = LazyLock::new(SharedMetrics::default);
 
     fn setup_test_fs(storage_engine: StorageEngine, hasher: Hasher) -> (CasFS, tempfile::TempDir) {
         setup_test_fs_verifying(storage_engine, hasher, false)
@@ -583,12 +584,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored_block.size(), test_data_len);
         assert_eq!(stored_block.rc(), 1);
-        assert!(
-            fs.path_tree()
-                .unwrap()
-                .contains_key(stored_block.path())
-                .unwrap()
-        );
+        assert!(fs.path_tree().contains_key(stored_block.path()).unwrap());
 
         // Store the same data again with different key
         // - The same block should be returned
@@ -647,11 +643,11 @@ mod tests {
     async fn test_store_inlined_object() {
         for (engine, hasher) in matrix() {
             let (fs, _dir) = setup_test_fs(engine, hasher);
-            do_test_store_inlined_object(fs).await;
+            do_test_store_inlined_object(fs);
         }
     }
 
-    async fn do_test_store_inlined_object(fs: CasFS) {
+    fn do_test_store_inlined_object(fs: CasFS) {
         let bucket_name = "test_bucket";
         let key = "test_key1";
         fs.create_bucket(bucket_name).unwrap();
@@ -786,7 +782,7 @@ mod tests {
         let mut stored_paths = Vec::new();
         for id in obj.blocks() {
             let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            assert!(fs.path_tree().unwrap().contains_key(block.path()).unwrap());
+            assert!(fs.path_tree().contains_key(block.path()).unwrap());
             stored_paths.push(block.path().to_vec());
         }
 
@@ -804,7 +800,7 @@ mod tests {
         }
         // Verify paths were cleaned up
         for path in stored_paths {
-            assert!(!fs.path_tree().unwrap().contains_key(&path).unwrap());
+            assert!(!fs.path_tree().contains_key(&path).unwrap());
         }
     }
 
@@ -962,6 +958,7 @@ mod tests {
     /// Payload spanning several blocks, with a partial last one. The period is
     /// coprime with the block size, so no two blocks come out identical and
     /// deduplication does not collapse them.
+    #[allow(clippy::cast_possible_truncation)] // the modulus bounds the cast
     fn multi_block_data() -> Vec<u8> {
         (0..BLOCK_SIZE * 2 + 4096)
             .map(|i| (i % 251) as u8)

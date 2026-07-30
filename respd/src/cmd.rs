@@ -355,30 +355,30 @@ impl CommandHandler {
         debug!("Set namespace authentication status to {}", authenticated);
     }
     /// Execute a command and return the response frame
-    pub async fn execute(&self, cmd: Command) -> Frame {
+    pub fn execute(&self, cmd: Command) -> Frame {
         match cmd {
-            Command::Get { key } => self.handle_get(key).await,
-            Command::MGet { keys } => self.handle_mget(keys).await,
-            Command::Set { key, value } => self.handle_set(key, value).await,
-            Command::Ping { message } => self.handle_ping(message),
-            Command::Del { key } => self.handle_del(key).await,
-            Command::Exists { key } => self.handle_exists(key).await,
-            Command::Check { key } => self.handle_check(key).await,
-            Command::Length { key } => self.handle_length(key).await,
-            Command::KeyTime { key } => self.handle_keytime(key).await,
-            Command::NSNew { name } => self.handle_nsnew(name).await,
-            Command::NSInfo { name } => self.handle_nsinfo(name).await,
-            Command::NSList => self.handle_nslist().await,
+            Command::Get { key } => self.handle_get(key),
+            Command::MGet { keys } => self.handle_mget(keys),
+            Command::Set { key, value } => self.handle_set(key, value),
+            Command::Ping { message } => Self::handle_ping(message),
+            Command::Del { key } => self.handle_del(key),
+            Command::Exists { key } => self.handle_exists(key),
+            Command::Check { key } => self.handle_check(key),
+            Command::Length { key } => self.handle_length(key),
+            Command::KeyTime { key } => self.handle_keytime(key),
+            Command::NSNew { name } => self.handle_nsnew(name),
+            Command::NSInfo { name } => self.handle_nsinfo(name),
+            Command::NSList => self.handle_nslist(),
             Command::DBSize => self.handle_dbsize(),
-            Command::Scan { cursor } => self.handle_scan(cursor).await,
-            Command::RScan { cursor } => self.handle_rscan(cursor).await,
+            Command::Scan { cursor } => self.handle_scan(cursor),
+            Command::RScan { cursor } => self.handle_rscan(cursor),
             Command::NSSet {
                 namespace,
                 property,
                 value,
-            } => self.handle_nsset(namespace, property, value).await,
-            Command::Flush => self.handle_flush().await,
-            Command::Time => self.handle_time(),
+            } => self.handle_nsset(namespace, property, value),
+            Command::Flush => self.handle_flush(),
+            Command::Time => Self::handle_time(),
             Command::Select { .. } => {
                 // SELECT is handled at a higher level in the connection handler
                 Frame::Error("ERR SELECT should be handled at connection level".into())
@@ -391,7 +391,7 @@ impl CommandHandler {
     }
 
     /// Handle GET command
-    async fn handle_get(&self, key: String) -> Frame {
+    fn handle_get(&self, key: String) -> Frame {
         debug!("Handling GET command for key: {}", key);
 
         // Check if namespace requires authentication for read operations
@@ -413,7 +413,7 @@ impl CommandHandler {
     }
 
     /// Handle MGET command - get multiple keys at once
-    async fn handle_mget(&self, keys: Vec<String>) -> Frame {
+    fn handle_mget(&self, keys: Vec<String>) -> Frame {
         debug!("Handling MGET command for {} keys", keys.len());
 
         // Check if namespace requires authentication for read operations
@@ -443,7 +443,7 @@ impl CommandHandler {
     }
 
     /// Handle SET command
-    async fn handle_set(&self, key: String, value: Bytes) -> Frame {
+    fn handle_set(&self, key: String, value: Bytes) -> Frame {
         debug!("Handling SET command for key: {}", key);
 
         // Check if the connection is authenticated for this namespace
@@ -461,7 +461,7 @@ impl CommandHandler {
     }
 
     /// Handle PING command
-    fn handle_ping(&self, message: Option<String>) -> Frame {
+    fn handle_ping(message: Option<String>) -> Frame {
         match message {
             Some(msg) => Frame::BulkString(msg.into_bytes()),
             None => Frame::SimpleString("PONG".into()),
@@ -469,7 +469,7 @@ impl CommandHandler {
     }
 
     /// Handle DEL command
-    async fn handle_del(&self, key: String) -> Frame {
+    fn handle_del(&self, key: String) -> Frame {
         debug!("Handling DEL command for key: {}", key);
 
         // Check if the connection is authenticated for this namespace
@@ -487,7 +487,7 @@ impl CommandHandler {
     }
 
     /// Handle EXISTS command
-    async fn handle_exists(&self, key: String) -> Frame {
+    fn handle_exists(&self, key: String) -> Frame {
         debug!("Handling EXISTS command for key: {}", key);
 
         // Check if namespace requires authentication for read operations
@@ -509,7 +509,7 @@ impl CommandHandler {
     }
 
     /// Handle CHECK command - verify data integrity for a key
-    async fn handle_check(&self, key: String) -> Frame {
+    fn handle_check(&self, key: String) -> Frame {
         debug!("Handling CHECK command for key: {}", key);
         match self.namespace.check(key.as_bytes()) {
             Ok(Some(true)) => Frame::Integer(1), // Data integrity check passed
@@ -522,7 +522,7 @@ impl CommandHandler {
     }
 
     /// Handle LENGTH command - get the size of a key's value
-    async fn handle_length(&self, key: String) -> Frame {
+    fn handle_length(&self, key: String) -> Frame {
         debug!("Handling LENGTH command for key: {}", key);
         match self.namespace.length(key.as_bytes()) {
             Ok(Some(size)) => Frame::Integer(size as i64), // Return the size as an integer
@@ -535,7 +535,7 @@ impl CommandHandler {
     }
 
     /// Handle KEYTIME command - get the last-modified timestamp of a key
-    async fn handle_keytime(&self, key: String) -> Frame {
+    fn handle_keytime(&self, key: String) -> Frame {
         debug!("Handling KEYTIME command for key: {}", key);
         match self.namespace.keytime(key.as_bytes()) {
             Ok(Some(timestamp)) => Frame::Integer(timestamp), // Return the timestamp as an integer
@@ -549,7 +549,7 @@ impl CommandHandler {
 
     /// Handle NSNEW command - create a new namespace
     /// This command requires admin privileges
-    async fn handle_nsnew(&self, name: String) -> Frame {
+    fn handle_nsnew(&self, name: String) -> Frame {
         debug!("Handling NSNEW command for namespace: {}", name);
 
         // Check if the connection has admin privileges
@@ -568,7 +568,7 @@ impl CommandHandler {
     }
 
     /// Handle NSINFO command - display information about a namespace
-    async fn handle_nsinfo(&self, name: String) -> Frame {
+    fn handle_nsinfo(&self, name: String) -> Frame {
         debug!("Handling NSINFO command for namespace: {}", name);
         match self.storage.get_namespace_meta(&name) {
             Ok(meta) => {
@@ -597,7 +597,7 @@ impl CommandHandler {
     }
 
     /// Handle NSLIST command - list all namespaces
-    async fn handle_nslist(&self) -> Frame {
+    fn handle_nslist(&self) -> Frame {
         debug!("Handling NSLIST command");
 
         // NSLIST is available to all users, no admin check required
@@ -624,7 +624,7 @@ impl CommandHandler {
     }
 
     /// Handle NSSET command - set a property for a namespace
-    async fn handle_nsset(&self, namespace: String, property: String, value: String) -> Frame {
+    fn handle_nsset(&self, namespace: String, property: String, value: String) -> Frame {
         debug!(
             "Handling NSSET command for namespace: {}, property: {}, value: {}",
             namespace, property, value
@@ -718,7 +718,7 @@ impl CommandHandler {
     }
 
     /// Handle SCAN command - scan keys in the current namespace
-    async fn handle_scan(&self, cursor: Option<String>) -> Frame {
+    fn handle_scan(&self, cursor: Option<String>) -> Frame {
         debug!("Handling SCAN command with cursor: {:?}", cursor);
 
         // Convert the cursor from String to Vec<u8> if it exists
@@ -761,7 +761,7 @@ impl CommandHandler {
     }
 
     /// Handle RSCAN command - scan keys in the current namespace in backward direction
-    async fn handle_rscan(&self, cursor: Option<String>) -> Frame {
+    fn handle_rscan(&self, cursor: Option<String>) -> Frame {
         debug!("Handling RSCAN command with cursor: {:?}", cursor);
 
         // Convert the cursor from String to Vec<u8> if it exists
@@ -805,7 +805,7 @@ impl CommandHandler {
 
     /// Handle FLUSH command - delete all keys in the current namespace
     /// This command is only allowed on private and password protected namespaces
-    async fn handle_flush(&self) -> Frame {
+    fn handle_flush(&self) -> Frame {
         debug!("Handling FLUSH command");
 
         // Get namespace properties
@@ -846,7 +846,7 @@ impl CommandHandler {
 
     /// Handle TIME command - returns the current server time as a two-element array: [seconds, microseconds]
     /// This is fully compatible with Redis TIME command
-    fn handle_time(&self) -> Frame {
+    fn handle_time() -> Frame {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         debug!("Handling TIME command");

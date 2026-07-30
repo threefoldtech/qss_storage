@@ -175,7 +175,7 @@ impl Session {
                     debug!("Received frame: {:?}", frame);
                     pos += len;
 
-                    let response = self.dispatch(frame).await;
+                    let response = self.dispatch(frame);
                     self.write_response(&response).await?;
                 }
                 Ok(None) => break, // Need more data
@@ -193,14 +193,14 @@ impl Session {
     ///
     /// SELECT and AUTH are special: they rebind this session's handler, so they
     /// are served here rather than by `CommandHandler`.
-    async fn dispatch(&mut self, frame: Frame) -> Frame {
+    fn dispatch(&mut self, frame: Frame) -> Frame {
         match Command::from_frame(frame) {
             Ok(Command::Select {
                 namespace,
                 password,
             }) => self.select_namespace(namespace, password),
             Ok(Command::Auth { password }) => self.authenticate(password),
-            Ok(cmd) => self.handler.execute(cmd).await,
+            Ok(cmd) => self.handler.execute(cmd),
             Err(e) => {
                 error!("Error parsing command: {}", e);
                 Frame::Error(format!("Error: {}", e))
