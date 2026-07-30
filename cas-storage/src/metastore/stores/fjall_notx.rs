@@ -101,8 +101,18 @@ impl FjallNoTransaction {
     }
 }
 
-unsafe impl Send for FjallNoTransaction {}
-unsafe impl Sync for FjallNoTransaction {}
+// ---- tfstor-extension: BEGIN ----
+// Upstream had `unsafe impl Send`/`Sync` here. Both are redundant: the fields
+// (`Arc<FjallStoreNotx>`, `Vec<(String, Vec<u8>)>`) are `Send + Sync`, so the
+// auto impls apply. Deleted so the compiler notices if a future field changes
+// that; the assertions pin the claim at the definition.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+    assert_send::<FjallNoTransaction>();
+    assert_sync::<FjallNoTransaction>();
+};
+// ---- tfstor-extension: END ----
 
 impl TransactionBackend for FjallNoTransaction {
     fn commit(&mut self) -> Result<(), MetaError> {

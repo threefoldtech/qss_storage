@@ -99,6 +99,11 @@ than a proof -- a mutex guard released on a thread other than the one that
 took it is only sound on some platforms, and what makes it a non-issue here is
 that the single caller never holds a transaction across an `.await`.
 
+### `unsafe impl Send`/`Sync for FjallNoTransaction` deleted
+Both redundant: the fields (`Arc<FjallStoreNotx>`, `Vec<(String, Vec<u8>)>`)
+are `Send + Sync`, so the auto impls apply. Same `const _` static assertions
+in their place.
+
 ### `unsafe impl Sync for BlockStream` deleted
 Also never needed, also unjustified. Every field is already `Sync`, including
 `open_fut`, whose boxed future carries an explicit `+ Send + Sync` bound in the
