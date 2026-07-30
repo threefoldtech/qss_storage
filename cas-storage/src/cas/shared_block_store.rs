@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::hasher::Hasher;
 use crate::metastore::{
-    BaseMetaTree, BlockTree, Durability, FjallStore, FjallStoreNotx, MetaError, MetaStore,
+    BaseMetaTree, BlockTree, Durability, FjallStore, FjallStoreNotx, HeaderSpec, MetaError,
+    MetaStore, StoreHeader,
 };
 
 use super::{StorageEngine, multipart::MultiPartTree};
@@ -16,21 +18,31 @@ pub struct SharedBlockStore {
     block_tree: Arc<BlockTree>,
     path_tree: Arc<dyn BaseMetaTree>,
     multipart_tree: Arc<MultiPartTree>,
+    header: StoreHeader,
+    hasher: Hasher,
 }
 
 impl SharedBlockStore {
-    /// Create a new SharedBlockStore
+    /// Create a new SharedBlockStore, or open an existing one.
+    ///
+    /// The block DB is the store whose header decides how blocks are
+    /// addressed, so this is where the [`Hasher`] comes from. A store whose
+    /// header names a hash this build does not have is refused here rather
+    /// than mis-addressed later.
     ///
     /// # Arguments
     /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/db)
     /// * `storage_engine` - Storage engine (Fjall or FjallNotx)
     /// * `inlined_metadata_size` - Maximum size for inlined metadata
     /// * `durability` - Durability level for transactions
+    /// * `spec` - Hash written into the header of a *new* store; ignored when
+    ///   an existing store is opened. `None` takes [`HeaderSpec::default`].
     pub fn new(
         mut path: PathBuf,
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
+        spec: Option<HeaderSpec>,
     ) -> Result<Self, MetaError> {
         path.push("db");
 
@@ -39,10 +51,12 @@ impl SharedBlockStore {
         std::fs::create_dir_all(&path).ok();
         path = path.canonicalize().unwrap_or(path);
 
-        let meta_store = match storage_engine {
+        let spec = spec.unwrap_or_default();
+        let (meta_store, header) = match storage_engine {
             StorageEngine::Fjall => {
-                let store = FjallStore::new(path, inlined_metadata_size, durability);
-                MetaStore::new(store, inlined_metadata_size)
+                MetaStore::open_or_create(path, inlined_metadata_size, spec, |p| {
+                    FjallStore::new(p, inlined_metadata_size, durability)
+                })?
             }
             StorageEngine::FjallNotx => {
                 tracing::warn!(
@@ -53,8 +67,9 @@ impl SharedBlockStore {
                      (3) durability parameter is ignored. \
                      For production multi-user deployments, consider using 'fjall' instead."
                 );
-                let store = FjallStoreNotx::new(path, inlined_metadata_size);
-                MetaStore::new(store, inlined_metadata_size)
+                MetaStore::open_or_create(path, inlined_metadata_size, spec, |p| {
+                    FjallStoreNotx::new(p, inlined_metadata_size)
+                })?
             }
         };
 
@@ -68,7 +83,20 @@ impl SharedBlockStore {
             block_tree: Arc::new(block_tree),
             path_tree,
             multipart_tree: Arc::new(multipart_tree),
+            header,
+            hasher: header.hasher(),
         })
+    }
+
+    /// The hash function this store's blocks are addressed by, as recorded in
+    /// its header at creation.
+    pub fn hasher(&self) -> Hasher {
+        self.hasher
+    }
+
+    /// The store header, for tools that report on it.
+    pub fn header(&self) -> StoreHeader {
+        self.header
     }
 
     /// Get a reference to the shared block tree

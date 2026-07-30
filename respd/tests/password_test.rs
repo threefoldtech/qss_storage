@@ -55,7 +55,9 @@ impl TestServer {
                 println!("Listening on: 127.0.0.1:{}", port);
 
                 // Create a shared storage instance
-                let storage = Arc::new(respd::storage::Storage::new(thread_data_dir, None));
+                let storage = Arc::new(
+                    respd::storage::Storage::new(thread_data_dir, None).expect("can open storage"),
+                );
 
                 // Create a shared namespace cache
                 let namespace_cache = Arc::new(respd::namespace::NamespaceCache::new(storage.clone()));

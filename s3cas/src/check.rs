@@ -46,6 +46,7 @@ pub async fn check_integrity(args: CheckConfig) -> Result<()> {
         storage_engine,
         None,
         None,
+        None,
     )?;
 
     let (obj_meta, _) = match casfs.get_object_paths(&args.bucket, &args.key)? {

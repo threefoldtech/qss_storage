@@ -92,6 +92,11 @@ impl<'a> Reader<'a> {
         Ok(self.take(field, 1)?[0])
     }
 
+    pub(crate) fn u16(&mut self, field: &'static str) -> Result<u16, FsError> {
+        let raw: [u8; 2] = self.take(field, 2)?.try_into().unwrap();
+        Ok(u16::from_le_bytes(raw))
+    }
+
     pub(crate) fn u64(&mut self, field: &'static str) -> Result<u64, FsError> {
         let raw: [u8; 8] = self.take(field, 8)?.try_into().unwrap();
         Ok(u64::from_le_bytes(raw))

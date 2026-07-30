@@ -9,7 +9,7 @@ use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
     BaseMetaTree, BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore,
-    FjallStoreNotx, MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
+    FjallStoreNotx, HeaderSpec, MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
 use super::byte_stream::AsyncByteStream;
@@ -56,6 +56,15 @@ impl CasFS {
     ///   `root/blocks/` - block data files
     ///   `namespace_meta_path/db/` - this namespace's metadata DB
     ///   (the shared DB lives wherever `SharedBlockStore::new` was given)
+    ///
+    /// The namespace DB is headered like every other store. Its header takes
+    /// the hash the shared block store already carries, so the two DBs of one
+    /// deployment can never disagree about how blocks are addressed.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::Header`] if the namespace DB exists but its header is
+    /// missing or unacceptable; see [`MetaStore::open_or_create`].
     pub fn new(
         mut root: PathBuf,
         mut namespace_meta_path: PathBuf,
@@ -64,7 +73,7 @@ impl CasFS {
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
-    ) -> Self {
+    ) -> Result<Self, MetaError> {
         namespace_meta_path.push("db");
         root.push("blocks");
 
@@ -78,24 +87,27 @@ impl CasFS {
             .canonicalize()
             .unwrap_or(namespace_meta_path);
 
-        let namespace = match storage_engine {
+        let spec = HeaderSpec::from(shared.hasher());
+        let (namespace, _header) = match storage_engine {
             StorageEngine::Fjall => {
-                let store = FjallStore::new(namespace_meta_path, inlined_metadata_size, durability);
-                MetaStore::new(store, inlined_metadata_size)
+                MetaStore::open_or_create(namespace_meta_path, inlined_metadata_size, spec, |p| {
+                    FjallStore::new(p, inlined_metadata_size, durability)
+                })?
             }
             StorageEngine::FjallNotx => {
-                let store = FjallStoreNotx::new(namespace_meta_path, inlined_metadata_size);
-                MetaStore::new(store, inlined_metadata_size)
+                MetaStore::open_or_create(namespace_meta_path, inlined_metadata_size, spec, |p| {
+                    FjallStoreNotx::new(p, inlined_metadata_size)
+                })?
             }
         };
 
-        Self {
+        Ok(Self {
             async_fs: Box::new(RealAsyncFs),
             namespace,
             shared,
             root,
             metrics,
-        }
+        })
     }
 
     /// Convenience constructor for single-namespace consumers (CLI ops,
@@ -104,6 +116,11 @@ impl CasFS {
     /// Builds a dedicated `SharedBlockStore` at `meta_path.join("blocks")`
     /// and returns a `CasFS` whose namespace metadata lives at
     /// `meta_path/db/`.
+    ///
+    /// Two headered DBs are involved: the blocks DB, whose header names the
+    /// block hash, and the namespace DB, which inherits it. `spec` applies
+    /// only to DBs that are created now; `None` takes
+    /// [`HeaderSpec::default`].
     pub fn single_namespace(
         root: PathBuf,
         meta_path: PathBuf,
@@ -111,14 +128,16 @@ impl CasFS {
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
+        spec: Option<HeaderSpec>,
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
             storage_engine,
             inlined_metadata_size,
             durability,
+            spec,
         )?);
-        Ok(Self::new(
+        Self::new(
             root,
             meta_path,
             shared,
@@ -126,7 +145,13 @@ impl CasFS {
             storage_engine,
             inlined_metadata_size,
             durability,
-        ))
+        )
+    }
+
+    /// The hash function this filesystem addresses blocks with, taken from the
+    /// block store's header at open.
+    pub fn hasher(&self) -> crate::hasher::Hasher {
+        self.shared.hasher()
     }
 
     pub(super) fn path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
@@ -350,6 +375,7 @@ mod tests {
             storage_engine,
             Some(1),
             Some(Durability::Buffer),
+            None,
         )
         .unwrap();
         (fs, dir)

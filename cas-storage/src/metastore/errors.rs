@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 use std::fmt::{Display, Formatter};
+
+use super::store_header::StoreHeaderError;
 
 /// Errors produced when decoding on-disk records.
 ///
@@ -85,6 +88,25 @@ pub enum MetaError {
     OtherDBError(String),
     /// A stored record failed to decode; carries the decode error.
     Corruption(FsError),
+    /// The store at `path` may not be opened; carries the reason. This is the
+    /// refusal an operator sees at startup, so it names both the store and
+    /// what is wrong with its header.
+    Header {
+        path: String,
+        source: StoreHeaderError,
+    },
+    /// A bucket name that the store reserves for itself was requested.
+    ReservedBucketName(String),
+}
+
+impl MetaError {
+    /// Builds the refusal for a store whose header will not let it be opened.
+    pub(crate) fn header(path: &Path, source: StoreHeaderError) -> Self {
+        MetaError::Header {
+            path: path.display().to_string(),
+            source,
+        }
+    }
 }
 
 // Implement the std::error::Error trait
@@ -92,6 +114,7 @@ impl Error for MetaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             MetaError::Corruption(e) => Some(e),
+            MetaError::Header { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -113,6 +136,14 @@ impl fmt::Display for MetaError {
             MetaError::BlockNotFound => write!(f, "Block not found"),
             MetaError::OtherDBError(ref s) => write!(f, "Other DB error: {s}"),
             MetaError::Corruption(ref e) => write!(f, "Corrupt record: {e}"),
+            MetaError::Header {
+                ref path,
+                ref source,
+            } => write!(f, "cannot open metadata store at {path}: {source}"),
+            MetaError::ReservedBucketName(ref name) => write!(
+                f,
+                "bucket name \"{name}\" is reserved: names starting with '_' belong to the store's internal trees"
+            ),
         }
     }
 }

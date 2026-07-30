@@ -1,7 +1,9 @@
 use std::convert::TryFrom;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::store_header::{self, HeaderSpec, StoreHeader, StoreHeaderError, StoreInit};
 use super::{BaseMetaTree, Block, BlockId, BucketMeta, MetaError, MetaTreeExt, Object, Store};
 
 /// `MetaStore` is a struct that provides methods to interact with the metadata store.
@@ -24,6 +26,11 @@ const DEFAULT_PATH_TREE: &str = "_PATHS";
 impl MetaStore {
     /// Creates a new MetaStore instance with the given store implementation.
     ///
+    /// This constructor neither writes nor checks the store header, so it will
+    /// happily wrap a database of any vintage. Production code opens stores
+    /// with [`MetaStore::open_or_create`] instead; this one stays for tests,
+    /// benchmarks and tools that deliberately want the unvalidated view.
+    ///
     /// # Arguments
     /// * `store` - The storage backend implementation
     /// * `inlined_metadata_size` - Optional size limit for inlined metadata. If None, a default value is used.
@@ -37,6 +44,59 @@ impl MetaStore {
             store: Arc::new(store),
             inlined_metadata_size: inlined_metadata_size.unwrap_or(DEFAULT_INLINED_METADATA_SIZE),
         }
+    }
+
+    /// Opens the store at `db_path`, creating it with a fresh QSST header if
+    /// there is nothing there yet.
+    ///
+    /// `build` is handed the path and must open the backing database. It runs
+    /// *after* the create-or-open decision has been made, which is the whole
+    /// point of taking a closure: opening a fjall database creates the
+    /// directory and its partitions, so once `build` has run the question
+    /// "was there a store here?" can no longer be answered.
+    ///
+    /// The rule is: a path that does not exist, or an empty directory, is a
+    /// new store and gets `spec`'s hash written into its header plus a sidecar
+    /// copy next to the db directory. Anything else is an existing store, and
+    /// its header decides -- `spec` is ignored, because its blocks are already
+    /// addressed by whatever the header says.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::Header`] if the store has no header (it predates the
+    /// format), or one this build refuses: foreign magic, an unsupported
+    /// version, or a hash it does not have. There is no fallback; see
+    /// [`super::store_header`].
+    pub fn open_or_create<S: Store + 'static>(
+        db_path: PathBuf,
+        inlined_metadata_size: Option<usize>,
+        spec: HeaderSpec,
+        build: impl FnOnce(PathBuf) -> S,
+    ) -> Result<(Self, StoreHeader), MetaError> {
+        let init = store_header::classify_db_dir(&db_path)?;
+
+        let meta = Self::new(build(db_path.clone()), inlined_metadata_size);
+
+        let header = match init {
+            StoreInit::Create => {
+                let header =
+                    StoreHeader::create(spec).map_err(|e| MetaError::header(&db_path, e))?;
+                store_header::write_header(&*meta.store, &header)?;
+                store_header::write_sidecar(&db_path, &header);
+                tracing::debug!(
+                    "created QSST store at {} (version {}, algo {}, width {})",
+                    db_path.display(),
+                    header.version(),
+                    header.hash_algo(),
+                    header.hash_width()
+                );
+                header
+            }
+            StoreInit::Open => store_header::read_header(&*meta.store, &db_path)?
+                .ok_or_else(|| MetaError::header(&db_path, StoreHeaderError::Missing))?,
+        };
+
+        Ok((meta, header))
     }
 
     /// Returns the maximum length of the data that can be inlined in the metadata object.
@@ -166,7 +226,20 @@ impl MetaStore {
     ///
     /// # Returns
     /// Success or an error if the insertion fails
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::ReservedBucketName`] for a name starting with `_`. A
+    /// bucket becomes a tree of its own name, so such a bucket would collide
+    /// with the store's internal trees (`_STORE_HEADER`, `_BUCKETS`,
+    /// `_BLOCKS`, `_PATHS`, `_MULTIPART_PARTS`) and hand a client the store's
+    /// own bookkeeping. S3 bucket naming forbids these names anyway; this is
+    /// the store enforcing it for every caller, respd included.
     pub fn insert_bucket(&self, bucket_name: &str, raw_bucket: Vec<u8>) -> Result<(), MetaError> {
+        if bucket_name.starts_with('_') {
+            return Err(MetaError::ReservedBucketName(bucket_name.to_string()));
+        }
+
         // Insert the bucket metadata into the buckets tree
         let buckets = self.store.tree_open(DEFAULT_BUCKET_TREE)?;
         buckets.insert(bucket_name.as_bytes(), raw_bucket)?;
@@ -758,6 +831,41 @@ mod tests {
             ),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// A bucket becomes a tree of its own name, so a bucket named like one of
+    /// the store's internal trees would hand a client the store's bookkeeping.
+    /// Creation must refuse the whole `_` namespace, and refuse it before
+    /// anything is written.
+    #[test]
+    fn insert_bucket_refuses_reserved_names() {
+        let (meta, _dir) = test_store();
+
+        for name in [
+            "_STORE_HEADER",
+            "_BLOCKS",
+            "_PATHS",
+            "_MULTIPART_PARTS",
+            "_",
+        ] {
+            let raw = BucketMeta::new(name.to_string()).to_vec();
+            match meta.insert_bucket(name, raw).unwrap_err() {
+                MetaError::ReservedBucketName(refused) => assert_eq!(refused, name),
+                other => panic!("unexpected error for {name}: {other:?}"),
+            }
+        }
+
+        // The refusal is not a side effect of the name existing already: a
+        // name nothing internal uses is refused just the same, and no tree is
+        // left behind.
+        let raw = BucketMeta::new("_private".to_string()).to_vec();
+        assert!(meta.insert_bucket("_private", raw).is_err());
+        assert!(!meta.bucket_exists("_private").unwrap());
+
+        // An ordinary name is unaffected.
+        let raw = BucketMeta::new("photos".to_string()).to_vec();
+        meta.insert_bucket("photos", raw).unwrap();
+        assert!(meta.bucket_exists("photos").unwrap());
     }
 
     /// The ordinary case: a fresh hash takes the one-byte prefix, and a second

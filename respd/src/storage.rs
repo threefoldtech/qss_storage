@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use cas_storage::{Durability, FjallStore, MetaError, MetaStore, MetaTreeExt};
+use cas_storage::{Durability, FjallStore, HeaderSpec, MetaError, MetaStore, MetaTreeExt};
 
 // Default tree name for key-value storage
 // No longer using a default tree name as we'll use the namespace as the tree name
@@ -18,16 +18,30 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Create a new MetaStorage instance
-    pub fn new(data_dir: PathBuf, inlined_metadata_size: Option<usize>) -> Self {
+    /// Create a new MetaStorage instance, or open the one already at
+    /// `data_dir`.
+    ///
+    /// respd never addresses a block, but its DB carries the same QSST header
+    /// as every other store in this workspace: that is what gives it format
+    /// versioning, and what makes a store from before the format refuse to
+    /// open instead of being read as garbage.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::Header`] if the directory holds a store this build will
+    /// not open; the message names the store and the reason.
+    pub fn new(data_dir: PathBuf, inlined_metadata_size: Option<usize>) -> Result<Self, MetaError> {
         // Create the metastore with FjallStore backend
         // Strongest persist mode (POSIX fsync semantics: data + metadata);
         // same behavior as before the Durability naming was untangled.
-        let fjall_store = FjallStore::new(data_dir, inlined_metadata_size, Some(Durability::Fsync));
+        let (store, _header) = MetaStore::open_or_create(
+            data_dir,
+            inlined_metadata_size,
+            HeaderSpec::default(),
+            |path| FjallStore::new(path, inlined_metadata_size, Some(Durability::Fsync)),
+        )?;
 
-        let store = MetaStore::new(fjall_store, inlined_metadata_size);
-
-        Self { store }
+        Ok(Self { store })
     }
 
     /// Initialize the default namespace if it doesn't exist

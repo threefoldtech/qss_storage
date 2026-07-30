@@ -127,7 +127,7 @@ fn main() -> Result<()> {
                 println!("Number of keys in bucket '{}': {}", bucket_name, num_keys);
             }
             InspectCommand::DiskSpace => {
-                let disk_space = disk_space(meta_root, metadata_db);
+                let disk_space = disk_space(meta_root, metadata_db)?;
                 println!("Disk space: {}", disk_space);
             }
         },
@@ -157,6 +157,7 @@ async fn run(args: ServerConfig) -> anyhow::Result<()> {
         storage_engine,
         args.inline_metadata_size,
         Some(args.durability),
+        None,
     )?;
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
     let s3fs = s3cas::metrics::MetricFs::new(s3fs, metrics.clone());

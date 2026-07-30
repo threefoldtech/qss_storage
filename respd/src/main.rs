@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     // Initialize storage
     // set the inlined metadata size to 1byte effectily enabling it for all keys
-    let storage = storage::Storage::new(opt.data_dir.clone(), Some(1));
+    let storage = storage::Storage::new(opt.data_dir.clone(), Some(1))?;
 
     // Start server
     info!("Starting respd server on {}:{}", opt.host, opt.port);

@@ -26,6 +26,7 @@
 //!     StorageEngine::Fjall,
 //!     None,                // inlined_metadata_size
 //!     Some(Durability::Fsync),
+//!     None,                // header spec (defaults to blake3/32)
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())
@@ -46,6 +47,7 @@
 //!     StorageEngine::Fjall,
 //!     None,
 //!     Some(Durability::Fsync),
+//!     None,                // header spec (defaults to blake3/32)
 //! )?);
 //!
 //! // One CasFS per namespace (e.g. per user)
@@ -57,7 +59,7 @@
 //!     StorageEngine::Fjall,
 //!     None,
 //!     Some(Durability::Fsync),
-//! );
+//! )?;
 //! # Ok(())
 //! # }
 //! ```
@@ -84,6 +86,8 @@ pub use metastore::{
     Durability,
     FjallStore,
     FjallStoreNotx,
+    // Store header (format versioning)
+    HeaderSpec,
     MetaError,
     MetaStore,
     MetaTreeExt,
@@ -91,6 +95,8 @@ pub use metastore::{
     ObjectData,
     ObjectType,
     Store,
+    StoreHeader,
+    StoreHeaderError,
     Transaction,
 };
 

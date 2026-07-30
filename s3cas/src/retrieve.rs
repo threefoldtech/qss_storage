@@ -48,6 +48,7 @@ pub async fn retrieve(args: RetrieveConfig) -> Result<()> {
         storage_engine,
         None,
         None,
+        None,
     )?;
 
     let (obj_meta, paths) = match casfs.get_object_paths(&args.bucket, &args.key)? {

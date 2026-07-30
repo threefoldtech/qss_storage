@@ -79,12 +79,21 @@ static CONFIG: Lazy<SdkConfig> = Lazy::new(|| {
         .cloned()
         .unwrap_or(s3cas::cas::StorageEngine::Fjall);
     let inlined_size = CONFIG_SIZE.lock().unwrap().or(Some(1));
+
+    // Start from an empty directory. The store carries a format header now,
+    // so a store left behind by an older build is refused at open instead of
+    // being reused -- which is the point of the header, but it would leave
+    // this suite failing on a stale target/ directory rather than on
+    // anything it tests.
+    let _ = std::fs::remove_dir_all(FS_ROOT);
+
     let casfs = s3cas::cas::CasFS::single_namespace(
         FS_ROOT.into(),
         FS_ROOT.into(),
         metrics.to_cas(),
         storage_engine,
         inlined_size,
+        None,
         None,
     )
     .expect("can construct CasFS");

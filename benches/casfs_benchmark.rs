@@ -35,6 +35,7 @@ fn setup_casfs() -> (CasFS, TempDir) {
         storage_engine,
         inlined_metadata_size,
         durability,
+        None,
     )
     .unwrap();
 
