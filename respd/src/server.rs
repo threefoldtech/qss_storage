@@ -65,50 +65,101 @@ pub async fn process(
     namespace_cache: Arc<NamespaceCache>,
     admin_password: Option<String>,
 ) -> Result<()> {
-    // Create a connection abstraction
-    // If no admin password is required, all connections are admin by default
-    let is_admin = admin_password.is_none();
-    let mut conn = Conn::new(socket, is_admin);
+    Session::new(socket, storage, namespace_cache, admin_password)?
+        .run()
+        .await
+}
 
-    // Try to get or create a namespace for the default namespace using the cache
-    let namespace = match namespace_cache.create_if_not_exists(conn.get_namespace()) {
-        Ok(namespace) => namespace,
-        Err(e) => {
-            error!("Failed to initialize default namespace: {}", e);
-            return Err(anyhow::anyhow!(
-                "Failed to initialize default namespace: {}",
-                e
-            ));
-        }
-    };
+/// Signals that the connection can no longer be written to.
+struct WriteFailed;
 
-    // Create a command handler with the connection's namespace, namespace cache, and admin status
-    let mut handler = CommandHandler::new(
-        storage.clone(),
-        namespace,
-        namespace_cache.clone(),
-        conn.is_admin(),
-    );
+/// Everything one client connection owns: the socket, the handler bound to the
+/// connection's current namespace, and the shared state needed to rebind that
+/// handler when SELECT or AUTH changes the connection's identity.
+struct Session {
+    conn: Conn,
+    handler: CommandHandler,
+    storage: Arc<Storage>,
+    namespace_cache: Arc<NamespaceCache>,
+    admin_password: Option<String>,
+}
 
-    // Use BytesMut for zero-copy operations
-    let mut buffer = BytesMut::with_capacity(4096);
+impl Session {
+    fn new(
+        socket: TcpStream,
+        storage: Arc<Storage>,
+        namespace_cache: Arc<NamespaceCache>,
+        admin_password: Option<String>,
+    ) -> Result<Self> {
+        // If no admin password is required, all connections are admin by default
+        let is_admin = admin_password.is_none();
+        let conn = Conn::new(socket, is_admin);
 
-    // Process commands
-    loop {
-        // Read data directly into BytesMut buffer
-        // This avoids an extra copy compared to using Vec<u8>
-        let _n = match conn.read_buf(&mut buffer).await {
-            Ok(0) => break, // Connection closed
-            Ok(n) => n,
+        // Try to get or create a namespace for the default namespace using the cache
+        let namespace = match namespace_cache.create_if_not_exists(conn.get_namespace()) {
+            Ok(namespace) => namespace,
             Err(e) => {
-                error!("Error reading from socket: {}", e);
-                break;
+                error!("Failed to initialize default namespace: {}", e);
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize default namespace: {}",
+                    e
+                ));
             }
         };
 
-        // No need to append data as we're reading directly into the buffer
-        // Try to parse a frame from the buffer
+        // Create a command handler with the connection's namespace, namespace cache, and admin status
+        let handler = CommandHandler::new(
+            storage.clone(),
+            namespace,
+            namespace_cache.clone(),
+            conn.is_admin(),
+        );
+
+        Ok(Self {
+            conn,
+            handler,
+            storage,
+            namespace_cache,
+            admin_password,
+        })
+    }
+
+    /// Read from the socket until the client goes away, answering every
+    /// complete frame that arrives.
+    async fn run(mut self) -> Result<()> {
+        // Use BytesMut for zero-copy operations
+        let mut buffer = BytesMut::with_capacity(4096);
+
+        loop {
+            // Read data directly into BytesMut buffer
+            // This avoids an extra copy compared to using Vec<u8>
+            match self.conn.read_buf(&mut buffer).await {
+                Ok(0) => break, // Connection closed
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Error reading from socket: {}", e);
+                    break;
+                }
+            }
+
+            let consumed = self.serve_buffered_frames(&buffer).await;
+
+            // Remove processed data using split_to which is zero-copy
+            if consumed > 0 {
+                let _ = buffer.split_to(consumed); // Ignore the return value as suggested by the compiler
+            }
+        }
+
+        debug!("Client disconnected");
+        Ok(())
+    }
+
+    /// Answer every complete frame sitting in `buffer`, returning how many
+    /// bytes were consumed. Stops early on a partial frame, a malformed frame,
+    /// or a failed write.
+    async fn serve_buffered_frames(&mut self, buffer: &[u8]) -> usize {
         let mut pos = 0;
+
         while pos < buffer.len() {
             // Create a slice starting at the current position
             match RespHelper::parse_frame(&buffer[pos..]) {
@@ -116,142 +167,9 @@ pub async fn process(
                     debug!("Received frame: {:?}", frame);
                     pos += len;
 
-                    // Process the frame
-                    // Select and Auth commands are special so we handle them separately here
-                    let response = match Command::from_frame(frame) {
-                        Ok(Command::Select {
-                            namespace,
-                            password,
-                        }) => {
-                            // Special handling for SELECT command to switch namespaces
-                            debug!("Handling SELECT command for namespace: {}", namespace);
-
-                            // Switch the connection's namespace
-                            conn.set_namespace(namespace.clone());
-
-                            // Get or create the namespace from the cache
-                            match namespace_cache.get_or_create(namespace.clone()) {
-                                Ok(namespace_obj) => {
-                                    // Check if the namespace has a password
-                                    let is_authenticated =
-                                        match storage.get_namespace_meta(&namespace) {
-                                            Ok(meta) => {
-                                                match &meta.password {
-                                                    Some(ns_password) => {
-                                                        // If password is provided and matches, authenticate
-                                                        if let Some(provided_password) = &password {
-                                                            // We'll set the authentication status in the CommandHandler later
-                                                            provided_password == ns_password
-                                                        } else {
-                                                            // No password provided, but namespace has one
-                                                            // User can still access but can't write
-                                                            // We'll set the authentication status in the CommandHandler later
-                                                            false
-                                                        }
-                                                    }
-                                                    None => {
-                                                        // Namespace has no password, always authenticated
-                                                        // We'll set the authentication status in the CommandHandler later
-                                                        true
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Error getting namespace metadata: {}", e);
-                                                // Default to not authenticated on error
-                                                // We'll set the authentication status in the CommandHandler later
-                                                false
-                                            }
-                                        };
-
-                                    // Update the handler with the new namespace
-                                    // Create a new command handler with the new namespace
-                                    let mut new_handler = CommandHandler::new(
-                                        storage.clone(),
-                                        namespace_obj,
-                                        namespace_cache.clone(),
-                                        conn.is_admin(),
-                                    );
-
-                                    // Set the authentication status in the new handler
-                                    new_handler.set_namespace_authenticated(is_authenticated);
-                                    handler = new_handler;
-
-                                    if is_authenticated {
-                                        Frame::SimpleString("OK".into())
-                                    } else {
-                                        Frame::SimpleString("OK (read-only access)".into())
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Error selecting namespace: {}", e);
-                                    Frame::Error(format!("ERR {}", e))
-                                }
-                            }
-                        }
-                        Ok(Command::Auth { password }) => {
-                            // Special handling for AUTH command to authenticate the connection
-                            debug!("Handling AUTH command");
-
-                            // Check if authentication is required
-                            match &admin_password {
-                                Some(admin_pwd) => {
-                                    // Admin password is set, verify the provided password
-                                    if password == *admin_pwd {
-                                        // Password matches, grant admin privileges
-                                        conn.set_admin(true);
-
-                                        // Update the handler with the new admin status
-                                        // We need to recreate the namespace from the current namespace name
-                                        match namespace_cache.get_or_create(conn.get_namespace()) {
-                                            Ok(namespace) => {
-                                                // Update the handler with the new admin status
-                                                handler = CommandHandler::new(
-                                                    storage.clone(),
-                                                    namespace,
-                                                    namespace_cache.clone(),
-                                                    conn.is_admin(),
-                                                );
-                                                Frame::SimpleString("OK".into())
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Error recreating namespace after AUTH: {}",
-                                                    e
-                                                );
-                                                Frame::Error(format!("ERR {}", e))
-                                            }
-                                        }
-                                    } else {
-                                        // Password doesn't match
-                                        Frame::Error("ERR invalid password".into())
-                                    }
-                                }
-                                None => {
-                                    // No admin password set, all connections are already admin
-                                    Frame::SimpleString("OK".into())
-                                }
-                            }
-                        }
-                        Ok(cmd) => handler.execute(cmd).await,
-                        Err(e) => {
-                            error!("Error parsing command: {}", e);
-                            Frame::Error(format!("Error: {}", e))
-                        }
-                    };
-
-                    // Encode and send the response
-                    match RespHelper::encode_frame(&response) {
-                        Ok(bytes) => {
-                            if let Err(e) = conn.write_all(&bytes).await {
-                                error!("Error writing response: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error encoding response: {}", e);
-                            break;
-                        }
+                    let response = self.dispatch(frame).await;
+                    if self.write_response(&response).await.is_err() {
+                        break;
                     }
                 }
                 Ok(None) => break, // Need more data
@@ -262,12 +180,135 @@ pub async fn process(
             }
         }
 
-        // Remove processed data using split_to which is zero-copy
-        if pos > 0 {
-            let _ = buffer.split_to(pos); // Ignore the return value as suggested by the compiler
+        pos
+    }
+
+    /// Route one frame to its handler.
+    ///
+    /// SELECT and AUTH are special: they rebind this session's handler, so they
+    /// are served here rather than by `CommandHandler`.
+    async fn dispatch(&mut self, frame: Frame) -> Frame {
+        match Command::from_frame(frame) {
+            Ok(Command::Select {
+                namespace,
+                password,
+            }) => self.select_namespace(namespace, password),
+            Ok(Command::Auth { password }) => self.authenticate(password),
+            Ok(cmd) => self.handler.execute(cmd).await,
+            Err(e) => {
+                error!("Error parsing command: {}", e);
+                Frame::Error(format!("Error: {}", e))
+            }
         }
     }
 
-    debug!("Client disconnected");
-    Ok(())
+    /// SELECT: switch the connection to another namespace, rebinding the
+    /// handler with the authentication status implied by the password given.
+    fn select_namespace(&mut self, namespace: String, password: Option<String>) -> Frame {
+        debug!("Handling SELECT command for namespace: {}", namespace);
+
+        // Switch the connection's namespace
+        self.conn.set_namespace(namespace.clone());
+
+        // Get or create the namespace from the cache
+        match self.namespace_cache.get_or_create(namespace.clone()) {
+            Ok(namespace_obj) => {
+                let is_authenticated =
+                    self.namespace_password_accepted(&namespace, password.as_deref());
+
+                // Replace the handler with one bound to the new namespace
+                let mut new_handler = CommandHandler::new(
+                    self.storage.clone(),
+                    namespace_obj,
+                    self.namespace_cache.clone(),
+                    self.conn.is_admin(),
+                );
+                new_handler.set_namespace_authenticated(is_authenticated);
+                self.handler = new_handler;
+
+                if is_authenticated {
+                    Frame::SimpleString("OK".into())
+                } else {
+                    // Access is still granted, but writes will be refused
+                    Frame::SimpleString("OK (read-only access)".into())
+                }
+            }
+            Err(e) => {
+                error!("Error selecting namespace: {}", e);
+                Frame::Error(format!("ERR {}", e))
+            }
+        }
+    }
+
+    /// True when the namespace has no password, or `provided` matches it.
+    /// A namespace whose metadata cannot be read is treated as not authenticated.
+    fn namespace_password_accepted(&self, namespace: &str, provided: Option<&str>) -> bool {
+        match self.storage.get_namespace_meta(namespace) {
+            Ok(meta) => match &meta.password {
+                Some(ns_password) => provided == Some(ns_password.as_str()),
+                None => true,
+            },
+            Err(e) => {
+                error!("Error getting namespace metadata: {}", e);
+                false
+            }
+        }
+    }
+
+    /// AUTH: verify the admin password and, on success, rebind the handler so
+    /// it sees the connection's new admin status.
+    fn authenticate(&mut self, password: String) -> Frame {
+        debug!("Handling AUTH command");
+
+        let admin_password = match &self.admin_password {
+            Some(admin_password) => admin_password,
+            // No admin password set, all connections are already admin
+            None => return Frame::SimpleString("OK".into()),
+        };
+
+        if password != *admin_password {
+            return Frame::Error("ERR invalid password".into());
+        }
+
+        self.conn.set_admin(true);
+
+        // Rebuild the handler from the connection's current namespace so the
+        // new admin status takes effect
+        match self
+            .namespace_cache
+            .get_or_create(self.conn.get_namespace())
+        {
+            Ok(namespace) => {
+                self.handler = CommandHandler::new(
+                    self.storage.clone(),
+                    namespace,
+                    self.namespace_cache.clone(),
+                    self.conn.is_admin(),
+                );
+                Frame::SimpleString("OK".into())
+            }
+            Err(e) => {
+                error!("Error recreating namespace after AUTH: {}", e);
+                Frame::Error(format!("ERR {}", e))
+            }
+        }
+    }
+
+    /// Encode a reply and push it to the client.
+    async fn write_response(&mut self, response: &Frame) -> Result<(), WriteFailed> {
+        let bytes = match RespHelper::encode_frame(response) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Error encoding response: {}", e);
+                return Err(WriteFailed);
+            }
+        };
+
+        if let Err(e) = self.conn.write_all(&bytes).await {
+            error!("Error writing response: {}", e);
+            return Err(WriteFailed);
+        }
+
+        Ok(())
+    }
 }

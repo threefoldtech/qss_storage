@@ -27,15 +27,24 @@ impl TestServer {
         // Make sure the directory exists
         fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
-        // Find an available port
-        let port = Self::find_available_port();
+        // Bind here, on an OS-assigned port, and hand the bound listener to the
+        // server thread. Binding before the thread starts means the port can
+        // never be stolen in between, and the kernel queues connections in the
+        // listen backlog until the accept loop is up -- so no sleep is needed.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to address");
+        listener
+            .set_nonblocking(true)
+            .expect("Failed to set non-blocking");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
         println!("Starting respd server on port {}", port);
 
         // Create a shutdown channel
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
         // Start the server in a separate thread
-        let thread_port = port;
         let thread_data_dir = data_dir.clone();
         let thread_admin_password = admin_password.clone();
         let server_handle = thread::spawn(move || {
@@ -43,13 +52,7 @@ impl TestServer {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
             rt.block_on(async {
-                // Create a TCP listener
-                let addr = format!("127.0.0.1:{}", thread_port);
-                let listener = TcpListener::bind(&addr).expect("Failed to bind to address");
-                listener
-                    .set_nonblocking(true)
-                    .expect("Failed to set non-blocking");
-                println!("Listening on: {}", addr);
+                println!("Listening on: 127.0.0.1:{}", port);
 
                 // Create a shared storage instance
                 let storage = Arc::new(respd::storage::Storage::new(thread_data_dir, None));
@@ -103,26 +106,12 @@ impl TestServer {
             });
         });
 
-        // Give the server some time to start
-        sleep(Duration::from_secs(1));
-
         TestServer {
             port,
             _temp_dir: temp_dir,
             _server_handle: server_handle,
             shutdown_sender: Some(shutdown_sender),
         }
-    }
-
-    // Helper function to find an available port
-    fn find_available_port() -> u16 {
-        // Try to bind to port 0, which will assign a random available port
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to address");
-        // The listener will be dropped after this function returns, freeing the port
-        listener
-            .local_addr()
-            .expect("Failed to get local address")
-            .port()
     }
 
     fn connect(&self) -> Connection {
@@ -321,6 +310,66 @@ mod test_config {
         assert_eq!(mixed_result[0], Some(values[0].to_string()));
         assert_eq!(mixed_result[1], None);
         assert_eq!(mixed_result[2], Some(values[2].to_string()));
+    }
+
+    #[test]
+    fn test_dbsize() {
+        let server = TestServer::new();
+        let mut conn = server.connect();
+
+        // A fresh namespace holds no keys
+        let empty: i64 = redis::cmd("DBSIZE")
+            .query(&mut conn)
+            .expect("Failed to execute DBSIZE on empty namespace");
+        assert_eq!(empty, 0, "DBSIZE should be 0 for an empty namespace");
+
+        // After N SETs, DBSIZE reports N
+        let num_keys = 7;
+        for i in 0..num_keys {
+            let _: () = redis::cmd("SET")
+                .arg(format!("dbsize_key_{}", i))
+                .arg(format!("value_{}", i))
+                .query(&mut conn)
+                .expect("Failed to set key");
+        }
+
+        let after_set: i64 = redis::cmd("DBSIZE")
+            .query(&mut conn)
+            .expect("Failed to execute DBSIZE after SETs");
+        assert_eq!(
+            after_set, num_keys,
+            "DBSIZE should count every key that was set"
+        );
+
+        // Overwriting an existing key does not change the count
+        let _: () = redis::cmd("SET")
+            .arg("dbsize_key_0")
+            .arg("overwritten")
+            .query(&mut conn)
+            .expect("Failed to overwrite key");
+
+        let after_overwrite: i64 = redis::cmd("DBSIZE")
+            .query(&mut conn)
+            .expect("Failed to execute DBSIZE after overwrite");
+        assert_eq!(
+            after_overwrite, num_keys,
+            "Overwriting a key should not change DBSIZE"
+        );
+
+        // After a DEL, DBSIZE reports N-1
+        let _: i64 = redis::cmd("DEL")
+            .arg("dbsize_key_0")
+            .query(&mut conn)
+            .expect("Failed to delete key");
+
+        let after_del: i64 = redis::cmd("DBSIZE")
+            .query(&mut conn)
+            .expect("Failed to execute DBSIZE after DEL");
+        assert_eq!(
+            after_del,
+            num_keys - 1,
+            "DBSIZE should drop by one after a DEL"
+        );
     }
 
     #[test]
