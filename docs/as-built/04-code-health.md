@@ -32,21 +32,21 @@ status. Commits are on `development`.
 | H5 BlockStream Sync | **Fixed** -- deleted; static assertion in its place | `16591a5` |
 | H6 unchecked UTF-8 | **Fixed** -- all six sites validate; `range_filter` sites log-and-skip (trait signature unchanged, see EXTENSIONS.md) | `16591a5` |
 | (H2 adjacent) FjallNoTransaction unsafe impls | **Fixed** -- both redundant, deleted with static assertions | `a5722c8` |
-| H7 Content-MD5 unverified | Open | -- |
+| H7 Content-MD5 unverified | **Fixed** -- malformed headers rejected as `InvalidDigest`; mismatches return `BadDigest` (inlined path checks before storing, streamed path rolls the object back, upload_part fails before the part is registered). Bonus: missing Content-Length no longer panics `put_object` | -- |
 | H8 num_keys unwrap | **Fixed** -- returns `Result`; no in-tree caller needed changes | `58ca932` |
-| H9 async_trait in metrics | Open (s3fs.rs occurrence stays, forced by s3s) | -- |
-| H10 truncating casts | Open | -- |
-| H11 module style | Open (cosmetic) | -- |
+| H9 async_trait in metrics | **Closed, no change** -- the finding's premise was wrong: `metrics.rs:258` is `impl S3 for MetricFs<T>`, the same upstream `#[async_trait]`-defined `s3s::S3` trait as `s3fs.rs:83`, not a local trait. Every impl must match the macro-expanded boxed-future signatures, and s3s pulls the crate in regardless. Both occurrences stay until s3s moves to native AFIT | -- |
+| H10 truncating casts | **Fixed** -- audited individually: client-influenced sites (`put_object` Content-Length, `BlockStream` range seek/read, `upload_part` size) now `try_from` with an error; provably-bounded sites carry `#[allow]` with the bounding argument; `debug_assert` comparisons flipped to the lossless direction. `-W clippy::cast_possible_truncation` is clean | -- |
+| H11 module style | **Fixed** -- `metastore/mod.rs` and `metastore/stores/mod.rs` converted to the post-2018 `metastore.rs` / `stores.rs` form via `git mv` | -- |
 | H12 Durability naming | **Fixed** -- mapping swapped to match POSIX semantics (`Fsync` -> `SyncAll`, `Fdatasync` -> `SyncData`); defaults moved from `fdatasync` to `fsync` so default persist behavior is unchanged | `7d61158` |
 | B1 duplicated backends | **Fixed** -- shared half extracted to `stores/fjall_common.rs`, generic over a `FjallFlavor` trait; the two stores are aliases of it with unchanged public API. The rebase argument is moot per the ownership decision at the top of `cas-storage/EXTENSIONS.md` | `541cc5d` |
 | B2 oversized functions | **Fixed** -- `from_frame` 388 -> 47-line dispatch table with per-command parsers; `process` -> 10-line delegate to `Session` | `721b53a`, `cfb271b` |
 | B3 edition split / toolchain | **Fixed** -- workspace on edition 2024, toolchain pinned 1.97 | `e4a795b`, `0777c36` |
-| B4 pedantic backlog | Open | -- |
+| B4 pedantic backlog | **Substantives cleared** -- respd handlers/execute/dispatch de-async'd (fjall is sync; the async was decorative), `unnecessary_wraps` and `unused_self` sites fixed, `once_cell::Lazy` -> `std::sync::LazyLock`, dead internal macros deleted (only `try_!` was used), bucket-count FIXME fixed (real count at startup), `CreateBucketOutput.location` filled. Left open as design decisions: metrics double-registration (single-instance by design), `list_buckets` pagination, `bucket_delete` optimization. Stylistic pedantic noise stays unchased | -- |
 | P1 ADRs describe unmerged layout | **Resolved on `development`** -- merged at `9a2d8c8`; `main` stays stale until development merges back | `9a2d8c8` |
 | P2 main red in CI | Same as P1 -- green on `development` | `9a2d8c8` |
-| P3 missing CI gates | **Mostly fixed** -- fmt gate added, toolchain pin honored, CI runs on development, stray checkout dropped; `release.yaml` still builds without testing | `0777c36`, `50ec0ec` |
+| P3 missing CI gates | **Fixed** -- fmt gate added, toolchain pin honored, CI runs on development, stray checkout dropped; `release.yaml` now runs `cargo test --workspace` before building and lost its deprecated `actions-rs` stable-override (the pin in rust-toolchain.toml applies) | `0777c36`, `50ec0ec` |
 | P4 .gitignore | **Fixed** -- `/data` ignored | `0777c36` |
-| P5 dangling deadlock-fix doc | Open | -- |
+| P5 dangling deadlock-fix doc | **Fixed** -- rationale reconstructed from the code as `docs/arch/deadlock-fix.md` (the original document and commit `c5f9cc9` exist in no reachable history); `async_fs.rs` comment rewritten to drop the dangling references | -- |
 | P6 DBSIZE untested / naming | **Fixed** -- `test_dbsize` added; former-name note in EXTENSIONS.md | `cfb271b`, `9dabfe1` |
 
 Found and fixed during the pass, beyond the original findings:
@@ -74,7 +74,8 @@ It closes two findings from this review: **H3** (on-disk format v1, all
 length and count fields `u64`, at `a0c6471`) and **H4** (blocks addressed by
 BLAKE3, default 32 bytes, at `23ed542`). It does not touch **H7**:
 `content_md5` is still destructured and discarded in `s3cas/src/s3fs.rs`, so
-client-supplied Content-MD5 remains unverified and that finding stays open.
+client-supplied Content-MD5 remains unverified and that finding stays open
+(since fixed in the remediation pass; see the status table above).
 
 The pass also added machinery this review predates and which is now the
 place to look first when a store misbehaves: a 32-byte QSST header on every
@@ -294,6 +295,14 @@ verdicts:
   change to `s3s`. Leave it.
 - `metrics.rs:1,258` -- a local trait impl. Likely convertible to native
   `async fn` in trait, or to `-> impl Future` if a `dyn` bound is needed.
+
+Resolution (2026-07-30): the second verdict was wrong. `metrics.rs:258` is
+`impl S3 for MetricFs<T>` -- the same upstream `s3s::S3` trait as `s3fs.rs:83`,
+not a local trait. Both impls must carry the macro to match its expanded
+boxed-future signatures, and `s3s` depends on `async-trait` regardless, so
+hand-writing `Pin<Box<dyn Future>>` shims would remove nothing from the
+dependency tree. Closed with no code change; revisit only if `s3s` migrates
+to native AFIT.
 
 Worth noting `cas-storage/src/cas/async_fs.rs:6` records that `async_trait` was
 already removed there as dead weight, so the direction of travel is established.
