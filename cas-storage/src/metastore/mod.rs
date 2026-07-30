@@ -1,6 +1,6 @@
 mod block;
 mod bucket_meta;
-mod constants;
+pub(crate) mod codec;
 mod content_hash;
 mod errors;
 mod meta_store;
@@ -10,7 +10,6 @@ mod traits;
 
 pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE};
 pub use bucket_meta::BucketMeta;
-pub use constants::*;
 pub use content_hash::{CONTENT_HASH_SIZE, ContentHash};
 pub use errors::{FsError, MetaError};
 pub use meta_store::*;

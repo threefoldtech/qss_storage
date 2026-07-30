@@ -1,10 +1,10 @@
 use faster_hex::hex_string;
-use std::{
-    convert::{TryFrom, TryInto},
-    path::PathBuf,
-};
+use std::{convert::TryFrom, path::PathBuf};
 
-use super::{FsError, PTR_SIZE};
+use super::{
+    FsError,
+    codec::{Reader, put_len},
+};
 
 /// Size of a block identifier in bytes (16 bytes, equivalent to an MD5 hash)
 ///
@@ -133,58 +133,42 @@ pub struct Block {
     rc: usize,
 }
 
-/// Implements serialization of a Block to a byte vector
+/// Serializes a Block (format v1):
+///
+/// ```text
+/// size u64 | path_len u8 | path[path_len] | rc u64
+/// ```
 impl From<&Block> for Vec<u8> {
     fn from(b: &Block) -> Self {
-        // NOTE: we encode the lenght of the vector as a single byte, since it can only be 16 bytes
-        // long.
-        let mut out = Vec::with_capacity(2 * PTR_SIZE + b.path.len() + 1);
+        // The path length is a single byte: a path is a prefix of a block
+        // hash, so it is at most one full hash width (32) < 256 bytes.
+        debug_assert!(
+            b.path.len() <= u8::MAX as usize,
+            "block path must fit a single length byte"
+        );
+        let mut out = Vec::with_capacity(8 + 1 + b.path.len() + 8);
 
-        out.extend_from_slice(&b.size.to_le_bytes());
-        out.extend_from_slice(&(b.path.len() as u8).to_le_bytes());
+        put_len(&mut out, b.size);
+        out.push(b.path.len() as u8);
         out.extend_from_slice(&b.path);
-        out.extend_from_slice(&b.rc.to_le_bytes());
+        put_len(&mut out, b.rc);
         out
     }
 }
 
-/// Implements deserialization of a Block from a byte slice
+/// Deserializes a Block from the layout above, with an exact length check.
 impl TryFrom<&[u8]> for Block {
     type Error = FsError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < PTR_SIZE + 1 {
-            return Err(FsError::Truncated {
-                record: "Block",
-                needed: PTR_SIZE + 1,
-                got: value.len(),
-            });
-        }
-        let size = usize::from_le_bytes(value[..PTR_SIZE].try_into().unwrap());
+        let mut r = Reader::new("Block", value);
+        let size = r.len("size")?;
+        let path_len = r.u8("path_len")? as usize;
+        let path = r.bytes("path", path_len)?.to_vec();
+        let rc = r.len("rc")?;
+        r.finish()?;
 
-        let vec_size =
-            u8::from_le_bytes(value[PTR_SIZE..PTR_SIZE + 1].try_into().unwrap()) as usize;
-        if value.len() < PTR_SIZE + 1 + vec_size {
-            return Err(FsError::Truncated {
-                record: "Block",
-                needed: PTR_SIZE + 1 + vec_size,
-                got: value.len(),
-            });
-        }
-        let path = value[PTR_SIZE + 1..PTR_SIZE + 1 + vec_size].to_vec();
-
-        if value.len() != PTR_SIZE * 2 + 1 + vec_size {
-            return Err(FsError::TrailingBytes {
-                record: "Block",
-                extra: value.len().abs_diff(PTR_SIZE * 2 + 1 + vec_size),
-            });
-        }
-
-        Ok(Block {
-            size,
-            path,
-            rc: usize::from_le_bytes(value[PTR_SIZE + 1 + vec_size..].try_into().unwrap()),
-        })
+        Ok(Block { size, path, rc })
     }
 }
 
@@ -341,5 +325,128 @@ mod tests {
         assert_eq!(narrow.to_hex().len(), BLOCKID_SIZE * 2);
         let wide = BlockId::from([0u8; MAX_BLOCKID_SIZE]);
         assert_eq!(wide.to_hex().len(), MAX_BLOCKID_SIZE * 2);
+    }
+
+    /// Block with a two byte path (format v1).
+    #[rustfmt::skip]
+    const GOLDEN_SHORT_PATH: &[u8] = &[
+        // size = 4096
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // path_len = 2
+        0x02,
+        // path
+        0xab, 0xcd,
+        // rc = 3
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Block whose path is a full 32 byte hash -- the widest a path can be,
+    /// and the reason the length stays a single byte.
+    #[rustfmt::skip]
+    const GOLDEN_FULL_PATH: &[u8] = &[
+        // size = 0x01020304
+        0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
+        // path_len = 32
+        0x20,
+        // path
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        // rc = 10
+        0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    fn golden_blocks() -> Vec<(&'static str, Block, &'static [u8])> {
+        vec![
+            (
+                "short_path",
+                Block {
+                    size: 4096,
+                    path: vec![0xab, 0xcd],
+                    rc: 3,
+                },
+                GOLDEN_SHORT_PATH,
+            ),
+            (
+                "full_path",
+                Block {
+                    size: 0x0102_0304,
+                    path: vec![0xff; MAX_BLOCKID_SIZE],
+                    rc: 10,
+                },
+                GOLDEN_FULL_PATH,
+            ),
+        ]
+    }
+
+    /// Format v1 pin: serialization must produce exactly these bytes.
+    #[test]
+    fn golden_serialization() {
+        for (name, block, expected) in golden_blocks() {
+            assert_eq!(block.to_vec(), expected, "golden mismatch for {name}");
+        }
+    }
+
+    /// Format v1 pin: the same bytes must decode to the same fields.
+    #[test]
+    fn golden_deserialization() {
+        for (name, block, expected) in golden_blocks() {
+            let decoded = Block::try_from(expected).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(decoded.size(), block.size(), "{name} size");
+            assert_eq!(decoded.path(), block.path(), "{name} path");
+            assert_eq!(decoded.rc(), block.rc(), "{name} rc");
+        }
+    }
+
+    #[test]
+    fn malformed_block_records() {
+        // Truncated at every field boundary.
+        for cut in [0usize, 1, 7, 8, 9, 10, 11, 18] {
+            assert!(
+                matches!(
+                    Block::try_from(&GOLDEN_SHORT_PATH[..cut]),
+                    Err(FsError::Truncated {
+                        record: "Block",
+                        ..
+                    })
+                ),
+                "expected Truncated when cut at {cut}"
+            );
+        }
+
+        // A path length longer than the record.
+        let mut long_path = GOLDEN_SHORT_PATH.to_vec();
+        long_path[8] = 0xff;
+        assert!(matches!(
+            Block::try_from(long_path.as_slice()),
+            Err(FsError::Truncated {
+                record: "Block",
+                ..
+            })
+        ));
+
+        // A path length shorter than the record: the leftover bytes are not
+        // silently swallowed.
+        let mut short_path = GOLDEN_SHORT_PATH.to_vec();
+        short_path[8] = 0x01;
+        assert_eq!(
+            Block::try_from(short_path.as_slice()).unwrap_err(),
+            FsError::TrailingBytes {
+                record: "Block",
+                extra: 1
+            }
+        );
+
+        // One byte too many.
+        let mut extra = GOLDEN_SHORT_PATH.to_vec();
+        extra.push(0);
+        assert_eq!(
+            Block::try_from(extra.as_slice()).unwrap_err(),
+            FsError::TrailingBytes {
+                record: "Block",
+                extra: 1
+            }
+        );
     }
 }

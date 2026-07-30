@@ -43,70 +43,108 @@ upload state lives in its own tree (`cas-storage/src/cas/multipart.rs`,
 In `SharedBlockStore` mode, `_BLOCKS` and the block files are shared across all
 namespaces while each namespace keeps its own bucket and object trees.
 
-## On-disk record formats
+## On-disk record formats (v1)
 
 Serialization is hand-rolled little-endian byte packing, not a serde format.
-Each type has a `to_vec` and a `TryFrom<&[u8]>`.
+Each type has a `to_vec` and a `TryFrom<&[u8]>`. All length and count fields
+are `u64`, independent of the host pointer width; the shared cursor and the
+id-list helpers live in `cas-storage/src/metastore/codec.rs`.
+
+Every record is length-exact: a short buffer decodes to `FsError::Truncated`,
+a long one to `FsError::TrailingBytes`. Byte-for-byte golden vectors for all
+four records are pinned in the `mod tests` of each of the files below.
 
 ### Block (`cas-storage/src/metastore/block.rs`)
 
 ```
-[ size: usize LE          ]  PTR_SIZE bytes
+[ size: u64 LE            ]  8 bytes
 [ path_len: u8            ]  1 byte
 [ path: bytes             ]  path_len bytes
-[ rc: usize LE            ]  PTR_SIZE bytes
+[ rc: u64 LE              ]  8 bytes
 ```
 
-Total `PTR_SIZE * 2 + 1 + path_len`, checked exactly at `block.rs:68`.
-
-A `TODO` at `block.rs:25` notes the path could be a fixed `[u8; BLOCKID_SIZE]`
-plus a length byte, avoiding the variable-length tail.
+The path length stays a single byte: a path is a prefix of a block hash, so it
+is at most one full hash width (32) < 256 bytes.
 
 ### BucketMeta (`cas-storage/src/metastore/bucket_meta.rs`)
 
 ```
 [ ctime: i64 LE           ]  8 bytes
-[ name_len: usize LE      ]  PTR_SIZE bytes
+[ name_len: u64 LE        ]  8 bytes
 [ name: UTF-8 bytes       ]  name_len bytes
 ```
 
-### MultiPart (`cas-storage/src/cas/multipart.rs`)
+### Object (`cas-storage/src/metastore/object.rs`)
 
-Five `PTR_SIZE` length fields plus 8 bytes plus a `BLOCKID_SIZE` hash, then the
-variable tails; the minimum size check is at `multipart.rs:82`.
-
-## Pointer-width dependence
-
-`PTR_SIZE` is defined at `cas-storage/src/metastore/constants.rs:4` as:
-
-```rust
-pub const PTR_SIZE: usize = mem::size_of::<usize>();
+```
+[ type: u8                ]  1 byte    0 Single, 1 Multipart, 2 Inline
+[ size: u64 LE            ]  8 bytes
+[ ctime: i64 LE           ]  8 bytes
+[ hash: bytes             ]  CONTENT_HASH_SIZE (16) bytes
 ```
 
-and it appears directly in the three formats above -- 19 references across
-`block.rs`, `bucket_meta.rs`, and `multipart.rs`.
+then, per type:
 
-**The on-disk format therefore varies with the pointer width of the host that
-wrote it.** On x86_64 or aarch64, `PTR_SIZE` is 8. On a 32-bit target
-(armv7, riscv32, i686) it is 4.
+```
+Inline:      [ data_len: u64 LE ] [ data ]
+SinglePart:  [ id_width: u8 ] [ count: u64 LE ] [ ids: count * id_width ]
+MultiPart:   [ parts: u64 LE ] [ id_width: u8 ] [ count: u64 LE ] [ ids ]
+```
 
-Concrete consequences:
+The shortest valid record is an Inline object with no data, 41 bytes. That is
+also `Object::minimum_inline_metadata_size()`, which
+`MetaStore::max_inlined_data_length` subtracts from the configured inline
+budget.
 
-- A store written on 64-bit and opened on 32-bit will misparse. The exact-length
-  assertions (`block.rs:68`, `bucket_meta.rs:91`) turn most cases into a
-  `TryFrom` error rather than silent corruption, which is the saving grace --
-  but `bucket_meta.rs` computes `name_len` from an 8-byte field read as 4 bytes
-  before that check, so the failure mode is length-dependent, not uniform.
-- Metadata cannot be replicated or migrated between hosts of different pointer
-  width, which matters for a system whose stated purpose is aggregating storage
-  across a heterogeneous node network.
-- Nothing in the format records which width wrote it, so there is no version
-  or magic byte to detect the mismatch and refuse cleanly.
+### MultiPart part record (`cas-storage/src/cas/multipart.rs`)
 
-A fixed-width type (`u64`) for all on-disk length and refcount fields would
-remove the coupling. That is a format-breaking change and so belongs with the
-ADR 0002 migration, which already contemplates a format transition. Tracked as
-finding H3 in [04-code-health.md](./04-code-health.md).
+```
+[ size: u64 LE            ]  8 bytes
+[ part_number: i64 LE     ]  8 bytes
+[ bucket_len: u64 LE      ]  8 bytes
+[ bucket: UTF-8 bytes     ]
+[ key_len: u64 LE         ]  8 bytes
+[ key: UTF-8 bytes        ]
+[ upload_len: u64 LE      ]  8 bytes
+[ upload_id: UTF-8 bytes  ]
+[ hash: bytes             ]  CONTENT_HASH_SIZE (16) bytes
+[ id_width: u8            ]  1 byte
+[ count: u64 LE           ]  8 bytes
+[ ids: count * id_width   ]
+```
+
+## Block-id widths in records
+
+Records that carry a block-id list write a self-describing width byte, so
+`TryFrom<&[u8]>` stays context-free: a decoder never has to be told which width
+the store that wrote the record uses.
+
+- `id_width` is 16 or 32; anything else is `FsError::InvalidIdWidth`.
+- `id_width` 0 is legal only when `count` is 0, which is how an empty list is
+  written.
+- All ids in one record share a width (they come from one store). The
+  serializer takes the width from the first id and `debug_assert`s the rest.
+
+The list length is derived exactly as `count * id_width`, so trailing garbage
+is reported rather than absorbed as extra block ids -- which is what the old
+`chunks_exact`-over-the-remainder loop did.
+
+## Pointer-width dependence (resolved)
+
+Format v1 removed `PTR_SIZE` (`metastore/constants.rs`, now deleted) from the
+records: every length, count and refcount field is a fixed `u64`, so a store
+written on a 64-bit host has the same bytes as one written on a 32-bit host.
+
+`usize` is still the in-memory type for `Block.size`/`rc`, `MultiPart.size` and
+`ObjectData::MultiPart.parts`; the conversion happens at the decode boundary
+with `try_into`, and a value that does not fit the host `usize` surfaces as
+`FsError::LengthOverflow` rather than a panic. Derived offsets are computed
+with checked arithmetic for the same reason.
+
+There is still no version or magic byte in a record; that arrives with the
+store header (ADR 0002 implementation, component 5). Until then, a store
+written before format v1 reads as a decode error, which is the intended
+outcome -- there is no backward compatibility with the pre-v1 layout.
 
 ## Reference counting
 

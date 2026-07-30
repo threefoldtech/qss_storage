@@ -32,7 +32,7 @@ cas-storage/src/
     +-- block.rs              Block, BlockID
     +-- bucket_meta.rs        BucketMeta
     +-- errors.rs             MetaError, FsError
-    +-- constants.rs          PTR_SIZE
+    +-- codec.rs              record cursor + id-list helpers (format v1)
     +-- stores/
         +-- fjall.rs          transactional backend                   433 lines
         +-- fjall_notx.rs     non-transactional backend               358 lines

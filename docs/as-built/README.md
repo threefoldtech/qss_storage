@@ -42,11 +42,12 @@ Three things a reader should know before touching the code:
    to stay byte-identical to upstream so the snapshot can be re-based. Edits
    outside those markers make rebasing harder and should be deliberate.
 
-2. **The on-disk format is not portable across pointer widths.** `PTR_SIZE =
-   size_of::<usize>()` is embedded in the serialization of blocks, bucket
-   metadata, and multipart records. A store written on a 64-bit host cannot be
-   read correctly on a 32-bit one. Details in
-   [02-storage-model.md](./02-storage-model.md#pointer-width-dependence).
+2. **The on-disk format is v1 and has no backward compatibility.** All length
+   and count fields are fixed `u64` (the old `PTR_SIZE = size_of::<usize>()`
+   is gone), records with block-id lists carry a self-describing width byte,
+   and every record is length-exact. A store written before format v1 reads as
+   a decode error. Details in
+   [02-storage-model.md](./02-storage-model.md#on-disk-record-formats-v1).
 
 3. **The health review found 6 correctness or soundness issues**, one of them
    a confirmed reachable panic on default flags, and one a cross-tenant data

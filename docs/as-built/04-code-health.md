@@ -27,7 +27,7 @@ status. Commits are on `development`.
 |---------|--------|-----------|
 | H1 reachable panic | **Fixed** -- `FjallStore::num_keys` delegates to `read_tx().len()`; regression test in the shared backend battery | `58ca932` |
 | H2 transmute + Send/Sync | **Addressed** -- SAFETY argument written, field order marked load-bearing, `unsafe impl Sync` deleted (auto impl suffices), `Send` kept with an honest argument | `16591a5` |
-| H3 pointer-width format | **Recorded** -- folded into ADR 0002 as decision 6 (u64 fields in the same format break); implementation pending with that ADR | `9dabfe1` |
+| H3 pointer-width format | **Fixed** -- format v1: all length/count fields are `u64`, `PTR_SIZE` and `constants.rs` deleted, records length-exact, block-id lists self-describing (width byte); golden byte vectors pin the layout. No backward compatibility: pre-v1 stores read as decode errors until the store header lands | `617f865` |
 | H4 MD5 cross-tenant substitution | **Recorded** -- ADR 0002 amended: migration is now a prerequisite for untrusted multi-tenancy; interim mitigations stated | `9dabfe1` |
 | H5 BlockStream Sync | **Fixed** -- deleted; static assertion in its place | `16591a5` |
 | H6 unchecked UTF-8 | **Fixed** -- all six sites validate; `range_filter` sites log-and-skip (trait signature unchanged, see EXTENSIONS.md) | `16591a5` |
@@ -156,7 +156,7 @@ pub const PTR_SIZE: usize = mem::size_of::<usize>();
 Length and refcount fields are serialized as native-width `usize`, so a store
 written on a 64-bit host is not readable on a 32-bit one, and there is no
 version or magic byte to detect the mismatch. Full analysis in
-[02-storage-model.md](./02-storage-model.md#pointer-width-dependence).
+[02-storage-model.md](./02-storage-model.md#pointer-width-dependence-resolved).
 
 This matters more than usual here because the product goal is aggregating
 storage across a heterogeneous node network -- 32-bit ARM or RISC-V nodes make
