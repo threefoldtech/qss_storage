@@ -1,5 +1,10 @@
 # cas-storage extensions (tfstor fork)
 
+> Naming note: `tfstor` is the former name of this repository (renamed to
+> `qss_storage` in 2026-07). The `tfstor-extension` markers keep the old
+> name deliberately -- renaming them would create churn against upstream
+> for no functional gain.
+
 This `cas-storage/` was vendored from
 `https://github.com/threefoldtech/s3-cas` at commit **`b28eac0`** (2026-05).
 

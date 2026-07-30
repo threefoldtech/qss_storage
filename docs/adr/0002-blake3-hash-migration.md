@@ -2,6 +2,10 @@
 
 **Status**: Proposed
 **Date**: 2026-05-26
+**Amended**: 2026-07-30 -- recorded the multi-tenant substitution risk
+(making this migration a prerequisite for untrusted multi-tenancy, not an
+improvement), folded fixed-width on-disk fields into the same format break,
+and flagged the width default under the adversarial framing.
 
 ---
 
@@ -10,8 +14,18 @@
 ADR 0001 noted MD5 as the content-address hash for blocks. MD5 was chosen
 for simplicity and speed, but:
 
-- It is cryptographically broken. Acceptable for dedup, not great as a
-  default.
+- It is cryptographically broken, and under shared block storage that is a
+  concrete attack, not a hygiene concern. In `SharedBlockStore` mode the
+  block store and `_BLOCKS` refcount tree are shared across namespaces
+  (tenants), so deduplication is cross-tenant. MD5 chosen-prefix collisions
+  are practical: a tenant who can upload arbitrary bytes can construct two
+  distinct blocks with the same MD5, and whichever lands first wins -- the
+  second writer's content is silently discarded and the first tenant's
+  bytes are served in its place. **This makes the migration a prerequisite
+  for offering shared-block multi-tenancy to untrusted tenants**, not a
+  nice-to-have. Until it lands, either do not enable `SharedBlockStore`
+  across trust boundaries, or verify full block content on every dedup hit
+  instead of trusting the digest.
 - BLAKE3 is faster than MD5 on modern CPUs (SIMD, parallelism) AND offers
   256-bit collision resistance.
 - The hash is baked into every block address. Inside one store it must be a
@@ -51,6 +65,15 @@ home.
 5. **No migration from MD5-addressed stores.** Existing dev data is
    discarded. A binary that opens a store whose header does not match a
    supported BLAKE3 variant refuses to start with a clear error.
+6. **All on-disk length and count fields become fixed-width `u64` little
+   endian** in the same format break. Today `PTR_SIZE =
+   size_of::<usize>()` is embedded in the serialization of `Block`,
+   `BucketMeta`, and `MultiPart` (19 sites), so a store written on a
+   64-bit host misparses on a 32-bit one and nothing records which width
+   wrote it. Since this ADR already breaks the format and introduces a
+   versioned store header, the pointer-width coupling is removed here
+   rather than in a separate break. `PTR_SIZE` disappears from the on-disk
+   layer entirely.
 
 ---
 
@@ -225,6 +248,15 @@ client -> frontend (s3cas|respd)
   Working preference: 16, on the grounds that 128-bit dedup collisions are
   not a real risk and the smaller metadata keys are worth it. Revisit if
   someone shows a workload where the extra bits matter.
+  **Caveat under the adversarial framing added 2026-07-30:** accidental
+  collisions at 128 bits are indeed a non-issue, but an *adversarial*
+  birthday search against a 128-bit address costs ~2^64 hash evaluations,
+  which is expensive-but-imaginable for a well-resourced attacker, and a
+  manufactured dedup collision here is exactly the cross-tenant
+  substitution this amendment records. For deployments with untrusted
+  tenants sharing a block store, the 32-byte width should be the
+  recommended (possibly enforced) choice; 16 remains fine for
+  single-tenant or trusted-tenant stores.
 - [ ] Should the store header include a salt, so two operators with the
   same blocks do not produce identical addresses across deployments? Adds
   privacy at the cost of cross-store dedup, which today is not a feature
