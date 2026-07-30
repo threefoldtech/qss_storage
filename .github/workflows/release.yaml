@@ -5,12 +5,15 @@ on:
     tags:
       - 'v*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-linux:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Cache cargo dependencies
         uses: actions/cache@v3
         with:
@@ -19,27 +22,42 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Install latest stable
-        uses: actions-rs/toolchain@v1
+
+      # No explicit toolchain install: rustup on the runner reads
+      # rust-toolchain.toml and installs the pinned toolchain on first use.
+      - name: Run tests
+        run: cargo test --workspace
+
+  build-linux:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
         with:
-          toolchain: stable
-          override: true
-          
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Build release
         run: cargo build --release -p s3cas
-        
+
       - name: Upload Linux binary
         uses: actions/upload-artifact@v4
         with:
           name: s3cas-linux
           path: target/release/s3cas
-          
+
   build-macos:
+    needs: [test]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Cache cargo dependencies
         uses: actions/cache@v3
         with:
@@ -48,22 +66,16 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Install latest stable
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          
+
       - name: Build release
         run: cargo build --release -p s3cas
-        
+
       - name: Upload macOS binary
         uses: actions/upload-artifact@v4
         with:
           name: s3cas-macos
           path: target/release/s3cas
-          
+
   create-release:
     needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
@@ -72,14 +84,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          
+
       - name: List directories
         run: |
           ls -la
           ls -la artifacts
           ls -la artifacts/s3cas-linux || echo "Linux directory not found"
           ls -la artifacts/s3cas-macos || echo "macOS directory not found"
-        
+
       - name: Rename binaries to include platform
         run: |
           if [ -f "artifacts/s3cas-linux/s3cas" ]; then
@@ -88,7 +100,7 @@ jobs:
           if [ -f "artifacts/s3cas-macos/s3cas" ]; then
             mv artifacts/s3cas-macos/s3cas artifacts/s3cas-macos/s3cas-macos
           fi
-        
+
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
