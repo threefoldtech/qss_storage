@@ -1,32 +1,168 @@
-use std::collections::HashMap;
+//! The transactional fjall backend.
+//!
+//! Everything that is not specific to fjall's single-writer transactional
+//! database lives in [`super::fjall_common`]; this module holds the flavor
+//! impl, the write-transaction backend, and the constructor.
+
+use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{convert::TryFrom, sync::Mutex};
 
 use fjall::{self, KeyspaceCreateOptions, Readable, SingleWriterTxKeyspace};
 
-use crate::metastore::{
-    BaseMetaTree, Durability, KeyValuePairs, MetaError, MetaTreeExt, Object, Store, Transaction,
-    TransactionBackend,
-};
+use crate::metastore::{Durability, MetaError, Transaction, TransactionBackend};
 
+use super::fjall_common::{FjallFlavor, FjallStoreOf};
+
+/// Metadata store backed by fjall's single-writer transactional database.
+///
+/// Writes go through a real fjall write transaction, so a rollback discards
+/// them without touching the keyspace; the price is that only one writer may
+/// be in flight at a time.
+pub type FjallStore = FjallStoreOf<Transactional>;
+
+/// Database handle for the transactional flavor: the fjall database plus the
+/// persist mode applied after every commit.
 #[derive(Clone)]
-pub struct FjallStore {
+pub struct TxDb {
     db: Arc<fjall::SingleWriterTxDatabase>,
-    inlined_metadata_size: usize,
     durability: fjall::PersistMode,
-    partition_cache: Arc<Mutex<HashMap<String, Arc<SingleWriterTxKeyspace>>>>,
 }
 
-impl std::fmt::Debug for FjallStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FjallStore")
-            .field("db", &"<fjall::SingleWriterTxDatabase>")
-            .finish()
+impl TxDb {
+    fn commit_persist(&self, tx: fjall::SingleWriterWriteTx) -> Result<(), MetaError> {
+        tx.commit()
+            .map_err(|e| MetaError::TransactionError(e.to_string()))?;
+
+        self.db
+            .persist(self.durability)
+            .map_err(|e| MetaError::PersistError(e.to_string()))?;
+        Ok(())
     }
 }
 
-const DEFAULT_INLINED_METADATA_SIZE: usize = 1; // setting very low will practically disable it by default
+/// Flavor marker for the transactional backend. Never instantiated.
+#[derive(Debug, Clone, Copy)]
+pub struct Transactional;
+
+impl FjallFlavor for Transactional {
+    const STORE_NAME: &'static str = "FjallStore";
+    const DB_LABEL: &'static str = "<fjall::SingleWriterTxDatabase>";
+
+    type Db = TxDb;
+    type Partition = SingleWriterTxKeyspace;
+
+    fn keyspace(db: &Self::Db, name: &str) -> Result<Self::Partition, MetaError> {
+        db.db
+            .keyspace(name, KeyspaceCreateOptions::default)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    fn keyspace_exists(db: &Self::Db, name: &str) -> bool {
+        db.db.keyspace_exists(name)
+    }
+
+    fn delete_keyspace(db: &Self::Db, partition: &Self::Partition) -> Result<(), MetaError> {
+        // `delete_keyspace` lives on the plain database underneath and takes a
+        // plain keyspace handle by value.
+        db.db
+            .inner()
+            .delete_keyspace(partition.inner().clone())
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    fn disk_space(db: &Self::Db) -> u64 {
+        db.db.disk_space().unwrap_or(0)
+    }
+
+    // Upstream leaves `Store::num_keys` `unimplemented!()` on this backend,
+    // which panics on the default `--metadata-db fjall` path. A read
+    // transaction counts a keyspace fine -- it is the same call `len` uses.
+    fn num_keys(db: &Self::Db, partition: &Self::Partition) -> Result<usize, MetaError> {
+        Self::len(db, partition)
+    }
+
+    fn begin_transaction(store: &FjallStore) -> Transaction {
+        tracing::debug!(target: "cas_storage::locks", "Transaction started");
+        // Upstream's comment here was "the transaction won't outlive the store",
+        // which states the conclusion without the two facts it rests on. Both are
+        // spelled out below, because both are silently breakable by an unrelated
+        // edit.
+        //
+        // SAFETY: `write_tx()` borrows the `SingleWriterTxDatabase`, and that
+        // borrow is laundered to `'static` here. Two properties make the
+        // laundered lifetime true in practice:
+        //
+        // 1. Liveness. The `FjallTransaction` built on the next line owns an
+        //    `Arc<FjallStore>` cloned from `store`, and the store's database
+        //    handle (`TxDb`) holds an `Arc<SingleWriterTxDatabase>`. The
+        //    database therefore stays alive for at least as long as the
+        //    transaction, whatever happens to the `FjallStore` this was
+        //    called on.
+        // 2. Drop order. `FjallTransaction` declares `tx` before `store`, and
+        //    Rust drops struct fields in declaration order, so the transaction
+        //    (and the single-writer lock guard inside it) is released before the
+        //    `Arc<FjallStore>` that keeps the database alive. See the field-order
+        //    note on the struct.
+        //
+        // Neither property is enforced by the compiler. Removing the `Arc` from
+        // `FjallTransaction`, or swapping its two fields, reintroduces a
+        // use-after-free without any diagnostic.
+        let tx = unsafe {
+            std::mem::transmute::<fjall::SingleWriterWriteTx<'_>, fjall::SingleWriterWriteTx<'static>>(
+                store.db().db.write_tx(),
+            )
+        };
+
+        Transaction::new(Box::new(FjallTransaction::new(tx, Arc::new(store.clone()))))
+    }
+
+    fn get(partition: &Self::Partition, key: &[u8]) -> Result<Option<fjall::Slice>, MetaError> {
+        partition
+            .get(key)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    fn insert(partition: &Self::Partition, key: &[u8], value: Vec<u8>) -> Result<(), MetaError> {
+        partition
+            .insert(key, value)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    fn remove(partition: &Self::Partition, key: &[u8]) -> Result<(), MetaError> {
+        partition
+            .remove(key)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    fn contains_key(partition: &Self::Partition, key: &[u8]) -> Result<bool, MetaError> {
+        partition
+            .contains_key(key)
+            .map_err(|_| MetaError::KeyNotFound)
+    }
+
+    fn len(db: &Self::Db, partition: &Self::Partition) -> Result<usize, MetaError> {
+        db.db
+            .read_tx()
+            .len(partition)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    }
+
+    // The transactional keyspace handle has no iteration API of its own, so
+    // reads go through a read transaction. The returned `Iter` owns its
+    // snapshot nonce, so it stays valid after the read transaction is dropped.
+    fn range<R: RangeBounds<Vec<u8>>>(
+        db: &Self::Db,
+        partition: &Self::Partition,
+        range: R,
+    ) -> fjall::Iter {
+        db.db.read_tx().range::<Vec<u8>, _>(partition, range)
+    }
+
+    fn prefix(db: &Self::Db, partition: &Self::Partition, prefix: &[u8]) -> fjall::Iter {
+        db.db.read_tx().prefix(partition, prefix)
+    }
+}
 
 impl FjallStore {
     pub fn new(
@@ -39,151 +175,35 @@ impl FjallStore {
         let db = fjall::SingleWriterTxDatabase::builder(&path)
             .open()
             .unwrap();
-        let inlined_metadata_size = inlined_metadata_size.unwrap_or(DEFAULT_INLINED_METADATA_SIZE);
 
-        let durability = durability.unwrap_or(Durability::Fdatasync);
-        let durability = match durability {
+        let durability = match durability.unwrap_or(Durability::Fdatasync) {
             Durability::Buffer => fjall::PersistMode::Buffer,
             Durability::Fsync => fjall::PersistMode::SyncData,
             Durability::Fdatasync => fjall::PersistMode::SyncAll,
         };
 
-        Self {
-            db: Arc::new(db),
+        FjallStoreOf::from_db(
+            TxDb {
+                db: Arc::new(db),
+                durability,
+            },
             inlined_metadata_size,
-            durability,
-            partition_cache: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn get_partition(&self, name: &str) -> Result<Arc<SingleWriterTxKeyspace>, MetaError> {
-        Ok(self
-            .partition_cache
-            .lock()
-            .expect("Can lock partition cache")
-            .entry(name.to_string())
-            .or_insert_with(|| {
-                Arc::new(
-                    self.db
-                        .keyspace(name, KeyspaceCreateOptions::default)
-                        .expect("Can open keyspace"),
-                )
-            })
-            .clone())
-    }
-
-    fn commit_persist(&self, tx: fjall::SingleWriterWriteTx) -> Result<(), MetaError> {
-        tx.commit()
-            .map_err(|e| MetaError::TransactionError(e.to_string()))?;
-
-        self.db
-            .persist(self.durability)
-            .map_err(|e| MetaError::PersistError(e.to_string()))?;
-        Ok(())
-    }
-
-    pub fn get_inlined_metadata_size(&self) -> usize {
-        self.inlined_metadata_size
-    }
-}
-
-impl Store for FjallStore {
-    fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
-        let partition = self.get_partition(name)?;
-        Ok(Arc::new(FjallTree::new(self.db.clone(), partition)))
-    }
-
-    fn tree_ext_open(&self, name: &str) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
-        let partition = self.get_partition(name)?;
-        Ok(Arc::new(FjallTree::new(self.db.clone(), partition)))
-    }
-
-    fn tree_exists(&self, name: &str) -> Result<bool, MetaError> {
-        Ok(self.db.keyspace_exists(name))
-    }
-
-    fn tree_delete(&self, name: &str) -> Result<(), MetaError> {
-        let partition = self.get_partition(name)?;
-        // Drop the cached handle so the inner Arc count goes to 1 path below;
-        // delete_keyspace operates on a Keyspace handle by value.
-        self.partition_cache
-            .lock()
-            .expect("Can lock partition cache")
-            .remove(name);
-        match self.db.inner().delete_keyspace(partition.inner().clone()) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(MetaError::OtherDBError(e.to_string())),
-        }
-    }
-
-    fn begin_transaction(&self) -> Transaction {
-        tracing::debug!(target: "cas_storage::locks", "Transaction started");
-        // ---- tfstor-extension: BEGIN ----
-        // Upstream's comment here was "the transaction won't outlive the store",
-        // which states the conclusion without the two facts it rests on. Both are
-        // spelled out below, because both are silently breakable by an unrelated
-        // edit.
-        //
-        // SAFETY: `self.db.write_tx()` borrows the `SingleWriterTxDatabase`, and
-        // that borrow is laundered to `'static` here. Two properties make the
-        // laundered lifetime true in practice:
-        //
-        // 1. Liveness. The `FjallTransaction` built on the next line owns an
-        //    `Arc<FjallStore>` cloned from `self`, and `FjallStore::db` is an
-        //    `Arc<SingleWriterTxDatabase>`. The database therefore stays alive
-        //    for at least as long as the transaction, whatever happens to the
-        //    `FjallStore` this method was called on.
-        // 2. Drop order. `FjallTransaction` declares `tx` before `store`, and
-        //    Rust drops struct fields in declaration order, so the transaction
-        //    (and the single-writer lock guard inside it) is released before the
-        //    `Arc<FjallStore>` that keeps the database alive. See the field-order
-        //    note on the struct.
-        //
-        // Neither property is enforced by the compiler. Removing the `Arc` from
-        // `FjallTransaction`, or swapping its two fields, reintroduces a
-        // use-after-free without any diagnostic.
-        let tx = unsafe {
-            std::mem::transmute::<fjall::SingleWriterWriteTx<'_>, fjall::SingleWriterWriteTx<'static>>(
-                self.db.write_tx(),
-            )
-        };
-        // ---- tfstor-extension: END ----
-
-        Transaction::new(Box::new(FjallTransaction::new(tx, Arc::new(self.clone()))))
-    }
-
-    // ---- tfstor-extension: BEGIN ----
-    // Upstream leaves this `unimplemented!()`, which panics on the default
-    // `--metadata-db fjall` path. A read transaction can count a keyspace just
-    // fine (same call `FjallTree::len` below already uses).
-    fn num_keys(&self, tree_name: &str) -> Result<usize, MetaError> {
-        let partition = self.get_partition(tree_name)?;
-        self.db
-            .read_tx()
-            .len(&*partition)
-            .map_err(|e| MetaError::OtherDBError(e.to_string()))
-    }
-    // ---- tfstor-extension: END ----
-
-    fn disk_space(&self) -> u64 {
-        self.db.disk_space().unwrap_or(0)
+        )
     }
 }
 
 pub struct FjallTransaction {
-    // ---- tfstor-extension: BEGIN ----
     // FIELD ORDER IS LOAD-BEARING. DO NOT REORDER.
     //
     // `tx` holds a transaction whose lifetime was laundered to `'static` in
-    // `FjallStore::begin_transaction`; it borrows the database owned (via `Arc`)
-    // by `store`. Fields drop in declaration order, so `tx` must be declared
-    // first to guarantee the transaction is released before the `Arc<FjallStore>`
-    // that keeps the database alive. Swapping these two lines produces a
-    // use-after-free that the compiler cannot see, because the `'static` in the
-    // type is a lie the `unsafe` block told it.
+    // `Transactional::begin_transaction`; it borrows the database owned (via
+    // `Arc`) by `store`. Fields drop in declaration order, so `tx` must be
+    // declared first to guarantee the transaction is released before the
+    // `Arc<FjallStore>` that keeps the database alive. Swapping these two lines
+    // produces a use-after-free that the compiler cannot see, because the
+    // `'static` in the type is a lie the `unsafe` block told it.
     tx: Option<fjall::SingleWriterWriteTx<'static>>,
     store: Arc<FjallStore>,
-    // ---- tfstor-extension: END ----
 }
 
 impl FjallTransaction {
@@ -195,7 +215,6 @@ impl FjallTransaction {
     }
 }
 
-// ---- tfstor-extension: BEGIN ----
 // SAFETY: `FjallTransaction` is `Send` by assertion, not by derivation. The
 // blocker is `fjall::SingleWriterWriteTx`, which holds a
 // `std::sync::MutexGuard<'_, ()>` for fjall's single-writer lock, and std's
@@ -242,13 +261,12 @@ const _: () = {
     const fn assert_sync<T: Sync>() {}
     assert_sync::<FjallTransaction>();
 };
-// ---- tfstor-extension: END ----
 
 impl TransactionBackend for FjallTransaction {
     fn commit(&mut self) -> Result<(), MetaError> {
         if let Some(tx) = self.tx.take() {
             tracing::debug!(target: "cas_storage::locks", "Transaction commit started");
-            let res = self.store.commit_persist(tx);
+            let res = self.store.db().commit_persist(tx);
             tracing::debug!(target: "cas_storage::locks", "Transaction commit finished");
             res
         } else {
@@ -293,255 +311,14 @@ impl TransactionBackend for FjallTransaction {
     }
 }
 
-pub struct FjallTree {
-    db: Arc<fjall::SingleWriterTxDatabase>,
-    partition: Arc<SingleWriterTxKeyspace>,
-}
-
-impl FjallTree {
-    pub fn new(
-        db: Arc<fjall::SingleWriterTxDatabase>,
-        partition: Arc<SingleWriterTxKeyspace>,
-    ) -> Self {
-        Self { db, partition }
-    }
-
-    fn get(&self, key: &[u8]) -> Result<Option<fjall::Slice>, MetaError> {
-        match self.partition.get(key) {
-            Ok(Some(v)) => Ok(Some(v)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(MetaError::OtherDBError(e.to_string())),
-        }
-    }
-}
-
-impl BaseMetaTree for FjallTree {
-    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), MetaError> {
-        match self.partition.insert(key, value) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(MetaError::OtherDBError(e.to_string())),
-        }
-    }
-
-    fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
-        match self.partition.remove(key) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(MetaError::OtherDBError(e.to_string())),
-        }
-    }
-
-    fn contains_key(&self, key: &[u8]) -> Result<bool, MetaError> {
-        match self.partition.contains_key(key) {
-            Ok(v) => Ok(v),
-            Err(_) => Err(MetaError::KeyNotFound),
-        }
-    }
-
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
-        match self.get(key) {
-            Ok(Some(v)) => Ok(Some(v.to_vec())),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    // ---- tfstor-extension: promoted out of #[cfg(test)] for runtime use ----
-    fn len(&self) -> Result<usize, MetaError> {
-        let read_tx = self.db.read_tx();
-        let len = read_tx
-            .len(&*self.partition)
-            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
-        Ok(len)
-    }
-}
-
-impl MetaTreeExt for FjallTree {
-    fn iter_all(&self) -> KeyValuePairs {
-        self.iter_kv(None)
-    }
-
-    // ---- tfstor-extension: BEGIN ----
-    fn iter_kv(&self, start_after: Option<Vec<u8>>) -> KeyValuePairs {
-        let partition = self.partition.clone();
-        let db = self.db.clone();
-        let mut last_key = start_after;
-
-        Box::new(std::iter::from_fn(move || {
-            let read_tx = db.read_tx();
-            let range = match &last_key {
-                Some(k) => {
-                    let mut next = k.clone();
-                    next.push(0);
-                    next..
-                }
-                None => Vec::new()..,
-            };
-
-            read_tx
-                .range::<Vec<u8>, _>(&*partition, range)
-                .next()
-                .map(|guard| match guard.into_inner() {
-                    Ok((k, v)) => {
-                        last_key = Some(k.to_vec());
-                        Ok((k.to_vec(), v.to_vec()))
-                    }
-                    Err(e) => {
-                        tracing::error!("Error reading key: {}", e);
-                        Err(MetaError::OtherDBError(e.to_string()))
-                    }
-                })
-        }))
-    }
-
-    fn iter_kv_backward(&self, start_key: Option<Vec<u8>>) -> KeyValuePairs {
-        let partition = self.partition.clone();
-        let db = self.db.clone();
-        let mut last_key = start_key;
-
-        Box::new(std::iter::from_fn(move || {
-            let read_tx = db.read_tx();
-            let range = match &last_key {
-                Some(k) => ..k.clone(),
-                None => ..Vec::new(),
-            };
-
-            read_tx
-                .range::<Vec<u8>, _>(&*partition, range)
-                .next_back()
-                .map(|guard| match guard.into_inner() {
-                    Ok((k, v)) => {
-                        last_key = Some(k.to_vec());
-                        Ok((k.to_vec(), v.to_vec()))
-                    }
-                    Err(e) => {
-                        tracing::error!("Error reading key: {}", e);
-                        Err(MetaError::OtherDBError(e.to_string()))
-                    }
-                })
-        }))
-    }
-    // ---- tfstor-extension: END ----
-
-    // rules:
-    // 1. continuation_token and start_after exists: use the one with the highest lexicographical order
-    //    -> call it: ctsa
-    // 2. if prefix exists
-    //    -> ctsa > the prefix && doesn't have prefix: return zero results
-    //    -> ctsa < prefix: ignore it
-    //    -> ctsa has the prefix: use it as start_after
-    //          In kv store like fjall & Sled: we process it in the Rust code
-    fn range_filter<'a>(
-        &'a self,
-        start_after: Option<String>,
-        prefix: Option<String>,
-        continuation_token: Option<String>,
-    ) -> Box<dyn Iterator<Item = (String, Object)> + 'a> {
-        let mut ctsa = match (continuation_token, start_after) {
-            (Some(token), Some(start)) => Some(std::cmp::max(token, start)),
-            (Some(token), None) => Some(token),
-            (None, start) => start,
-        };
-
-        let read_tx = self.db.read_tx();
-
-        let base_iter: Box<dyn Iterator<Item = fjall::Guard>> =
-            match (prefix.as_ref(), ctsa.as_ref()) {
-                (Some(prefix), Some(ctsa)) if (ctsa > prefix && !ctsa.starts_with(prefix)) => {
-                    //Return empty iterator if ctsa is after prefix
-                    Box::new(std::iter::empty())
-                }
-                (Some(prefix), Some(ctsa_local)) if ctsa_local < prefix => {
-                    // If ctsa is before prefix, ignore ctsa
-                    ctsa = None;
-                    Box::new(read_tx.prefix(&*self.partition, prefix.as_bytes()))
-                }
-                (Some(prefix), _) => Box::new(read_tx.prefix(&*self.partition, prefix.as_bytes())),
-                (None, Some(ctsa)) => {
-                    let mut next_key = ctsa.as_bytes().to_vec();
-                    next_key.push(0);
-                    Box::new(read_tx.range(&*self.partition, next_key..))
-                }
-                (None, None) => Box::new(read_tx.range::<Vec<u8>, _>(&*self.partition, ..)),
-            };
-
-        let pairs = base_iter.filter_map(|g| g.into_inner().ok());
-
-        let skip_filtered = if let (Some(_), Some(ctsa)) = (&prefix, ctsa) {
-            let ctsa_bytes = ctsa.into_bytes();
-            Box::new(pairs.skip_while(move |(raw_key, _)| &**raw_key <= ctsa_bytes.as_slice()))
-                as Box<dyn Iterator<Item = _>>
-        } else {
-            Box::new(pairs)
-        };
-
-        // ---- tfstor-extension: BEGIN ----
-        // Upstream used `String::from_utf8_unchecked` on the raw key. The key
-        // comes straight off disk, so a corrupt or truncated record turns into
-        // undefined behaviour instead of a bad result. `range_filter` yields an
-        // infallible item type, so a key that is not valid UTF-8 is skipped and
-        // logged -- the same treatment the iterator above already gives to keys
-        // the backend fails to read (`filter_map(|g| g.into_inner().ok())`).
-        Box::new(skip_filtered.filter_map(|(raw_key, raw_value)| {
-            let key = match String::from_utf8(raw_key.to_vec()) {
-                Ok(key) => key,
-                Err(e) => {
-                    tracing::error!("Skipping key that is not valid UTF-8: {}", e);
-                    return None;
-                }
-            };
-            let obj = Object::try_from(&*raw_value).unwrap();
-            Some((key, obj))
-        }))
-        // ---- tfstor-extension: END ----
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metastore::stores::test_utils;
     use tempfile::tempdir;
 
-    fn setup_store() -> (FjallStore, tempfile::TempDir) {
+    crate::metastore::stores::test_utils::backend_test_battery!(FjallStore, || {
         let dir = tempdir().unwrap();
         let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None);
         (store, dir)
-    }
-
-    impl test_utils::TestStore for FjallStore {
-        fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
-            <FjallStore as Store>::tree_open(self, name)
-        }
-
-        fn get_bucket_ext(
-            &self,
-            name: &str,
-        ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
-            <FjallStore as Store>::tree_ext_open(self, name)
-        }
-
-        fn num_keys(&self, name: &str) -> Result<usize, MetaError> {
-            <FjallStore as Store>::num_keys(self, name)
-        }
-    }
-
-    #[test]
-    fn test_get_bucket_keys() {
-        let (store, _dir) = setup_store();
-        test_utils::test_get_bucket_keys(&store);
-    }
-
-    #[test]
-    fn test_range_filter() {
-        let (store, _dir) = setup_store();
-        test_utils::test_range_filter(&store);
-    }
-
-    // ---- tfstor-extension: BEGIN ----
-    #[test]
-    fn test_num_keys() {
-        let (store, _dir) = setup_store();
-        test_utils::test_num_keys(&store);
-    }
-    // ---- tfstor-extension: END ----
+    });
 }

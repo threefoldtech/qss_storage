@@ -10,6 +10,65 @@ pub trait TestStore {
     // ---- tfstor-extension: END ----
 }
 
+/// Runs the shared backend battery against a concrete store type.
+///
+/// `$store` is the store type, `$setup` a closure returning
+/// `($store, tempfile::TempDir)` -- the directory is returned so the caller
+/// keeps it alive for the duration of the test. Both fjall backends invoke
+/// this, which is what makes the battery a real cross-backend comparison
+/// rather than two copies that can drift apart.
+macro_rules! backend_test_battery {
+    ($store:ty, $setup:expr) => {
+        impl $crate::metastore::stores::test_utils::TestStore for $store {
+            fn tree_open(
+                &self,
+                name: &str,
+            ) -> Result<
+                std::sync::Arc<dyn $crate::metastore::BaseMetaTree>,
+                $crate::metastore::MetaError,
+            > {
+                <$store as $crate::metastore::Store>::tree_open(self, name)
+            }
+
+            fn get_bucket_ext(
+                &self,
+                name: &str,
+            ) -> Result<
+                std::sync::Arc<dyn $crate::metastore::MetaTreeExt + Send + Sync>,
+                $crate::metastore::MetaError,
+            > {
+                <$store as $crate::metastore::Store>::tree_ext_open(self, name)
+            }
+
+            fn num_keys(&self, name: &str) -> Result<usize, $crate::metastore::MetaError> {
+                <$store as $crate::metastore::Store>::num_keys(self, name)
+            }
+        }
+
+        #[test]
+        fn test_get_bucket_keys() {
+            let (store, _dir) = ($setup)();
+            $crate::metastore::stores::test_utils::test_get_bucket_keys(&store);
+        }
+
+        #[test]
+        fn test_range_filter() {
+            let (store, _dir) = ($setup)();
+            $crate::metastore::stores::test_utils::test_range_filter(&store);
+        }
+
+        // ---- tfstor-extension: BEGIN ----
+        #[test]
+        fn test_num_keys() {
+            let (store, _dir) = ($setup)();
+            $crate::metastore::stores::test_utils::test_num_keys(&store);
+        }
+        // ---- tfstor-extension: END ----
+    };
+}
+
+pub(crate) use backend_test_battery;
+
 // ---- tfstor-extension: BEGIN ----
 /// Guards against `Store::num_keys` regressing to `unimplemented!()` on any
 /// backend: it must count the keys of a named tree, not panic.

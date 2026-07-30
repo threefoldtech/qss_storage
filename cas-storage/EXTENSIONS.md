@@ -62,7 +62,8 @@ than an error. All six now validate:
 
 - `metastore/bucket_meta.rs` (bucket name) -> `FsError::MalformedObject`
 - `cas/multipart.rs` (bucket, key, upload_id) -> `FsError::MalformedObject`
-- `metastore/stores/fjall.rs` and `stores/fjall_notx.rs` (`range_filter` key)
+- `metastore/stores/fjall_common.rs` (`range_filter` key; was one copy per
+  backend before the dedup below)
 
 The first two sit in `TryFrom` impls and simply return the error. The two
 `range_filter` sites do not: the trait method yields an infallible
@@ -110,17 +111,63 @@ struct definition. Same `const _` static assertion in its place.
 `TestStore` trait, wired into both backends' test modules. Upstream had no
 coverage for `Store::num_keys`, which is how the `unimplemented!()` survived.
 
+### The two fjall backends deduplicated
+Finding B1 of `docs/as-built/04-code-health.md`. `stores/fjall.rs` and
+`stores/fjall_notx.rs` were near-copies: same function inventory, 161
+identical non-trivial lines, and every extension (`iter_kv`, the checked
+UTF-8 keys, the `num_keys` fix) had to be written twice.
+
+The shared half now lives in `stores/fjall_common.rs`, generic over a
+`FjallFlavor` trait: `FjallStoreOf<F>` (partition cache, tree opening,
+`Store` impl, inlined-metadata threshold, disk space) and `FjallTreeOf<F>`
+(the whole `BaseMetaTree` and `MetaTreeExt` impl, including `range_filter`
+and the two `iter_kv` walks). `FjallStore` and `FjallStoreNotx` are now
+aliases of that generic with their flavor marker; their public API,
+constructors and `Debug` output are unchanged.
+
+What did *not* unify, and why:
+
+- **Writes.** `SingleWriterTxKeyspace::insert`/`remove` wrap the call in a
+  fjall write transaction; `Keyspace::insert`/`remove` do not. Same names,
+  different machinery, no common trait -- they stay per-flavor one-liners.
+- **Reads.** The transactional keyspace handle has no iteration API at all,
+  so `range`/`prefix`/`len` there go through `db.read_tx()`, while the plain
+  keyspace iterates directly (and at `SeqNo::MAX` rather than a snapshot
+  seqno). The flavor supplies the iterator; both return a plain
+  `fjall::Iter`, which owns its snapshot nonce and so survives the read
+  transaction that produced it.
+- **The transaction backends.** A real fjall write transaction versus a
+  no-op transaction that replays its own inserts on rollback. This is the
+  reason both backends exist; it was never duplication.
+- **`Store::num_keys`.** Still exact on the transactional backend and
+  `approximate_len` on the other, as recorded above -- now an explicit
+  per-flavor method with that difference documented on the trait.
+
+Two behaviour notes: the plain backend inherits the partition cache that
+only the transactional one had (fewer keyspace-lock acquisitions, and
+`tree_delete` now evicts on both), and `get_partition` propagates a
+keyspace-open failure as `MetaError` instead of the transactional path's
+former `.expect("Can open keyspace")`.
+
+The shared test battery moved into a `backend_test_battery!` macro in
+`stores/test_utils.rs`, so both backends still run the identical three
+tests from one definition instead of two copies.
+
+Because the dedup dissolved the code they fenced, the `tfstor-extension`
+markers in these two files are gone; this entry and the comments in
+`fjall_common.rs` are the record.
+
 ## Implementations
 
 The trait additions are implemented in:
 
-- `src/metastore/stores/fjall.rs`     (transactional backend)
-- `src/metastore/stores/fjall_notx.rs` (non-transactional backend)
+- `src/metastore/stores/fjall_common.rs` (shared, generic over the flavor)
+- `src/metastore/stores/fjall.rs`        (transactional flavor)
+- `src/metastore/stores/fjall_notx.rs`   (non-transactional flavor)
 
-Both implementations preserve upstream's partition cache, durability
-handling, and write-path locking semantics. They share their range
-plumbing with the existing `iter_all` (which is now a one-line wrapper
-around `iter_kv(None)`).
+Both backends preserve upstream's partition cache, durability handling, and
+write-path locking semantics. They share their range plumbing with the
+existing `iter_all` (which is now a one-line wrapper around `iter_kv(None)`).
 
 ## Upstreaming sketch (historical -- moot per the 2026-07-30 ownership decision)
 
