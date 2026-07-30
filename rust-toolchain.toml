@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned deliberately: CI gates on `cargo clippy -D warnings` and
+# `cargo fmt --check`, both of which are toolchain-sensitive. Bump this
+# consciously, not implicitly via "stable".
+channel = "1.97"
+components = ["rustfmt", "clippy"]
