@@ -156,3 +156,7 @@ the fix moved a failure class from "impossible" to "counted and ignored".
   whose rollback is compensation).
 - Consequences and reconciliation: `docs/refcount.md`,
   `docs/adr/0005-fsck-scrub-reconciliation.md`.
+- Successor design: `docs/adr/0006-block-write-protocol.md` proposes a
+  file-first, per-block-striped protocol that closes the dangling-record,
+  partial-read, and durability gaps this document describes, and retires
+  the "compensating delete" and "two-phase records" roads above.
