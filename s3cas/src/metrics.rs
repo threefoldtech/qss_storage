@@ -53,6 +53,45 @@ impl Deref for SharedMetrics {
         &self.metrics
     }
 }
+
+/// Adapter so this crate's `Metrics` can be plugged into
+/// `cas_storage::SharedMetrics` (which expects `MetricsCollector`).
+///
+/// Note: upstream's `block_written` is parameterless so we cannot forward
+/// the block size into our internal `bytes_written` counter from this path.
+struct CasMetricsAdapter(Arc<Metrics>);
+
+impl cas_storage::MetricsCollector for CasMetricsAdapter {
+    fn block_pending(&self) {
+        self.0.block_pending()
+    }
+    fn block_written(&self) {
+        // size unknown via the trait; account for the block count only.
+        self.0.block_written(0)
+    }
+    fn block_write_error(&self) {
+        self.0.block_write_error()
+    }
+    fn block_ignored(&self) {
+        self.0.block_ignored()
+    }
+    fn blocks_dropped(&self, amount: u64) {
+        self.0.blocks_dropped(amount)
+    }
+    fn bytes_sent(&self, amount: usize) {
+        self.0.bytes_sent(amount)
+    }
+    fn bytes_received(&self, amount: usize) {
+        self.0.bytes_received(amount)
+    }
+}
+
+impl SharedMetrics {
+    /// Wrap as a cas_storage SharedMetrics (for calls into the CAS lib).
+    pub fn to_cas(&self) -> cas_storage::SharedMetrics {
+        cas_storage::SharedMetrics::new(Arc::new(CasMetricsAdapter(self.metrics.clone())))
+    }
+}
 #[derive(Debug)]
 pub struct Metrics {
     method_calls: IntCounterVec,

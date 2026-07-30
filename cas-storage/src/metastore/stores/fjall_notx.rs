@@ -1,23 +1,24 @@
 use std::convert::TryFrom;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{
+use fjall::{self, KeyspaceCreateOptions};
+
+use crate::metastore::{
     BaseMetaTree, KeyValuePairs, MetaError, MetaTreeExt, Object, Store, Transaction,
     TransactionBackend,
 };
 
 #[derive(Clone)]
 pub struct FjallStoreNotx {
-    keyspace: Arc<fjall::Keyspace>,
+    db: Arc<fjall::Database>,
     inlined_metadata_size: usize,
 }
 
 impl std::fmt::Debug for FjallStoreNotx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FjallStoreNotx")
-            .field("keyspace", &"<fjall::Keyspace>")
+            .field("db", &"<fjall::Database>")
             .finish()
     }
 }
@@ -26,18 +27,18 @@ impl FjallStoreNotx {
     pub fn new(path: PathBuf, inlined_metadata_size: Option<usize>) -> Self {
         tracing::debug!("Opening fjall store at {:?}", path);
 
-        let keyspace = fjall::Config::new(path).open().unwrap();
+        let db = fjall::Database::builder(&path).open().unwrap();
         // setting very low will practically disable it by default
         let inlined_metadata_size = inlined_metadata_size.unwrap_or(1);
 
         Self {
-            keyspace: Arc::new(keyspace),
+            db: Arc::new(db),
             inlined_metadata_size,
         }
     }
 
-    fn get_partition(&self, name: &str) -> Result<fjall::PartitionHandle, MetaError> {
-        match self.keyspace.open_partition(name, Default::default()) {
+    fn get_partition(&self, name: &str) -> Result<fjall::Keyspace, MetaError> {
+        match self.db.keyspace(name, KeyspaceCreateOptions::default) {
             Ok(partition) => Ok(partition),
             Err(e) => Err(MetaError::OtherDBError(e.to_string())),
         }
@@ -49,24 +50,23 @@ impl FjallStoreNotx {
 }
 
 impl Store for FjallStoreNotx {
-    fn tree_open(&self, name: &str) -> Result<Box<dyn BaseMetaTree>, MetaError> {
+    fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         let partition = self.get_partition(name)?;
-        Ok(Box::new(FjallTreeNotx::new(Arc::new(partition))))
+        Ok(Arc::new(FjallTreeNotx::new(Arc::new(partition))))
     }
 
-    fn tree_ext_open(&self, name: &str) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError> {
+    fn tree_ext_open(&self, name: &str) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
         let partition = self.get_partition(name)?;
-        Ok(Box::new(FjallTreeNotx::new(Arc::new(partition))))
+        Ok(Arc::new(FjallTreeNotx::new(Arc::new(partition))))
     }
 
     fn tree_exists(&self, name: &str) -> Result<bool, MetaError> {
-        let exists = self.keyspace.partition_exists(name);
-        Ok(exists)
+        Ok(self.db.keyspace_exists(name))
     }
 
     fn tree_delete(&self, name: &str) -> Result<(), MetaError> {
         let partition = self.get_partition(name)?;
-        match self.keyspace.delete_partition(partition) {
+        match self.db.delete_keyspace(partition) {
             Ok(_) => Ok(()),
             Err(e) => Err(MetaError::OtherDBError(e.to_string())),
         }
@@ -76,8 +76,13 @@ impl Store for FjallStoreNotx {
         Transaction::new(Box::new(FjallNoTransaction::new(Arc::new(self.clone()))))
     }
 
+    fn num_keys(&self, tree_name: &str) -> Result<usize, MetaError> {
+        let partition = self.get_partition(tree_name)?;
+        Ok(partition.approximate_len())
+    }
+
     fn disk_space(&self) -> u64 {
-        self.keyspace.disk_space()
+        self.db.disk_space().unwrap_or(0)
     }
 }
 
@@ -134,11 +139,11 @@ impl TransactionBackend for FjallNoTransaction {
 }
 
 pub struct FjallTreeNotx {
-    partition: Arc<fjall::PartitionHandle>,
+    partition: Arc<fjall::Keyspace>,
 }
 
 impl FjallTreeNotx {
-    pub fn new(partition: Arc<fjall::PartitionHandle>) -> Self {
+    pub fn new(partition: Arc<fjall::Keyspace>) -> Self {
         Self { partition }
     }
 
@@ -181,18 +186,22 @@ impl BaseMetaTree for FjallTreeNotx {
         }
     }
 
-    fn len(&self) -> usize {
-        self.partition.approximate_len()
-    }
-
-    fn is_empty(&self) -> Result<bool, MetaError> {
-        self.partition
-            .is_empty()
-            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+    // ---- tfstor-extension: promoted out of #[cfg(test)] for runtime use ----
+    fn len(&self) -> Result<usize, MetaError> {
+        let len = self
+            .partition
+            .len()
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+        Ok(len)
     }
 }
 
 impl MetaTreeExt for FjallTreeNotx {
+    fn iter_all(&self) -> KeyValuePairs {
+        self.iter_kv(None)
+    }
+
+    // ---- tfstor-extension: BEGIN ----
     fn iter_kv(&self, start_after: Option<Vec<u8>>) -> KeyValuePairs {
         let partition = self.partition.clone();
         let mut last_key = start_after;
@@ -210,7 +219,7 @@ impl MetaTreeExt for FjallTreeNotx {
             partition
                 .range::<Vec<u8>, _>(range)
                 .next()
-                .map(|res| match res {
+                .map(|guard| match guard.into_inner() {
                     Ok((k, v)) => {
                         last_key = Some(k.to_vec());
                         Ok((k.to_vec(), v.to_vec()))
@@ -228,16 +237,15 @@ impl MetaTreeExt for FjallTreeNotx {
         let mut last_key = start_key;
 
         Box::new(std::iter::from_fn(move || {
-            // Backward scanning
             let range = match &last_key {
                 Some(k) => ..k.clone(),
-                None => ..Vec::new(), // Start from the end
+                None => ..Vec::new(),
             };
 
             partition
                 .range::<Vec<u8>, _>(range)
                 .next_back()
-                .map(|res| match res {
+                .map(|guard| match guard.into_inner() {
                     Ok((k, v)) => {
                         last_key = Some(k.to_vec());
                         Ok((k.to_vec(), v.to_vec()))
@@ -249,6 +257,7 @@ impl MetaTreeExt for FjallTreeNotx {
                 })
         }))
     }
+    // ---- tfstor-extension: END ----
 
     // rules:
     // 1. continuation_token and start_after exists: use the one with the highest lexicographical order
@@ -263,9 +272,7 @@ impl MetaTreeExt for FjallTreeNotx {
         start_after: Option<String>,
         prefix: Option<String>,
         continuation_token: Option<String>,
-    ) -> Box<(dyn Iterator<Item = (String, Object)> + 'a)> {
-        // we only use one of token or start_after
-        // we can ignore the other
+    ) -> Box<dyn Iterator<Item = (String, Object)> + 'a> {
         let mut ctsa = match (continuation_token, start_after) {
             (Some(token), Some(start)) => Some(std::cmp::max(token, start)),
             (Some(token), None) => Some(token),
@@ -274,49 +281,36 @@ impl MetaTreeExt for FjallTreeNotx {
 
         let partition = self.partition.clone();
 
-        // create the iterator based on the existence of the prefix and ctsa
-        let base_iter: Box<
-            dyn Iterator<Item = Result<(fjall::Slice, fjall::Slice), fjall::Error>>,
-        > = match (prefix.as_ref(), ctsa.as_ref()) {
-            // if ctsa is after prefix and doesn't have prefix, return empty iterator
-            (Some(prefix), Some(ctsa)) if (ctsa > prefix && !ctsa.starts_with(prefix)) => {
-                //Return empty iterator if ctsa is after prefix
-                Box::new(std::iter::empty())
-            }
+        let base_iter: Box<dyn Iterator<Item = fjall::Guard>> =
+            match (prefix.as_ref(), ctsa.as_ref()) {
+                (Some(prefix), Some(ctsa)) if (ctsa > prefix && !ctsa.starts_with(prefix)) => {
+                    //Return empty iterator if ctsa is after prefix
+                    Box::new(std::iter::empty())
+                }
+                (Some(prefix), Some(ctsa_local)) if ctsa_local < prefix => {
+                    // If ctsa is before prefix, ignore ctsa
+                    ctsa = None;
+                    Box::new(partition.prefix(prefix.as_bytes()))
+                }
+                (Some(prefix), _) => Box::new(partition.prefix(prefix.as_bytes())),
+                (None, Some(ctsa)) => {
+                    let mut next_key = ctsa.as_bytes().to_vec();
+                    next_key.push(0);
+                    Box::new(partition.range(next_key..))
+                }
+                (None, None) => Box::new(partition.range::<Vec<u8>, _>(..)),
+            };
 
-            // if ctsa is before prefix, ignore ctsa
-            (Some(prefix), Some(ctsa_local)) if ctsa_local < prefix => {
-                // If ctsa is before prefix, ignore ctsa
-                ctsa = None;
-                Box::new(partition.prefix(prefix.as_bytes()))
-            }
+        let pairs = base_iter.filter_map(|g| g.into_inner().ok());
 
-            // if prefix exists, with or without ctsa, use `prefix`
-            (Some(prefix), _) => Box::new(partition.prefix(prefix.as_bytes())),
-
-            // if ctsa exists, without prefix, use `range` from ctsa
-            (None, Some(ctsa)) => {
-                let mut next_key = ctsa.as_bytes().to_vec();
-                next_key.push(0);
-                Box::new(partition.range(next_key..))
-            }
-            (None, None) => Box::new(partition.range::<Vec<u8>, _>(..)),
-        };
-
-        // filter out errors
-        let filtered = base_iter.filter_map(|res| res.ok());
-
-        //  if both prefix and ctsa exists, skip keys before ctsa
-        let skip_filtered = if prefix.is_some() && ctsa.is_some() {
-            let ctsa_bytes = ctsa.unwrap().into_bytes();
-            Box::new(
-                filtered.skip_while(move |(raw_key, _)| raw_key.deref() <= ctsa_bytes.as_slice()),
-            ) as Box<dyn Iterator<Item = _>>
+        let skip_filtered = if let (Some(_), Some(ctsa)) = (&prefix, ctsa) {
+            let ctsa_bytes = ctsa.into_bytes();
+            Box::new(pairs.skip_while(move |(raw_key, _)| &**raw_key <= ctsa_bytes.as_slice()))
+                as Box<dyn Iterator<Item = _>>
         } else {
-            Box::new(filtered)
+            Box::new(pairs)
         };
 
-        // convert raw keys and values to strings and objects
         Box::new(skip_filtered.map(|(raw_key, raw_value)| {
             let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
             let obj = Object::try_from(&*raw_value).unwrap();
@@ -328,18 +322,18 @@ impl MetaTreeExt for FjallTreeNotx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::test_utils;
+    use crate::metastore::stores::test_utils;
     use tempfile::tempdir;
 
     impl test_utils::TestStore for FjallStoreNotx {
-        fn tree_open(&self, name: &str) -> Result<Box<dyn BaseMetaTree>, MetaError> {
+        fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
             <FjallStoreNotx as Store>::tree_open(self, name)
         }
 
         fn get_bucket_ext(
             &self,
             name: &str,
-        ) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError> {
+        ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
             <FjallStoreNotx as Store>::tree_ext_open(self, name)
         }
     }

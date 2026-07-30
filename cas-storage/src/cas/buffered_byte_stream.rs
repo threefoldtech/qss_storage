@@ -1,6 +1,6 @@
+use super::byte_stream::AsyncByteStream;
 use super::fs::BLOCK_SIZE;
-use futures::{ready, Stream};
-use rusoto_core::ByteStream;
+use futures::{Stream, ready};
 use std::{
     io, mem,
     pin::Pin,
@@ -13,13 +13,13 @@ pub struct BufferedByteStream {
     // tokio one, which is not the same as the futures one. And I don't feel like adding a tokio
     // dependency here right now for that.
     // TODO: benchmark both approaches
-    bs: ByteStream,
+    bs: AsyncByteStream,
     buffer: Vec<u8>,
     finished: bool,
 }
 
 impl BufferedByteStream {
-    pub fn new(bs: ByteStream) -> Self {
+    pub fn new(bs: AsyncByteStream) -> Self {
         Self {
             bs,
             buffer: Vec::with_capacity(BLOCK_SIZE),

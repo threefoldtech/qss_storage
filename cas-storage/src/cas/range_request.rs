@@ -31,9 +31,9 @@ impl RangeRequest {
 // TODO: replace with a parse impl on RangeRequest
 /// Parse a range request.
 pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
-    if let Some(ref input) = input {
+    if let Some(input) = input {
         if !input.starts_with("bytes=") {
-            eprintln!("Invalid range input \"{}\"", input);
+            eprintln!("Invalid range input \"{input}\"");
             return RangeRequest::All;
         }
         let (_, input) = input.split_at(6); // split of "bytes="
@@ -41,27 +41,24 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
         let first = parts.next();
         let second = parts.next();
         if first.is_none() || second.is_none() {
-            eprintln!("invalid range request structure {}", input);
+            eprintln!("invalid range request structure {input}");
             return RangeRequest::All;
         }
         let first = first.unwrap();
         let second = second.unwrap();
         if parts.next().is_some() {
-            eprintln!("invalid range request structure {}", input);
+            eprintln!("invalid range request structure {input}");
             return RangeRequest::All;
         }
         if first.is_empty() && second.is_empty() {
-            eprintln!("invalid range request - missing start AND end {}", input);
+            eprintln!("invalid range request - missing start AND end {input}");
             return RangeRequest::All;
         }
         if first.is_empty() {
             match second.parse() {
                 Ok(end) => RangeRequest::ToBytes(end),
                 Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse end ({}): {}",
-                        e, input
-                    );
+                    eprintln!("invalid range request - could not parse end ({e}): {input}");
                     RangeRequest::All
                 }
             }
@@ -69,10 +66,7 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
             match first.parse() {
                 Ok(start) => RangeRequest::FromBytes(start),
                 Err(e) => {
-                    eprintln!(
-                        "invalid range request - could not parse start ({}): {}",
-                        e, input
-                    );
+                    eprintln!("invalid range request - could not parse start ({e}): {input}");
                     RangeRequest::All
                 }
             }
@@ -81,8 +75,7 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
                 Ok(start) => start,
                 Err(e) => {
                     eprintln!(
-                        "invalid range request - could not parse start from string ({}): {}",
-                        e, input
+                        "invalid range request - could not parse start from string ({e}): {input}"
                     );
                     return RangeRequest::All;
                 }
@@ -91,8 +84,7 @@ pub fn parse_range_request(input: &Option<String>) -> RangeRequest {
                 Ok(end) => end,
                 Err(e) => {
                     eprintln!(
-                        "invalid range request - could not parse end from string ({}): {}",
-                        e, input
+                        "invalid range request - could not parse end from string ({e}): {input}"
                     );
                     return RangeRequest::All;
                 }

@@ -6,11 +6,11 @@ use clap::Parser;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::cas::block_stream::BlockStream;
-use crate::cas::range_request::RangeRequest;
-use crate::cas::CasFS;
-use crate::cas::StorageEngine;
 use crate::metrics::SharedMetrics;
+use cas_storage::BlockStream;
+use cas_storage::CasFS;
+use cas_storage::RangeRequest;
+use cas_storage::StorageEngine;
 
 #[derive(Parser, Debug)]
 pub struct RetrieveConfig {
@@ -41,14 +41,14 @@ pub struct RetrieveConfig {
 pub async fn retrieve(args: RetrieveConfig) -> Result<()> {
     let storage_engine = args.metadata_db;
     let metrics = SharedMetrics::new();
-    let casfs = CasFS::new(
+    let casfs = CasFS::single_namespace(
         args.fs_root.clone(),
         args.meta_root.clone(),
-        metrics.clone(),
+        metrics.to_cas(),
         storage_engine,
         None,
         None,
-    );
+    )?;
 
     let (obj_meta, paths) = match casfs.get_object_paths(&args.bucket, &args.key)? {
         Some((obj, paths)) => (obj, paths),
@@ -67,7 +67,7 @@ pub async fn retrieve(args: RetrieveConfig) -> Result<()> {
     let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
     debug_assert!(obj_meta.size() as usize == block_size);
-    let mut block_stream = BlockStream::new(paths, block_size, RangeRequest::All, metrics);
+    let mut block_stream = BlockStream::new(paths, block_size, RangeRequest::All, metrics.to_cas());
 
     // Create the destination file
     let mut file = tokio::fs::File::create(&args.dest).await?;

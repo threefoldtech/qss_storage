@@ -46,6 +46,9 @@ impl TestServer {
                 // Create a TCP listener
                 let addr = format!("127.0.0.1:{}", thread_port);
                 let listener = TcpListener::bind(&addr).expect("Failed to bind to address");
+                listener
+                    .set_nonblocking(true)
+                    .expect("Failed to set non-blocking");
                 println!("Listening on: {}", addr);
 
                 // Create a shared storage instance
@@ -1082,11 +1085,14 @@ mod test_config {
 
         // Filter to only keep our test keys and find the last one
         all_scan_keys.retain(|k| k.starts_with(key_prefix));
-        assert!(!all_scan_keys.is_empty(), "Expected to find test keys with SCAN");
-        
+        assert!(
+            !all_scan_keys.is_empty(),
+            "Expected to find test keys with SCAN"
+        );
+
         // Use the last key as our starting point for RSCAN
         let start_key = all_scan_keys.last().unwrap().clone();
-        
+
         // Test 1: Initial rscan with a valid cursor
         let rscan_result: (String, Vec<String>) = redis::cmd("RSCAN")
             .arg(&start_key)
@@ -1152,14 +1158,14 @@ mod test_config {
         // Filter to only keep our test keys and find the largest one
         all_scan_keys.retain(|k| k.starts_with(key_prefix));
         all_scan_keys.sort();
-        
+
         let largest_key = all_scan_keys.last().unwrap().clone();
-        
+
         // Now do a complete backward scan starting from the largest key
         // We need to include the largest key in our results, so we'll add it manually
         let mut all_keys = Vec::new();
         all_keys.push(largest_key.clone()); // Add the largest key first
-        
+
         // Then start scanning backward from the largest key
         let mut next_cursor = largest_key.clone();
 
@@ -1170,11 +1176,11 @@ mod test_config {
                 .expect("Failed to execute RSCAN in loop");
 
             let (cursor, mut batch_keys) = rscan_result;
-            
+
             // Filter out the largest key if it's in the batch to avoid duplicates
             let largest_key_ref = &all_keys[0]; // Reference to the largest key we added
             batch_keys.retain(|k| k != largest_key_ref);
-            
+
             all_keys.append(&mut batch_keys);
 
             if cursor == "0" {
@@ -1199,9 +1205,13 @@ mod test_config {
         // Test 4: Verify that keys were collected in reverse order
         // Sort the keys to check if we got all of them
         all_keys.sort();
-        
+
         // Verify we got all our test keys
-        assert_eq!(all_keys.len(), num_keys, "Should have found all test keys with RSCAN");
+        assert_eq!(
+            all_keys.len(),
+            num_keys,
+            "Should have found all test keys with RSCAN"
+        );
 
         // Verify each expected key is in the results
         for i in 0..num_keys {
@@ -1216,7 +1226,7 @@ mod test_config {
         // Test 5: Verify that RSCAN returns keys in reverse order compared to SCAN
         // Create a new set of keys with a predictable order
         let ordered_prefix = "ordered_key_";
-        
+
         // Insert keys with ordered values to ensure a specific lexicographical order
         for i in 0..5 {
             let key = format!("{}{:02}", ordered_prefix, i); // Use padding to ensure correct ordering
@@ -1253,13 +1263,13 @@ mod test_config {
 
         // Get the largest ordered key to start RSCAN from
         let largest_ordered_key = scan_ordered_keys.last().unwrap().clone();
-        
+
         // Get all ordered keys with RSCAN (backward direction)
         let mut rscan_ordered_keys = Vec::new();
-        
+
         // Add the largest key manually first (since RSCAN might not include it)
         rscan_ordered_keys.push(largest_ordered_key.clone());
-        
+
         // Then start scanning backward from the largest key
         let mut next_cursor = largest_ordered_key.clone();
 
@@ -1270,11 +1280,11 @@ mod test_config {
                 .expect("Failed to execute RSCAN for ordered keys");
 
             let (cursor, mut batch_keys) = rscan_result;
-            
+
             // Filter out the largest key if it's in the batch to avoid duplicates
             let largest_key_ref = &rscan_ordered_keys[0]; // Reference to the first key we added
             batch_keys.retain(|k| k != largest_key_ref);
-            
+
             rscan_ordered_keys.append(&mut batch_keys);
 
             if cursor == "0" {
@@ -1285,15 +1295,14 @@ mod test_config {
 
         // Filter to only keep our ordered test keys
         rscan_ordered_keys.retain(|k| k.starts_with(ordered_prefix));
-        
+
         // Verify that RSCAN returns keys in reverse order
         // We need to reverse the scan_ordered_keys to match the expected order from RSCAN
         let mut reversed_scan_keys = scan_ordered_keys.clone();
         reversed_scan_keys.reverse();
-        
+
         assert_eq!(
-            rscan_ordered_keys, 
-            reversed_scan_keys,
+            rscan_ordered_keys, reversed_scan_keys,
             "RSCAN should return keys in reverse order compared to SCAN"
         );
     }

@@ -1,6 +1,9 @@
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    sync::Arc,
+};
 
-use metastore::{BaseMetaTree, BlockID, FsError, MetaError, BLOCKID_SIZE, PTR_SIZE};
+use crate::metastore::{BLOCKID_SIZE, BaseMetaTree, BlockID, FsError, MetaError, PTR_SIZE};
 
 #[derive(Debug)]
 pub struct MultiPart {
@@ -163,7 +166,7 @@ impl TryFrom<&[u8]> for MultiPart {
 }
 
 pub struct MultiPartTree {
-    tree: Box<dyn BaseMetaTree>,
+    tree: Arc<dyn BaseMetaTree>,
 }
 // Implement Debug manually
 impl std::fmt::Debug for MultiPartTree {
@@ -174,7 +177,7 @@ impl std::fmt::Debug for MultiPartTree {
     }
 }
 impl MultiPartTree {
-    pub fn new(tree: Box<dyn BaseMetaTree>) -> Self {
+    pub fn new(tree: Arc<dyn BaseMetaTree>) -> Self {
         Self { tree }
     }
 

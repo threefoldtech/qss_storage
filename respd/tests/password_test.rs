@@ -46,6 +46,9 @@ impl TestServer {
                 // Create a TCP listener
                 let addr = format!("127.0.0.1:{}", thread_port);
                 let listener = TcpListener::bind(&addr).expect("Failed to bind to address");
+                listener
+                    .set_nonblocking(true)
+                    .expect("Failed to set non-blocking");
                 println!("Listening on: {}", addr);
 
                 // Create a shared storage instance

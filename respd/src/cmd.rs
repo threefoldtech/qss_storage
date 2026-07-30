@@ -17,7 +17,7 @@ pub enum CommandError {
     WrongNumberOfArguments(String),
 
     #[error("Storage error: {0}")]
-    Storage(#[from] metastore::MetaError),
+    Storage(#[from] cas_storage::MetaError),
 
     #[error("Protocol error: {0}")]
     Protocol(String),
@@ -882,9 +882,10 @@ impl CommandHandler {
     /// Handle DBSIZE command - get the number of keys in the current namespace
     fn handle_dbsize(&self) -> Frame {
         debug!("Handling DBSIZE command");
-        // Use the num_keys method to get an approximation of the number of keys
-        let count = self.namespace.num_keys();
-        Frame::Integer(count as i64)
+        match self.namespace.num_keys() {
+            Ok(count) => Frame::Integer(count as i64),
+            Err(e) => Frame::Error(format!("ERR {e}")),
+        }
     }
 
     /// Handle SCAN command - scan keys in the current namespace

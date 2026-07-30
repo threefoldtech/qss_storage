@@ -8,7 +8,7 @@ use md5::{Digest, Md5};
 use tracing::debug;
 
 use crate::storage::{Storage, StorageError};
-use metastore::{MetaError, MetaTreeExt, Object, ObjectData};
+use cas_storage::{MetaError, MetaTreeExt, Object, ObjectData};
 
 /// Properties for a namespace
 #[derive(Debug, Clone)]
@@ -81,7 +81,7 @@ impl NamespaceCache {
             ..Default::default()
         };
         let namespace = Arc::new(Namespace {
-            tree: RwLock::new(Arc::from(tree)),
+            tree: RwLock::new(tree),
             properties: RwLock::new(props),
         });
 
@@ -129,7 +129,7 @@ impl NamespaceCache {
                     ..Default::default()
                 };
                 let namespace = Arc::new(Namespace {
-                    tree: RwLock::new(Arc::from(tree)),
+                    tree: RwLock::new(tree),
                     properties: RwLock::new(props),
                 });
 
@@ -168,7 +168,7 @@ impl NamespaceCache {
                 let mut tree_lock = namespace.tree.write().unwrap();
 
                 // Replace the old tree with the placeholder
-                *tree_lock = Arc::from(placeholder_tree);
+                *tree_lock = placeholder_tree;
 
                 // The lock will be dropped at the end of this scope, releasing the placeholder tree
             }
@@ -181,7 +181,7 @@ impl NamespaceCache {
 
             // Assign the new tree to the namespace
             let mut tree_lock = namespace.tree.write().unwrap();
-            *tree_lock = Arc::from(new_tree);
+            *tree_lock = new_tree;
 
             // Restore the original metadata to preserve properties
             self.storage.update_namespace_meta(name, namespace_meta)?;
@@ -351,7 +351,7 @@ impl Namespace {
         }
     }
 
-    pub fn num_keys(&self) -> usize {
+    pub fn num_keys(&self) -> Result<usize, MetaError> {
         self.tree.read().unwrap().len()
     }
 

@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::Rng;
-use s3_cas::metastore::{
+use rand::{Rng, RngExt};
+use s3cas::metastore::{
     Block, BlockID, BucketMeta, FjallStore, FjallStoreNotx, MetaStore, Object, ObjectData,
 };
 use std::time::Duration;
@@ -81,7 +81,7 @@ fn bench_insert_bucket(c: &mut Criterion) {
         let (store, _dir) = setup_fjall_store();
         group.bench_function(BenchmarkId::new("FjallStore", "insert_bucket"), |b| {
             b.iter(|| {
-                let bucket_name = format!("bucket-{}", rand::thread_rng().gen::<u32>());
+                let bucket_name = format!("bucket-{}", rand::rng().random::<u32>());
                 let bucket_data = create_test_bucket(&bucket_name);
                 black_box(store.insert_bucket(&bucket_name, bucket_data)).unwrap();
             });
@@ -93,7 +93,7 @@ fn bench_insert_bucket(c: &mut Criterion) {
         let (store, _dir) = setup_fjall_notx_store();
         group.bench_function(BenchmarkId::new("FjallStoreNotx", "insert_bucket"), |b| {
             b.iter(|| {
-                let bucket_name = format!("bucket-{}", rand::thread_rng().gen::<u32>());
+                let bucket_name = format!("bucket-{}", rand::rng().random::<u32>());
                 let bucket_data = create_test_bucket(&bucket_name);
                 black_box(store.insert_bucket(&bucket_name, bucket_data)).unwrap();
             });
@@ -122,7 +122,7 @@ fn bench_insert_meta(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("FjallStore", "insert_small_object"), |b| {
             b.iter(|| {
-                let key = format!("key-{}", rand::thread_rng().gen::<u32>());
+                let key = format!("key-{}", rand::rng().random::<u32>());
                 black_box(store.insert_meta(bucket_name, &key, small_object.clone())).unwrap();
             });
         });
@@ -139,7 +139,7 @@ fn bench_insert_meta(c: &mut Criterion) {
             BenchmarkId::new("FjallStoreNotx", "insert_small_object"),
             |b| {
                 b.iter(|| {
-                    let key = format!("key-{}", rand::thread_rng().gen::<u32>());
+                    let key = format!("key-{}", rand::rng().random::<u32>());
                     black_box(store.insert_meta(bucket_name, &key, small_object.clone())).unwrap();
                 });
             },
@@ -157,7 +157,7 @@ fn bench_insert_meta(c: &mut Criterion) {
             BenchmarkId::new("FjallStore", "insert_medium_object"),
             |b| {
                 b.iter(|| {
-                    let key = format!("key-{}", rand::thread_rng().gen::<u32>());
+                    let key = format!("key-{}", rand::rng().random::<u32>());
                     black_box(store.insert_meta(bucket_name, &key, medium_object.clone())).unwrap();
                 });
             },
@@ -175,7 +175,7 @@ fn bench_insert_meta(c: &mut Criterion) {
             BenchmarkId::new("FjallStoreNotx", "insert_medium_object"),
             |b| {
                 b.iter(|| {
-                    let key = format!("key-{}", rand::thread_rng().gen::<u32>());
+                    let key = format!("key-{}", rand::rng().random::<u32>());
                     black_box(store.insert_meta(bucket_name, &key, medium_object.clone())).unwrap();
                 });
             },
@@ -205,7 +205,7 @@ fn bench_get_meta(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("FjallStore", "get_meta"), |b| {
             b.iter(|| {
-                let key = format!("key-{}", rand::thread_rng().gen::<u8>() % 100);
+                let key = format!("key-{}", rand::rng().random::<u8>() % 100);
                 black_box(store.get_meta(bucket_name, &key)).unwrap();
             });
         });
@@ -227,7 +227,7 @@ fn bench_get_meta(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("FjallStoreNotx", "get_meta"), |b| {
             b.iter(|| {
-                let key = format!("key-{}", rand::thread_rng().gen::<u8>() % 100);
+                let key = format!("key-{}", rand::rng().random::<u8>() % 100);
                 black_box(store.get_meta(bucket_name, &key)).unwrap();
             });
         });
@@ -293,7 +293,7 @@ fn bench_transaction(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("FjallStore", "transaction"), |b| {
             b.iter(|| {
                 let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::thread_rng().gen::<u8>(), 1024);
+                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
                 black_box(tx.write_block(block_id, 1024, false)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
@@ -310,7 +310,7 @@ fn bench_transaction(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("FjallStoreNotx", "transaction"), |b| {
             b.iter(|| {
                 let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::thread_rng().gen::<u8>(), 1024);
+                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
                 black_box(tx.write_block(block_id, 1024, false)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
@@ -332,7 +332,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("FjallStore", "mixed_workload"), |b| {
             b.iter(|| {
                 // Create a bucket
-                let bucket_name = format!("bucket-{}", rand::thread_rng().gen::<u16>());
+                let bucket_name = format!("bucket-{}", rand::rng().random::<u16>());
                 let bucket_data = create_test_bucket(&bucket_name);
                 store.insert_bucket(&bucket_name, bucket_data).unwrap();
 
@@ -354,7 +354,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
                 // Use a transaction
                 let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::thread_rng().gen::<u8>(), 1024);
+                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
                 black_box(tx.write_block(block_id, 1024, false)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
@@ -368,7 +368,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("FjallStoreNotx", "mixed_workload"), |b| {
             b.iter(|| {
                 // Create a bucket
-                let bucket_name = format!("bucket-{}", rand::thread_rng().gen::<u16>());
+                let bucket_name = format!("bucket-{}", rand::rng().random::<u16>());
                 let bucket_data = create_test_bucket(&bucket_name);
                 store.insert_bucket(&bucket_name, bucket_data).unwrap();
 
@@ -390,7 +390,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
                 // Use a transaction
                 let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::thread_rng().gen::<u8>(), 1024);
+                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
                 black_box(tx.write_block(block_id, 1024, false)).unwrap();
                 black_box(tx.commit()).unwrap();
             });

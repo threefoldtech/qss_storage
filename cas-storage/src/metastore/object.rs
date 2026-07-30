@@ -7,7 +7,7 @@ use std::{
 use chrono::{SecondsFormat, TimeZone, Utc};
 use faster_hex::hex_string;
 
-use super::{BlockID, FsError, BLOCKID_SIZE, PTR_SIZE};
+use super::{BLOCKID_SIZE, BlockID, FsError, PTR_SIZE};
 
 /// Represents an object in the storage system with its metadata and content (for Inline objects).
 ///
@@ -149,10 +149,9 @@ impl Object {
     /// A formatted ETag string
     pub fn format_e_tag(&self) -> String {
         if let ObjectData::MultiPart { parts, .. } = &self.data {
-            format!("\"{}-{}\"", hex_string(&self.hash), parts)
+            format!("{}-{}", hex_string(&self.hash), parts)
         } else {
-            // Handle error case or provide default
-            format!("\"{}\"", hex_string(&self.hash))
+            hex_string(&self.hash)
         }
     }
 
@@ -262,6 +261,22 @@ impl Object {
             ObjectData::Inline { data } => Some(data),
             _ => None,
         }
+    }
+
+    /// Returns the object type.
+    ///
+    /// # Returns
+    /// The ObjectType of this object
+    pub fn object_type(&self) -> ObjectType {
+        self.object_type
+    }
+
+    /// Returns a reference to the object data.
+    ///
+    /// # Returns
+    /// A reference to the ObjectData enum
+    pub fn data(&self) -> &ObjectData {
+        &self.data
     }
 }
 

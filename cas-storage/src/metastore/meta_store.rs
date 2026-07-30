@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use super::{
-    BaseMetaTree, Block, BlockID, BucketMeta, MetaError, MetaTreeExt, Object, Store, BLOCKID_SIZE,
+    BLOCKID_SIZE, BaseMetaTree, Block, BlockID, BucketMeta, MetaError, MetaTreeExt, Object, Store,
 };
 
 /// `MetaStore` is a struct that provides methods to interact with the metadata store.
@@ -19,7 +19,7 @@ pub struct MetaStore {
 
 /// Default tree names used by the MetaStore
 /// These constants define the names of the special trees used internally
-const BUCKET_LIST_TREE: &str = "_BUCKETS";
+const DEFAULT_BUCKET_TREE: &str = "_BUCKETS";
 const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
 const DEFAULT_PATH_TREE: &str = "_PATHS";
 
@@ -55,15 +55,26 @@ impl MetaStore {
         self.inlined_metadata_size - Object::minimum_inline_metadata_size()
     }
 
-    /// Returns the tree which contains list of all the buckets.
+    /// Returns a reference to the underlying store.
+    ///
+    /// This is used for creating additional stores that share the same storage backend,
+    /// such as UserStore in multi-user mode.
+    ///
+    /// # Returns
+    /// An Arc reference to the underlying Store implementation
+    pub fn get_underlying_store(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store)
+    }
+
+    /// Returns the tree which contains all the buckets.
     ///
     /// This tree is used to store the bucket lists and provide
     /// the CRUD operations for the bucket list.
     ///
     /// # Returns
     /// A tree with extended functionality for bucket operations or an error
-    pub fn get_bucketlist_tree(&self) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError> {
-        self.store.tree_ext_open(BUCKET_LIST_TREE)
+    pub fn get_allbuckets_tree(&self) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
+        self.store.tree_ext_open(DEFAULT_BUCKET_TREE)
     }
 
     /// Returns the tree for a specific bucket with extended methods.
@@ -78,7 +89,7 @@ impl MetaStore {
     pub fn get_bucket_ext(
         &self,
         name: &str,
-    ) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError> {
+    ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
         self.store.tree_ext_open(name)
     }
 
@@ -90,7 +101,7 @@ impl MetaStore {
     /// # Returns
     /// A BlockTree instance or an error
     pub fn get_block_tree(&self) -> Result<BlockTree, MetaError> {
-        let tree = self.store.tree_open(DEFAULT_BLOCK_TREE)?;
+        let tree = self.store.tree_ext_open(DEFAULT_BLOCK_TREE)?;
         Ok(BlockTree { tree })
     }
 
@@ -104,7 +115,7 @@ impl MetaStore {
     ///
     /// # Returns
     /// A tree instance or an error
-    pub fn get_tree(&self, name: &str) -> Result<Box<dyn BaseMetaTree>, MetaError> {
+    pub fn get_tree(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         self.store.tree_open(name)
     }
 
@@ -114,7 +125,7 @@ impl MetaStore {
     ///
     /// # Returns
     /// A tree instance or an error
-    pub fn get_path_tree(&self) -> Result<Box<dyn BaseMetaTree>, MetaError> {
+    pub fn get_path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         self.store.tree_open(DEFAULT_PATH_TREE)
     }
 
@@ -159,7 +170,7 @@ impl MetaStore {
     /// Success or an error if the insertion fails
     pub fn insert_bucket(&self, bucket_name: &str, raw_bucket: Vec<u8>) -> Result<(), MetaError> {
         // Insert the bucket metadata into the buckets tree
-        let buckets = self.store.tree_open(BUCKET_LIST_TREE)?;
+        let buckets = self.store.tree_open(DEFAULT_BUCKET_TREE)?;
         buckets.insert(bucket_name.as_bytes(), raw_bucket)?;
 
         // Create the bucket tree if it doesn't exist
@@ -177,9 +188,9 @@ impl MetaStore {
     /// This method currently loads all buckets into memory at once.
     /// TODO: This should be paginated and return a stream for better scalability.
     pub fn list_buckets(&self) -> Result<Vec<BucketMeta>, MetaError> {
-        let bucketlist_tree = self.get_bucketlist_tree()?;
-        let buckets = bucketlist_tree
-            .iter_kv(None)
+        let bucket = self.get_allbuckets_tree()?;
+        let buckets = bucket
+            .iter_all()
             .filter_map(|result| {
                 let (_, value) = match result {
                     Ok(kv) => kv,
@@ -254,9 +265,19 @@ impl MetaStore {
     /// # Note
     /// This method currently handles reference counting and block management directly.
     /// In the future, these operations should be abstracted into a transaction system.
-    pub fn delete_object(&self, bucket: &str, key: &str) -> Result<Vec<Block>, MetaError> {
+    /// Delete an object from a bucket and decrement refcounts on its blocks.
+    ///
+    /// The bucket tree lives in this `MetaStore`; the block tree is passed
+    /// explicitly because in multi-namespace deployments it lives in a
+    /// separate `SharedBlockStore` (see `CasFS::new`). For single-namespace
+    /// use, pass `self.get_block_tree()?`.
+    pub fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        block_tree: &BlockTree,
+    ) -> Result<Vec<Block>, MetaError> {
         let bucket_tree = self.get_bucket_ext(bucket)?;
-        let block_tree = self.get_block_tree()?;
 
         // Get the object metadata
         let raw_object = match bucket_tree.get(key.as_bytes())? {
@@ -266,6 +287,13 @@ impl MetaStore {
 
         let obj = Object::try_from(&*raw_object).expect("Malformed object");
         let mut to_delete: Vec<Block> = Vec::with_capacity(obj.blocks().len());
+
+        tracing::debug!(
+            bucket = bucket,
+            key = key,
+            block_count = obj.blocks().len(),
+            "Deleting object"
+        );
 
         // Delete the object from the bucket
         bucket_tree.remove(key.as_bytes())?;
@@ -278,17 +306,41 @@ impl MetaStore {
 
                     // If this is the last reference to the block, delete it
                     if block.rc() == 1 {
+                        tracing::debug!(
+                            block_hash = %hex::encode(block_id),
+                            rc = block.rc(),
+                            "Block rc==1: deleting block and marking for file deletion"
+                        );
                         block_tree.remove(block_id)?;
                         to_delete.push(block);
                     } else {
                         // Otherwise decrement the reference count
+                        let old_rc = block.rc();
                         block.decrement_refcount();
+                        let new_rc = block.rc();
+                        tracing::debug!(
+                            block_hash = %hex::encode(block_id),
+                            old_rc = old_rc,
+                            new_rc = new_rc,
+                            "Block rc>1: decrementing refcount"
+                        );
                         block_tree.insert(block_id, block.to_vec())?;
                     }
                 }
-                None => continue, // Block not found, skip it
+                None => {
+                    tracing::warn!(
+                        block_hash = %hex::encode(block_id),
+                        "Block not found in tree during deletion"
+                    );
+                    continue; // Block not found, skip it
+                }
             }
         }
+
+        tracing::debug!(
+            blocks_to_delete = to_delete.len(),
+            "Finished processing object deletion"
+        );
 
         Ok(to_delete)
     }
@@ -301,15 +353,14 @@ impl MetaStore {
         self.store.begin_transaction()
     }
 
-    /// Returns the total number of keys in a tree.
+    /// Returns the total number of keys in the bucket tree.
     ///
     /// This is primarily used for monitoring and debugging purposes.
     ///
     /// # Returns
-    /// The number of keys in the a tree
-    pub fn num_keys(&self, tree_name: &str) -> Result<usize, MetaError> {
-        let tree = self.store.tree_open(tree_name)?;
-        Ok(tree.len())
+    /// The number of keys in the bucket tree
+    pub fn num_keys(&self) -> usize {
+        self.store.num_keys(DEFAULT_BUCKET_TREE).unwrap()
     }
 
     /// Returns the total disk space used by the metadata store.
@@ -325,7 +376,7 @@ impl Debug for MetaStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetaStore")
             .field("store", &"<Store>")
-            .field("bucket_tree_name", &BUCKET_LIST_TREE)
+            .field("bucket_tree_name", &DEFAULT_BUCKET_TREE)
             .field("block_tree_name", &DEFAULT_BLOCK_TREE)
             .field("path_tree_name", &DEFAULT_PATH_TREE)
             .field("inlined_metadata_size", &self.inlined_metadata_size)
@@ -335,10 +386,17 @@ impl Debug for MetaStore {
 
 /// `BlockTree` provides specialized operations for working with block metadata.
 ///
-/// This struct wraps a BaseMetaTree and provides methods specific to block operations,
+/// This struct wraps a MetaTreeExt and provides methods specific to block operations,
 /// such as retrieving and manipulating block metadata.
+#[derive(Clone)]
 pub struct BlockTree {
-    tree: Box<dyn BaseMetaTree>,
+    tree: Arc<dyn MetaTreeExt + Send + Sync>,
+}
+
+impl Debug for BlockTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockTree").finish()
+    }
 }
 
 impl BlockTree {
@@ -363,14 +421,18 @@ impl BlockTree {
 
     /// Returns the number of blocks in the tree.
     ///
+    /// This method is only available in test builds.
+    ///
     /// # Returns
     /// The number of blocks or an error
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub fn len(&self) -> Result<usize, MetaError> {
         self.tree.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tree.is_empty().unwrap()
+    #[cfg(test)]
+    pub fn is_empty(&self) -> Result<bool, MetaError> {
+        self.len().map(|n| n == 0)
     }
 
     /// Removes a block from the tree.
@@ -380,7 +442,7 @@ impl BlockTree {
     ///
     /// # Returns
     /// Success or an error if the removal fails
-    fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
+    pub fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
         self.tree.remove(key)
     }
 
@@ -405,6 +467,32 @@ impl BlockTree {
     /// The raw block data if found, None if the key doesn't exist, or an error
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
         self.tree.get(key)
+    }
+
+    /// Returns an iterator over all blocks in the tree.
+    ///
+    /// # Returns
+    /// An iterator yielding (BlockID, Block) tuples
+    pub fn iter_all(&self) -> Box<dyn Iterator<Item = Result<(BlockID, Block), MetaError>> + '_> {
+        use crate::metastore::block::BLOCKID_SIZE;
+
+        Box::new(self.tree.iter_all().map(|result| match result {
+            Ok((key, value)) => {
+                // Parse the block ID from the key
+                let block_id: BlockID = if key.len() >= BLOCKID_SIZE {
+                    let mut id = [0u8; BLOCKID_SIZE];
+                    id.copy_from_slice(&key[..BLOCKID_SIZE]);
+                    id
+                } else {
+                    return Err(MetaError::OtherDBError("Malformed block key".to_string()));
+                };
+                // Deserialize the block
+                Block::try_from(&*value)
+                    .map(|block| (block_id, block))
+                    .map_err(|e| MetaError::OtherDBError(e.to_string()))
+            }
+            Err(e) => Err(e),
+        }))
     }
 }
 
@@ -474,9 +562,25 @@ impl Transaction {
 
                 // If the key doesn't have this block, increment the reference count
                 if !key_has_block {
+                    let old_rc = block.rc();
                     block.increment_refcount();
+                    let new_rc = block.rc();
+                    tracing::debug!(
+                        block_hash = %hex::encode(block_hash),
+                        old_rc = old_rc,
+                        new_rc = new_rc,
+                        key_has_block = key_has_block,
+                        "Block exists: incrementing refcount"
+                    );
                     self.backend
                         .insert(DEFAULT_BLOCK_TREE, &block_hash, block.to_vec())?;
+                } else {
+                    tracing::debug!(
+                        block_hash = %hex::encode(block_hash),
+                        rc = block.rc(),
+                        key_has_block = key_has_block,
+                        "Block exists: NOT incrementing (key already has it)"
+                    );
                 }
 
                 Ok((false, block))
@@ -501,6 +605,14 @@ impl Transaction {
 
                 // insert this new block
                 let block = Block::new(data_len, block_hash[..idx].to_vec());
+
+                tracing::debug!(
+                    block_hash = %hex::encode(block_hash),
+                    rc = block.rc(),
+                    data_len = data_len,
+                    key_has_block = key_has_block,
+                    "Creating new block with rc=1"
+                );
 
                 self.backend
                     .insert(DEFAULT_BLOCK_TREE, &block_hash, block.to_vec())?;
