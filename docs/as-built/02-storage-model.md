@@ -158,25 +158,24 @@ bytes, a single-part block list, or the multipart shape.
 
 ## Durability
 
-`Durability` (`cas-storage/src/metastore/traits.rs`, mapped at
-`stores/fjall.rs:45-49`) has three levels, translated onto fjall's
-`PersistMode`:
+`Durability` (`cas-storage/src/metastore/traits.rs`, mapped in
+`stores/fjall.rs`) has three levels, translated onto fjall's `PersistMode`:
 
 | `Durability` | fjall `PersistMode` |
 |--------------|---------------------|
 | `Buffer` | `Buffer` |
-| `Fsync` | `SyncData` |
-| `Fdatasync` | `SyncAll` |
+| `Fsync` | `SyncAll` |
+| `Fdatasync` | `SyncData` |
 
-Default is `Fdatasync` (`stores/fjall.rs:44`), and the `s3cas` CLI default is
-`fdatasync` (`s3cas/src/main.rs:62`).
+Default is `Fsync`, and the `s3cas` CLI default is `fsync` -- the strongest
+mode.
 
-Note the mapping is crossed relative to what the names suggest: `Fsync` maps to
-`SyncData` and `Fdatasync` maps to `SyncAll`. Conventionally `fdatasync` is the
-*weaker* of the two POSIX calls (it may skip metadata), while here `Fdatasync`
-selects the *stronger* fjall mode. Whether that is intentional naming drift or
-a transposition is not documented; it is worth confirming before relying on
-either level. Flagged as finding H12.
+The mapping follows the POSIX names: `fsync` flushes data and metadata
+(strongest), `fdatasync` flushes data only (weaker, faster). It was originally
+crossed -- `Fsync` selected `SyncData` and `Fdatasync` selected `SyncAll`,
+with `fdatasync` as the default -- which was flagged as finding H12 and fixed
+on 2026-07-30 by swapping the mapping and moving the default to `Fsync`, so
+the default persist behavior is unchanged while the names now tell the truth.
 
 ## Transactional model
 
