@@ -2,9 +2,9 @@ name: Build and Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, development ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, development ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,8 +14,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-    
+    - uses: actions/checkout@v4
+
     - name: Cache cargo dependencies
       uses: actions/cache@v3
       with:
@@ -24,20 +24,15 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        
-    - name: Install latest stable
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
 
+    # No explicit toolchain install: rustup on the runner reads
+    # rust-toolchain.toml and installs the pinned toolchain on first use.
     - name: Check formatting
       run: cargo fmt --all -- --check
 
     - name: Build
       run: cargo build --workspace
 
-    - uses: actions/checkout@v4
     - name: Run clippy
       run: cargo clippy --workspace --all-features -- -Dwarnings
 
