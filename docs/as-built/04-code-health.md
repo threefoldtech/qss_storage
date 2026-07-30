@@ -1,0 +1,440 @@
+# Code Health: Bloat and Smell Findings
+
+Findings from a review of branch `refactor/cas-storage` at `e349d9d`.
+
+Each finding states what was actually verified. **Confirmed** means reproduced
+or read directly off the code. **By inspection** means read but not executed.
+**Needs decision** means the code is defensible and the question is intent.
+
+Much of what follows lives inside `cas-storage/`, which is a vendored fork of
+`threefoldtech/s3-cas @ b28eac0`. Those findings are upstream's, not this
+repository's authorship -- but they are this repository's risk, and fixing them
+locally has a rebase cost. Where that tension applies it is called out.
+
+Baseline: this branch is clean under
+`cargo clippy --workspace --all-targets -- -D warnings` and passes 44 tests.
+Everything below is beyond what the gating lints catch.
+
+---
+
+## Correctness and soundness
+
+### H1. `unimplemented!()` reachable on default flags -- CONFIRMED
+
+`cas-storage/src/metastore/stores/fjall.rs:132-135`
+
+```rust
+fn num_keys(&self, _: &str) -> Result<usize, MetaError> {
+    unimplemented!("fjall with transaction does not support number of keys");
+}
+```
+
+Reached from `s3cas inspect num-keys` via `s3cas/src/inspect.rs:23`. The
+`--metadata-db` flag defaults to `fjall` (`s3cas/src/main.rs:55`), so the
+default invocation panics. Reproduced:
+
+```
+$ s3cas inspect --meta-root /tmp/meta num-keys testbucket
+thread 'main' panicked at cas-storage/src/metastore/stores/fjall.rs:133:9:
+not implemented: fjall with transaction does not support number of keys
+
+$ s3cas inspect --meta-root /tmp/meta --metadata-db fjall_notx num-keys testbucket
+Number of keys in bucket 'testbucket': 0
+```
+
+**The panic message is factually wrong**, which makes this cheaper to fix than
+it looks. Two hundred lines later in the same file, `BaseMetaTree::len` does
+exactly the counting the message claims is impossible:
+
+```rust
+fn len(&self) -> Result<usize, MetaError> {
+    let read_tx = self.db.read_tx();
+    let len = read_tx.len(&*self.partition)...
+}
+```
+
+So the fix is to open the named partition and delegate to `read_tx().len()`,
+mirroring `FjallStoreNotx::num_keys`. No fjall limitation is involved.
+
+Scope is limited to the CLI. `respd`'s `DBSIZE` takes a different route
+(`respd/src/namespace.rs::num_keys` -> `BaseMetaTree::len`) and does **not**
+hit this, so there is no network-reachable panic here. Verified by reading both
+paths.
+
+### H2. Lifetime laundering plus unaudited `Send`/`Sync` -- by inspection
+
+`cas-storage/src/metastore/stores/fjall.rs:119-131, 156-157`
+
+```rust
+let tx = unsafe {
+    std::mem::transmute::<fjall::SingleWriterWriteTx<'_>, fjall::SingleWriterWriteTx<'static>>(
+        self.db.write_tx(),
+    )
+};
+...
+unsafe impl Send for FjallTransaction {}
+unsafe impl Sync for FjallTransaction {}
+```
+
+The `'static` claim holds in current code, for reasons the comment does not
+give: `FjallTransaction` stores an `Arc<FjallStore>`, whose `Arc<...Database>`
+clone keeps the database alive for at least as long as the transaction, and
+field declaration order (`tx` before `store`) makes the transaction drop first.
+Both are load-bearing and neither is written down, so a future field reorder or
+a change to what `FjallTransaction` owns would break soundness silently.
+
+The `Send`/`Sync` impls are the larger concern. `SingleWriterWriteTx` is
+presumably not `Send`/`Sync` by design -- the type name states a single-writer
+invariant. Asserting both removes the compiler's enforcement of exactly the
+property fjall is trying to guarantee. `Send` is plausibly needed to hold the
+transaction across an `await` in a tokio task. `Sync` is harder to justify:
+every `TransactionBackend` method takes `&mut self`, so shared-reference access
+should not arise.
+
+Suggested: document the drop-order and Arc-liveness argument as a `SAFETY`
+comment, add a compile-time guard against field reordering, and try deleting
+`unsafe impl Sync` to see whether anything actually needs it.
+
+### H3. On-disk format depends on host pointer width -- by inspection
+
+`cas-storage/src/metastore/constants.rs:4`, used in 19 places across
+`block.rs`, `bucket_meta.rs`, `multipart.rs`.
+
+```rust
+pub const PTR_SIZE: usize = mem::size_of::<usize>();
+```
+
+Length and refcount fields are serialized as native-width `usize`, so a store
+written on a 64-bit host is not readable on a 32-bit one, and there is no
+version or magic byte to detect the mismatch. Full analysis in
+[02-storage-model.md](./02-storage-model.md#pointer-width-dependence).
+
+This matters more than usual here because the product goal is aggregating
+storage across a heterogeneous node network -- 32-bit ARM or RISC-V nodes make
+it concrete rather than theoretical, as does any attempt to replicate metadata
+between nodes.
+
+Fix is `u64` for all on-disk length and count fields. That is format-breaking,
+so it belongs with the ADR 0002 migration, which already plans a format
+transition.
+
+### H4. MD5 content addressing under shared block storage -- by inspection
+
+`cas-storage/src/cas/write_path.rs` (hashing),
+`cas-storage/src/cas/shared_block_store.rs` (sharing)
+
+Blocks are content-addressed by MD5, and in `SharedBlockStore` mode the block
+store and `_BLOCKS` refcount tree are shared across namespaces (tenants).
+Deduplication is therefore cross-tenant: if tenant A writes a block whose MD5
+matches one tenant B already stored, A's write is deduplicated onto B's block.
+
+MD5 chosen-prefix collisions are practical. So a tenant who can upload
+arbitrary bytes can construct two distinct blocks with the same MD5 and, in the
+shared mode, cause one tenant's data to be served in place of another's. The
+refcount design means whichever block landed first wins and the second writer's
+content is silently discarded.
+
+This is a property of MD5 plus cross-tenant dedup, not a coding defect, and
+ADR 0002 already proposes BLAKE3 -- but ADR 0002 is **Status: Proposed** and
+frames the motivation as MD5 being "chosen for simplicity and speed". The
+multi-tenant substitution consequence is worth recording explicitly in that
+ADR, because it changes the migration from a nice-to-have into a prerequisite
+for offering shared-block multi-tenancy to untrusted tenants.
+
+Interim mitigations, if BLAKE3 is not imminent: do not enable
+`SharedBlockStore` across trust boundaries, or verify full block content on
+dedup hit rather than trusting the digest.
+
+Note this is separate from MD5's use for S3 ETags, which is mandated by S3
+compatibility and carries no such risk.
+
+### H5. `unsafe impl Sync` with no justification -- by inspection
+
+`cas-storage/src/cas/block_stream.rs:46`
+
+```rust
+unsafe impl Sync for BlockStream {}
+```
+
+No `SAFETY` comment, no explanation. `BlockStream` holds an `open_fut` future
+and a file handle and is polled as a `Stream`. Whether `Sync` is sound depends
+on what `open_fut` contains; whether it is *needed* is a separate question that
+the code does not answer. Same recommendation as H2: try removing it and see
+what breaks.
+
+### H6. `from_utf8_unchecked` on data read back from disk -- by inspection
+
+Six sites: `bucket_meta.rs:97`, `stores/fjall.rs:390`,
+`stores/fjall_notx.rs:315`, `multipart.rs:93,108,124`.
+
+```rust
+// SAFETY: this is safe because we only store valid strings in the first place.
+name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
+```
+
+The safety argument covers the write path but not the read path. These bytes
+come back from a database file, where the invariant can be broken by disk
+corruption, a truncated write, a partially-migrated format, or a version that
+wrote a different layout -- exactly the H3 scenario. The consequence of a
+violated invariant is undefined behaviour rather than an error return.
+
+The performance argument is weak: `str::from_utf8` is a fast SIMD-friendly
+validation, and these are bucket names, keys, and upload IDs, not bulk data.
+Recommend `String::from_utf8` mapped into the existing `MetaError`/`FsError`,
+which every one of these call sites is already positioned to return.
+
+---
+
+## Design and consistency
+
+### H7. Client-supplied Content-MD5 accepted and ignored -- by inspection
+
+`s3cas/src/s3fs.rs:676`
+
+```rust
+content_md5: _, // TODO: Verify
+```
+
+S3 clients send `Content-MD5` so the server can reject corrupted uploads. It is
+destructured and discarded, so that end-to-end integrity check silently does
+nothing. Low effort to implement given the write path already computes the
+object MD5.
+
+### H8. `unwrap()` on a fallible store call in a facade method
+
+`cas-storage/src/metastore/meta_store.rs:363`
+
+```rust
+pub fn num_keys(&self) -> usize {
+    self.store.num_keys(DEFAULT_BUCKET_TREE).unwrap()
+}
+```
+
+Swallows the `Result` into a panic in a method whose doc comment says it is
+"primarily used for monitoring and debugging". Compounds H1. Should return
+`Result<usize, MetaError>`.
+
+### H9. `#[async_trait]` still present -- needs decision
+
+`s3cas/src/s3fs.rs:83`, `s3cas/src/metrics.rs:1,258`
+
+House rule is native AFIT over the `async-trait` crate. Two cases, different
+verdicts:
+
+- `s3fs.rs:83` -- `impl S3 for S3FS`. The `s3s` crate defines the `S3` trait
+  with `#[async_trait]`; the impl must match. Not removable without an upstream
+  change to `s3s`. Leave it.
+- `metrics.rs:1,258` -- a local trait impl. Likely convertible to native
+  `async fn` in trait, or to `-> impl Future` if a `dyn` bound is needed.
+
+Worth noting `cas-storage/src/cas/async_fs.rs:6` records that `async_trait` was
+already removed there as dead weight, so the direction of travel is established.
+
+### H10. Truncating casts in size and offset arithmetic -- by inspection
+
+12 `clippy::cast_possible_truncation` hits under `-W clippy::pedantic`,
+including `size as u64`, `part_number as i64`, and `count as i64` in
+`s3cas/src/s3fs.rs`. In a storage system these sit on the paths that compute
+object sizes, part numbers, and content ranges, where a silent truncation is a
+data-integrity bug rather than a display glitch. Worth auditing the 12
+individually and using `try_into()` with an error where the value is
+externally influenced.
+
+### H11. Mixed module style within one crate -- cosmetic
+
+`cas-storage/src/cas.rs` + `cas/` (post-2018 form) sits next to
+`cas-storage/src/metastore/mod.rs` (pre-2018 form). Pick one.
+
+### H12. `Durability` names appear transposed -- needs decision
+
+`cas-storage/src/metastore/stores/fjall.rs:45-49`
+
+```rust
+Durability::Fsync      => fjall::PersistMode::SyncData,
+Durability::Fdatasync  => fjall::PersistMode::SyncAll,
+```
+
+By POSIX convention `fdatasync` is the weaker call (may skip metadata) and
+`fsync` the stronger. Here `Fdatasync` selects the stronger fjall mode
+(`SyncAll`) and `Fsync` the weaker (`SyncData`). The default is `Fdatasync`
+(`fjall.rs:44`), which is also the `s3cas` CLI default -- so the default is the
+strongest mode, which is a safe default but not what the name suggests.
+
+Either the mapping is transposed or the enum names mean something other than
+the POSIX calls. Worth confirming before anyone tunes durability for
+performance based on the flag names.
+
+---
+
+## Bloat and duplication
+
+### B1. Two near-copy store backends
+
+`cas-storage/src/metastore/stores/fjall.rs` (433 lines) and
+`fjall_notx.rs` (358 lines): 791 lines total, of which **235 lines are
+identical**, and the two files define almost the same function set (differing
+only by `commit_persist`, present in the transactional one).
+
+This is the largest single block of duplication in the workspace. Every
+extension has to be written twice -- `EXTENSIONS.md` explicitly says the
+`iter_kv` additions were "port both `fjall.rs` and `fjall_notx.rs` impls (copy
+from this fork)", i.e. the duplication is a known, accepted tax.
+
+Two caveats before deduplicating:
+
+1. The duplication is upstream's. Refactoring it locally maximizes rebase pain
+   against `s3-cas`, which cuts directly against the stated goal of dissolving
+   the fork. This is arguably a fix to make *upstream*, not here.
+2. Both backends earn their existence: `benches/fjall_benchmark.rs` exists to
+   compare them, and `shared_block_store.rs:49` treats `fjall_notx` as a real
+   deployment option with weaker guarantees.
+
+So: real bloat, but the right move is probably an upstream PR rather than a
+local refactor. Worth a decision either way rather than drift.
+
+### B2. Oversized functions
+
+Measured by brace matching, production code only:
+
+| Lines | Location |
+|-------|----------|
+| 388 | `respd/src/cmd.rs::from_frame` |
+| 212 | `respd/src/server.rs::process` |
+| 161 | `cas-storage/src/cas/write_path.rs::store_object` |
+| 147 | `cas-storage/src/cas/block_stream.rs::poll_next` |
+| 131 | `s3cas/src/main.rs::run` |
+
+`from_frame` is the clear outlier: one `match` handling arity checks, type
+coercion, and construction for all twenty respd commands. It is the natural
+place for a per-command parse trait or a table-driven arity/type spec, and it
+is not vendored code -- `respd` is this repository's own, so there is no rebase
+argument against fixing it.
+
+`poll_next` at 147 lines is a hand-rolled state machine and carries the
+workspace's bluntest comment (`block_stream.rs:117`, `// TODO: Fix this crap`).
+
+`clippy::too_many_lines` fires 4 times under pedantic.
+
+### B3. Edition split across the workspace
+
+| Crate | Edition |
+|-------|---------|
+| workspace `[workspace.package]` | 2018 |
+| `cas-storage` | 2024 (explicit override) |
+| `s3cas` | 2018 (inherited) |
+| `respd` | 2018 (inherited) |
+
+The refactor moved `cas-storage` to 2024 but left the workspace default and
+both frontends on 2018 -- an edition that predates `async`/`await` stabilizing
+in its current form and is three editions behind. This compiles (editions are
+per-crate) but means the two binaries are written against 2018 idioms while the
+library they consume uses 2024. Moving the workspace to 2024 is mostly
+mechanical (`cargo fix --edition`) and worth doing while the layout is already
+in flux.
+
+There is also no `rust-toolchain.toml`, so the toolchain is whatever the builder
+has -- and CI gates on `clippy -D warnings`, which is toolchain-sensitive by
+nature. A new stable release can turn CI red without a code change. Pinning is
+cheap insurance.
+
+### B4. Pedantic lint and TODO backlog
+
+458 warnings under `-W clippy::pedantic --all-targets`. Most are stylistic
+(`doc_markdown`, `must_use_candidate`, `uninlined_format_args`) and not worth
+chasing. The substantive clusters are H10 (truncating casts) and a handful of
+`unused_async`, `unused_self`, `unnecessary_wraps`, and `non_std_lazy_statics`.
+
+16 `TODO`/`FIXME` markers across the workspace. The ones tied to behaviour
+rather than style:
+
+| Location | Note |
+|----------|------|
+| `s3cas/src/s3fs.rs:51` | `FIXME` -- bucket count hardcoded to 1 |
+| `s3cas/src/s3fs.rs:676` | Content-MD5 unverified (H7) |
+| `s3cas/src/s3fs.rs:200,256` | output structs returned as `default()` |
+| `s3cas/src/metrics.rs:109` | may crash with multiple instances |
+| `cas-storage/src/metastore/meta_store.rs:189` | `list_buckets` should be paginated/streamed |
+| `cas-storage/src/cas/fs.rs:199` | "this is very much not optimal" |
+| `s3cas/src/internal_macros.rs:2` | `TODO: remove` |
+
+`meta_store.rs:189` is the one with scaling teeth: an unpaginated
+`list_buckets` that materializes every bucket is fine at small scale and a
+problem at the scale the README describes.
+
+---
+
+## Process and documentation
+
+### P1. ADRs describe a layout `main` does not have
+
+`docs/adr/0001-initial-architecture-overview.md` (9 references to
+`cas-storage`) and `0002` (5 references) document the consolidated three-crate
+layout. On `main` that layout does not exist -- `main` still has a separate
+`metastore` crate. The ADRs were committed ahead of the refactor they describe.
+
+Resolved by merging this branch. Until then, `main`'s architecture
+documentation describes code that is not in `main`.
+
+### P2. `main` is red in CI
+
+`.github/workflows/build.yaml` runs
+`cargo clippy --workspace --all-features -- -Dwarnings`. On `main`'s layout,
+clippy reports 6 errors in the `metastore` crate (unnecessary parentheses
+around types x3, `io::Error::other`, and `unwrap` after `is_some` x2). Observed
+directly when a local pre-commit hook ran clippy against `main`'s tree.
+
+This branch fixes all six -- five by deleting the crate that contained them,
+one by the auto-deref fix carried in `e349d9d`.
+
+### P3. Missing CI gates
+
+- No `cargo fmt --check`. Formatting drift is currently caught only by local
+  hooks, inconsistently.
+- No `rust-toolchain.toml` (see B3).
+- `release.yaml` builds but does not test.
+
+### P4. `.gitignore` is too narrow
+
+Contents are `/target` and `.vscode`. Notably absent: the `data/` directory
+that the servers write into by default. In the pre-rename checkout, `data/`
+existed as untracked-but-committable content -- one `git add -A` from being
+committed. Adding `/data` is a one-line fix.
+
+### P5. Dangling documentation reference
+
+`cas-storage/src/cas/async_fs.rs:6` cites `docs/arch/deadlock-fix.md`. Neither
+that file nor `docs/arch/` exists; `docs/` holds only `refcount.md` and
+`adr/`. Either the document was never carried over from upstream or it was
+lost. Since it explains why the `AsyncFileSystem` abstraction exists at all,
+the missing rationale is worth reconstructing.
+
+### P6. Test and naming gaps
+
+- `DBSIZE` has no test, despite being one of the two commands that motivated
+  promoting `BaseMetaTree::len` out of `#[cfg(test)]`. Reading the code says it
+  works (H1 explains why it takes the safe path), but nothing guards it.
+- `EXTENSIONS.md` and the `tfstor-extension` markers still use the pre-rename
+  name. Renaming the markers would create churn against upstream for no
+  functional gain, so the sensible resolution is a one-line note in
+  `EXTENSIONS.md` recording that `tfstor` is the former name of this
+  repository, rather than a sweep.
+
+---
+
+## Suggested order of work
+
+1. **H1** -- confirmed panic on a default code path, and the fix is a few lines
+   delegating to `read_tx().len()`. Fix in place.
+2. **P2 / P1** -- merge this branch. Turns CI green and makes the ADRs true.
+3. **H4** -- amend ADR 0002 to record the multi-tenant substitution risk. This
+   is a documentation change that may reprioritize the whole BLAKE3 migration.
+4. **H6, H2, H5** -- the `unsafe` cluster. Convert `from_utf8_unchecked` to
+   checked conversions, write the missing `SAFETY` arguments, and test whether
+   the two `unsafe impl Sync`s are needed at all.
+5. **H3** -- fold fixed-width on-disk fields into the ADR 0002 format
+   transition rather than doing it standalone.
+6. **B3, P3, P4** -- edition bump, toolchain pin, fmt gate, gitignore. Cheap
+   and mechanical.
+7. **B2 (`from_frame`)** -- own code, no rebase cost, clear win.
+8. **B1** -- decide: upstream PR, or accept the duplication and stop
+   relitigating it.

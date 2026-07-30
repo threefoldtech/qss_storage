@@ -1,4 +1,4 @@
-use std::io::{self, ErrorKind};
+use std::io;
 
 use bytes::Bytes;
 use faster_hex::{hex_decode, hex_string};
@@ -9,14 +9,14 @@ use tracing::error;
 use tracing::info;
 use uuid::Uuid;
 
-use rusoto_core::ByteStream;
+use cas_storage::AsyncByteStream;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
 use s3s::dto::{
     Bucket, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
     CopyObjectOutput, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
     CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
     GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
     HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
     ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
@@ -27,19 +27,24 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 
-use crate::cas::{block_stream::BlockStream, range_request::parse_range_request, CasFS};
 use crate::metrics::SharedMetrics;
-use metastore::{BlockID, ObjectData};
+use cas_storage::{parse_range_request, BlockStream, CasFS};
+use cas_storage::{BlockID, ObjectData};
 
 const MAX_KEYS: i32 = 1000;
 
-#[derive(Debug)]
 pub struct S3FS {
     casfs: CasFS,
     metrics: SharedMetrics,
 }
 
-use crate::cas::range_request::RangeRequest;
+impl std::fmt::Debug for S3FS {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3FS").finish_non_exhaustive()
+    }
+}
+
+use cas_storage::RangeRequest;
 impl S3FS {
     pub fn new(casfs: CasFS, metrics: SharedMetrics) -> Self {
         // Get the current amount of buckets
@@ -105,10 +110,7 @@ impl S3 for S3FS {
                 .ok_or_else(|| { io::Error::new(io::ErrorKind::NotFound, "Missing part_number") }));
             cnt = cnt.wrapping_add(1);
             if part_number != cnt {
-                try_!(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "InvalidPartOrder"
-                )));
+                try_!(Err(io::Error::other("InvalidPartOrder")));
             }
 
             let result =
@@ -162,7 +164,7 @@ impl S3 for S3FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
-            e_tag: Some(object_meta.format_e_tag()),
+            e_tag: Some(ETag::Strong(object_meta.format_e_tag())),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -357,7 +359,7 @@ impl S3 for S3FS {
                 content_length: Some(stream_size as i64),
                 content_range: Some(fmt_content_range(0, stream_size - 1, stream_size)),
                 last_modified: Some(Timestamp::from(obj_meta.last_modified())),
-                e_tag: Some(obj_meta.format_e_tag()),
+                e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
                 ..Default::default()
             };
             return Ok(S3Response::new(output));
@@ -375,7 +377,7 @@ impl S3 for S3FS {
         let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
         debug_assert!(obj_meta.size() as usize == block_size);
-        let block_stream = BlockStream::new(paths, block_size, range, self.metrics.clone());
+        let block_stream = BlockStream::new(paths, block_size, range, self.metrics.to_cas());
         let stream = StreamingBlob::wrap(block_stream);
 
         let output = GetObjectOutput {
@@ -384,7 +386,7 @@ impl S3 for S3FS {
             content_range: Some(fmt_content_range(0, stream_size - 1, stream_size)),
             last_modified: Some(Timestamp::from(obj_meta.last_modified())),
             //metadata: object_metadata,
-            e_tag: Some(obj_meta.format_e_tag()),
+            e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -447,6 +449,7 @@ impl S3 for S3FS {
             let bucket = Bucket {
                 creation_date: Some(Timestamp::from(bucket.ctime())),
                 name: Some(bucket.name().into()),
+                bucket_region: None,
             };
             buckets.push(bucket);
         }
@@ -482,7 +485,7 @@ impl S3 for S3FS {
             .range_filter(marker.clone(), prefix.clone(), None)
             .map(|(key, obj)| s3s::dto::Object {
                 key: Some(key),
-                e_tag: Some(obj.format_e_tag()),
+                e_tag: Some(ETag::Strong(obj.format_e_tag())),
                 last_modified: Some(obj.last_modified().into()),
                 owner: None,
                 size: Some(obj.size() as i64),
@@ -553,7 +556,7 @@ impl S3 for S3FS {
             )
             .map(|(key, obj)| s3s::dto::Object {
                 key: Some(key),
-                e_tag: Some(obj.format_e_tag()),
+                e_tag: Some(ETag::Strong(obj.format_e_tag())),
                 last_modified: Some(obj.last_modified().into()),
                 owner: None,
                 size: Some(obj.size() as i64),
@@ -638,7 +641,7 @@ impl S3 for S3FS {
                 let obj_meta = try_!(self.casfs.store_inlined_object(&bucket, &key, data));
 
                 let output = PutObjectOutput {
-                    e_tag: Some(obj_meta.format_e_tag()),
+                    e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
                     ..Default::default()
                 };
                 return Ok(S3Response::new(output));
@@ -647,16 +650,16 @@ impl S3 for S3FS {
 
         // save the datadata
         let converted_stream = convert_stream_error(body);
-        let byte_stream =
-            ByteStream::new_with_size(converted_stream, content_length.unwrap() as usize);
+        let len = content_length.unwrap() as usize;
+        let byte_stream = AsyncByteStream::new(converted_stream);
         let obj_meta = try_!(
             self.casfs
-                .store_single_object_and_meta(&bucket, &key, byte_stream)
+                .store_single_object_and_meta(&bucket, &key, byte_stream, len)
                 .await
         );
 
         let output = PutObjectOutput {
-            e_tag: Some(obj_meta.format_e_tag()),
+            e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -689,7 +692,7 @@ impl S3 for S3FS {
         })?;
 
         let converted_stream = convert_stream_error(body);
-        let byte_stream = ByteStream::new_with_size(converted_stream, content_length as usize);
+        let byte_stream = AsyncByteStream::new(converted_stream);
 
         // we only store the object here, metadata is not stored in the meta store.
         // it is stored in the multipart metadata, in the `cas` layer.
@@ -714,7 +717,7 @@ impl S3 for S3FS {
             blocks
         ));
 
-        let e_tag = format!("\"{}\"", hex_string(&hash));
+        let e_tag = ETag::Strong(hex_string(&hash));
 
         let output = UploadPartOutput {
             e_tag: Some(e_tag),
@@ -726,7 +729,7 @@ impl S3 for S3FS {
 
 // Add helper function
 fn convert_stream_error(body: StreamingBlob) -> impl Stream<Item = Result<Bytes, io::Error>> {
-    body.map(|r| r.map_err(|e| io::Error::new(ErrorKind::Other, e.to_string())))
+    body.map(|r| r.map_err(|e| io::Error::other(e.to_string())))
 }
 
 fn decode_continuation_token(rt: Option<&str>) -> Result<Option<String>, s3s::S3Error> {

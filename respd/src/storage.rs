@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use metastore::{Durability, FjallStore, MetaError, MetaStore, MetaTreeExt};
+use cas_storage::{Durability, FjallStore, MetaError, MetaStore, MetaTreeExt};
 
 // Default tree name for key-value storage
 // No longer using a default tree name as we'll use the namespace as the tree name
@@ -46,7 +47,7 @@ impl Storage {
     pub fn get_namespace(
         &self,
         name: &str,
-    ) -> Result<Box<dyn MetaTreeExt + Send + Sync>, StorageError> {
+    ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, StorageError> {
         if !self.store.bucket_exists(name)? {
             return Err(StorageError::NamespaceNotFound);
         }
@@ -63,7 +64,7 @@ impl Storage {
             return Err(StorageError::NamespaceNotFound);
         }
 
-        let bucketlist_tree = self.store.get_bucketlist_tree()?;
+        let bucketlist_tree = self.store.get_allbuckets_tree()?;
         let raw = bucketlist_tree
             .get(name.as_bytes())
             .map_err(|e| StorageError::MetaError(e.to_string()))?;
@@ -88,7 +89,7 @@ impl Storage {
             .to_msgpack()
             .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
 
-        let bucketlist_tree = self.store.get_bucketlist_tree()?;
+        let bucketlist_tree = self.store.get_allbuckets_tree()?;
         bucketlist_tree
             .insert(name.as_bytes(), meta_raw)
             .map_err(|e| StorageError::MetaError(e.to_string()))?;
@@ -98,7 +99,7 @@ impl Storage {
     pub fn create_namespace(
         &self,
         name: &str,
-    ) -> Result<Box<dyn MetaTreeExt + Send + Sync>, StorageError> {
+    ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, StorageError> {
         if self.store.bucket_exists(name)? {
             return Err(StorageError::NamespaceNotFound);
         }
@@ -128,7 +129,7 @@ impl Storage {
         &self,
     ) -> Result<impl Iterator<Item = Result<NamespaceMeta, StorageError>>, StorageError> {
         // Get the all buckets tree which contains namespace metadata
-        let bucketlist_tree = self.store.get_bucketlist_tree()?;
+        let bucketlist_tree = self.store.get_allbuckets_tree()?;
 
         // Use tree.iter_kv to iterate over all key-value pairs in the tree
         let kv_pairs = bucketlist_tree.iter_kv(None);

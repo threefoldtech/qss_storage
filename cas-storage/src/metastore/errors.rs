@@ -55,13 +55,13 @@ impl fmt::Display for MetaError {
             MetaError::KeyAlreadyExists => write!(f, "Key already exists"),
             MetaError::CollectionNotFound => write!(f, "Collection not found"),
             MetaError::BucketNotFound => write!(f, "Bucket not found"),
-            MetaError::InsertError(ref s) => write!(f, "Insert error: {}", s),
-            MetaError::RemoveError(ref s) => write!(f, "Remove error: {}", s),
-            MetaError::NotMetaTree(ref s) => write!(f, "Not a meta tree: {}", s),
-            MetaError::TransactionError(ref s) => write!(f, "Transaction error: {}", s),
-            MetaError::PersistError(ref s) => write!(f, "Persist error: {}", s),
+            MetaError::InsertError(ref s) => write!(f, "Insert error: {s}"),
+            MetaError::RemoveError(ref s) => write!(f, "Remove error: {s}"),
+            MetaError::NotMetaTree(ref s) => write!(f, "Not a meta tree: {s}"),
+            MetaError::TransactionError(ref s) => write!(f, "Transaction error: {s}"),
+            MetaError::PersistError(ref s) => write!(f, "Persist error: {s}"),
             MetaError::BlockNotFound => write!(f, "Block not found"),
-            MetaError::OtherDBError(ref s) => write!(f, "Other DB error: {}", s),
+            MetaError::OtherDBError(ref s) => write!(f, "Other DB error: {s}"),
         }
     }
 }
@@ -70,6 +70,6 @@ use std::io;
 
 impl From<MetaError> for io::Error {
     fn from(error: MetaError) -> Self {
-        io::Error::new(io::ErrorKind::Other, error.to_string())
+        io::Error::other(error.to_string())
     }
 }

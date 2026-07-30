@@ -3,7 +3,7 @@ name = "respd"
 version = { workspace = true }
 edition = { workspace = true }
 authors = { workspace = true }
-description = "A Redis-compatible server using metastore as backend"
+description = "A Redis-compatible server using cas-storage as backend"
 
 # Expose the modules as a library
 [lib]
@@ -15,7 +15,7 @@ name = "respd"
 path = "src/main.rs"
 
 [dependencies]
-metastore = { path = "../metastore" }
+cas-storage = { path = "../cas-storage" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -26,14 +26,14 @@ bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 redis-protocol = { version = "6.0.0", features = ["bytes"] }
 atoi = "2.0.0"
-thiserror = "1.0.56"
+thiserror = "2.0.18"
 md-5 = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-rmp-serde = "1.1.2"
+rmp-serde = "1.3.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 rand = { workspace = true }
-redis = { version = "0.23.0" }
+redis = { version = "1.2.1" }

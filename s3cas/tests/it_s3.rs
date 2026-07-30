@@ -79,14 +79,15 @@ static CONFIG: Lazy<SdkConfig> = Lazy::new(|| {
         .cloned()
         .unwrap_or(s3cas::cas::StorageEngine::Fjall);
     let inlined_size = CONFIG_SIZE.lock().unwrap().or(Some(1));
-    let casfs = s3cas::cas::CasFS::new(
+    let casfs = s3cas::cas::CasFS::single_namespace(
         FS_ROOT.into(),
         FS_ROOT.into(),
-        metrics.clone(),
+        metrics.to_cas(),
         storage_engine,
         inlined_size,
         None,
-    );
+    )
+    .expect("can construct CasFS");
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
 
     // Setup S3 service
@@ -101,7 +102,7 @@ static CONFIG: Lazy<SdkConfig> = Lazy::new(|| {
     };
 
     // Convert to aws http client
-    let client = s3s_aws::Client::from(service.into_shared());
+    let client = s3s_aws::Client::from(service);
 
     // Setup aws sdk config
     SdkConfig::builder()

@@ -1,13 +1,12 @@
-use std::fmt::Debug;
 use std::str::FromStr;
+use std::{fmt::Debug, sync::Arc};
 
-use super::{object::Object, MetaError, Transaction};
+use super::{MetaError, Transaction, object::Object};
 
 /// `BaseMetaTree` defines the core operations for a metadata tree storage.
 ///
 /// This trait provides the fundamental operations needed to interact with a key-value
 /// storage system, including inserting, removing, and retrieving values.
-#[allow(clippy::len_without_is_empty)]
 pub trait BaseMetaTree: Send + Sync {
     /// Inserts a key-value pair into the tree.
     ///
@@ -46,13 +45,18 @@ pub trait BaseMetaTree: Send + Sync {
     /// * `Result<Option<Vec<u8>>, MetaError>` - The value if found, None if the key doesn't exist, or an error
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError>;
 
+    // ---- tfstor-extension: BEGIN ----
+    // Upstream marks `len`/`is_empty` as `#[cfg(test)]`. We need them at
+    // runtime for respd's LENGTH (key size) and DBSIZE (namespace size)
+    // commands. Drop these markers and the cfg gate once upstreamed.
     /// Returns the number of key-value pairs in the tree.
-    ///
-    /// # Returns
-    /// * `usize` - The number of entries
-    fn len(&self) -> usize;
+    fn len(&self) -> Result<usize, MetaError>;
 
-    fn is_empty(&self) -> Result<bool, MetaError>;
+    /// Returns true if the tree contains no key-value pairs.
+    fn is_empty(&self) -> Result<bool, MetaError> {
+        self.len().map(|n| n == 0)
+    }
+    // ---- tfstor-extension: END ----
 }
 
 /// Type alias for a boxed iterator over key-value pairs.
@@ -65,21 +69,23 @@ pub type KeyValuePairs = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), Meta
 pub trait MetaTreeExt: BaseMetaTree {
     /// Iterates over all key-value pairs in the tree.
     ///
-    /// # Arguments
-    /// * `start_after` - The key to start scanning from. If None, starts from the beginning.
-    ///
     /// # Returns
     /// * `KeyValuePairs` - A boxed iterator over all key-value pairs
+    fn iter_all(&self) -> KeyValuePairs;
+
+    // ---- tfstor-extension: BEGIN ----
+    // respd needs forward iteration from an arbitrary key (SCAN cursor) and
+    // backward iteration from an arbitrary key (RSCAN). Upstream's iter_all
+    // is a strict subset (iter_kv(None) == iter_all()).
+
+    /// Iterates forward over key-value pairs starting strictly after `start_after`.
+    /// If `start_after` is None, behaves like `iter_all()`.
     fn iter_kv(&self, start_after: Option<Vec<u8>>) -> KeyValuePairs;
 
-    /// Iterates over all key-value pairs in the tree in backward direction.
-    ///
-    /// # Arguments
-    /// * `start_key` - Optional key to start iteration from (inclusive in backward direction)
-    ///
-    /// # Returns
-    /// * `KeyValuePairs` - A boxed iterator over all key-value pairs in backward order
+    /// Iterates backward over key-value pairs starting strictly before `start_key`.
+    /// If `start_key` is None, starts from the end of the tree.
     fn iter_kv_backward(&self, start_key: Option<Vec<u8>>) -> KeyValuePairs;
+    // ---- tfstor-extension: END ----
 
     /// Filters and iterates over a range of keys with optional filtering parameters.
     ///
@@ -95,7 +101,7 @@ pub trait MetaTreeExt: BaseMetaTree {
         start_after: Option<String>,
         prefix: Option<String>,
         continuation_token: Option<String>,
-    ) -> Box<(dyn Iterator<Item = (String, Object)> + 'a)>;
+    ) -> Box<dyn Iterator<Item = (String, Object)> + 'a>;
 }
 
 /// `Store` represents a storage backend for metadata trees.
@@ -110,7 +116,7 @@ pub trait Store: Send + Sync + Debug + 'static {
     ///
     /// # Returns
     /// * `Result<Box<dyn BaseMetaTree>, MetaError>` - A boxed trait object implementing BaseMetaTree or an error
-    fn tree_open(&self, name: &str) -> Result<Box<dyn BaseMetaTree>, MetaError>;
+    fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError>;
 
     /// Opens a tree with extended functionality.
     ///
@@ -119,7 +125,7 @@ pub trait Store: Send + Sync + Debug + 'static {
     ///
     /// # Returns
     /// * `Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError>` - A boxed trait object implementing MetaTreeExt or an error
-    fn tree_ext_open(&self, name: &str) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError>;
+    fn tree_ext_open(&self, name: &str) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError>;
 
     /// Checks if a tree with the given name exists.
     ///
@@ -144,6 +150,15 @@ pub trait Store: Send + Sync + Debug + 'static {
     /// # Returns
     /// * `Transaction` - A new transaction object
     fn begin_transaction(&self) -> Transaction;
+
+    /// Returns the number of keys in the specified tree.
+    ///
+    /// # Arguments
+    /// * `tree_name` - The name of the tree to count keys in
+    ///
+    /// # Returns
+    /// * `Result<usize, MetaError>` - The number of keys or an error
+    fn num_keys(&self, tree_name: &str) -> Result<usize, MetaError>;
 
     /// Returns the total disk space used by the storage.
     ///
@@ -186,7 +201,7 @@ impl FromStr for Durability {
             "buffer" => Ok(Durability::Buffer),
             "fsync" => Ok(Durability::Fsync),
             "fdatasync" => Ok(Durability::Fdatasync),
-            _ => Err(format!("Unknown durability option: {}", s)),
+            _ => Err(format!("Unknown durability option: {s}")),
         }
     }
 }

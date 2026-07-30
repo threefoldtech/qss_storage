@@ -2,99 +2,26 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{io, path::PathBuf};
 
-use super::{
-    buffered_byte_stream::BufferedByteStream,
-    multipart::{MultiPart, MultiPartTree},
-};
+use super::async_fs::{AsyncFileSystem, RealAsyncFs};
+use super::multipart::MultiPart;
+use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
-use metastore::{
+use crate::metastore::{
     BaseMetaTree, BlockID, BlockTree, BucketMeta, Durability, FjallStore, FjallStoreNotx,
     MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
-use faster_hex::hex_string;
-use futures::{
-    channel::mpsc::unbounded,
-    sink::SinkExt,
-    stream,
-    stream::{StreamExt, TryStreamExt},
-};
-use md5::{Digest, Md5};
-use rusoto_core::ByteStream;
-
-use tracing::error;
+use super::byte_stream::AsyncByteStream;
 
 pub const BLOCK_SIZE: usize = 1 << 20; // Supposedly 1 MiB
 
-struct PendingMarker {
-    metrics: SharedMetrics,
-    in_flight: u64,
-}
-
-impl PendingMarker {
-    pub fn new(metrics: SharedMetrics) -> Self {
-        Self {
-            metrics,
-            in_flight: 0,
-        }
-    }
-
-    pub fn block_pending(&mut self) {
-        self.metrics.block_pending();
-        self.in_flight += 1;
-    }
-
-    pub fn block_write_error(&mut self) {
-        self.metrics.block_write_error();
-        self.in_flight -= 1;
-    }
-
-    pub fn block_ignored(&mut self) {
-        self.metrics.block_ignored();
-    }
-
-    pub fn block_written(&mut self, size: usize) {
-        self.metrics.block_written(size);
-        self.in_flight -= 1;
-    }
-}
-
-impl Drop for PendingMarker {
-    fn drop(&mut self) {
-        self.metrics.blocks_dropped(self.in_flight)
-    }
-}
-
-use async_trait::async_trait;
-
-#[async_trait]
-trait AsyncFileSystem: Send + Sync + std::fmt::Debug {
-    async fn create_dir_all(&self, path: &std::path::Path) -> std::io::Result<()>;
-    async fn write(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()>;
-}
-
-#[derive(Debug)]
-struct RealAsyncFs;
-
-#[async_trait]
-impl AsyncFileSystem for RealAsyncFs {
-    async fn create_dir_all(&self, path: &std::path::Path) -> std::io::Result<()> {
-        async_fs::create_dir_all(path).await
-    }
-
-    async fn write(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-        async_fs::write(path, contents).await
-    }
-}
-
-#[derive(Debug)]
 pub struct CasFS {
-    async_fs: Box<dyn AsyncFileSystem>,
-    meta_store: MetaStore,
-    root: PathBuf,
-    metrics: SharedMetrics,
-    multipart_tree: Arc<MultiPartTree>,
+    pub(super) async_fs: Box<dyn AsyncFileSystem>,
+    pub(super) namespace: MetaStore,
+    pub(super) shared: Arc<SharedBlockStore>,
+    pub(super) root: PathBuf,
+    pub(super) metrics: SharedMetrics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,7 +41,7 @@ impl FromStr for StorageEngine {
         match s.to_lowercase().as_str() {
             "fjall" => Ok(StorageEngine::Fjall),
             "fjall_notx" => Ok(StorageEngine::FjallNotx),
-            _ => Err(format!("Unknown storage engine: {}", s)),
+            _ => Err(format!("Unknown storage engine: {s}")),
         }
     }
 }
@@ -122,44 +49,88 @@ impl FromStr for StorageEngine {
 pub type ObjectPaths = (Object, Vec<(PathBuf, usize)>);
 
 impl CasFS {
+    /// Build a `CasFS` for one namespace, sharing a block/path/multipart
+    /// store across namespaces via `shared`.
+    ///
+    /// Layout on disk:
+    ///   `root/blocks/` - block data files
+    ///   `namespace_meta_path/db/` - this namespace's metadata DB
+    ///   (the shared DB lives wherever `SharedBlockStore::new` was given)
     pub fn new(
         mut root: PathBuf,
-        mut meta_path: PathBuf,
+        mut namespace_meta_path: PathBuf,
+        shared: Arc<SharedBlockStore>,
         metrics: SharedMetrics,
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
     ) -> Self {
-        meta_path.push("db");
+        namespace_meta_path.push("db");
         root.push("blocks");
-        let meta_store = match storage_engine {
+
+        // Canonicalize both paths to eliminate getcwd() syscalls in async operations
+        // This is critical for performance as it avoids repeated getcwd() on every file op
+        std::fs::create_dir_all(&root).ok();
+        root = root.canonicalize().unwrap_or(root);
+
+        std::fs::create_dir_all(&namespace_meta_path).ok();
+        namespace_meta_path = namespace_meta_path
+            .canonicalize()
+            .unwrap_or(namespace_meta_path);
+
+        let namespace = match storage_engine {
             StorageEngine::Fjall => {
-                let store = FjallStore::new(meta_path, inlined_metadata_size, durability);
+                let store = FjallStore::new(namespace_meta_path, inlined_metadata_size, durability);
                 MetaStore::new(store, inlined_metadata_size)
             }
             StorageEngine::FjallNotx => {
-                let store = FjallStoreNotx::new(meta_path, inlined_metadata_size);
+                let store = FjallStoreNotx::new(namespace_meta_path, inlined_metadata_size);
                 MetaStore::new(store, inlined_metadata_size)
             }
         };
-        //let meta_store = MetaStore::new(store, inlined_metadata_size);
 
-        // Get the current amount of buckets
-        //metrics.set_bucket_count(db.open_tree(BUCKET_META_TREE).unwrap().len());
-
-        let tree = meta_store.get_tree("_MULTIPART_PARTS").unwrap();
-        let multipart_tree = MultiPartTree::new(tree);
         Self {
             async_fs: Box::new(RealAsyncFs),
-            meta_store,
+            namespace,
+            shared,
             root,
             metrics,
-            multipart_tree: Arc::new(multipart_tree),
         }
     }
 
-    fn path_tree(&self) -> Result<Box<dyn BaseMetaTree>, MetaError> {
-        self.meta_store.get_path_tree()
+    /// Convenience constructor for single-namespace consumers (CLI ops,
+    /// tests, third-party library users who only need one namespace).
+    ///
+    /// Builds a dedicated `SharedBlockStore` at `meta_path.join("blocks")`
+    /// and returns a `CasFS` whose namespace metadata lives at
+    /// `meta_path/db/`.
+    pub fn single_namespace(
+        root: PathBuf,
+        meta_path: PathBuf,
+        metrics: SharedMetrics,
+        storage_engine: StorageEngine,
+        inlined_metadata_size: Option<usize>,
+        durability: Option<Durability>,
+    ) -> Result<Self, MetaError> {
+        let shared = Arc::new(SharedBlockStore::new(
+            meta_path.join("blocks"),
+            storage_engine,
+            inlined_metadata_size,
+            durability,
+        )?);
+        Ok(Self::new(
+            root,
+            meta_path,
+            shared,
+            metrics,
+            storage_engine,
+            inlined_metadata_size,
+            durability,
+        ))
+    }
+
+    pub(super) fn path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
+        Ok(self.shared.path_tree())
     }
 
     pub fn fs_root(&self) -> &PathBuf {
@@ -167,24 +138,24 @@ impl CasFS {
     }
 
     pub fn max_inlined_data_length(&self) -> usize {
-        self.meta_store.max_inlined_data_length()
+        self.namespace.max_inlined_data_length()
     }
 
     pub fn get_bucket(
         &self,
         bucket_name: &str,
-    ) -> Result<Box<dyn MetaTreeExt + Send + Sync>, MetaError> {
-        self.meta_store.get_bucket_ext(bucket_name)
+    ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
+        super::buckets::get_bucket(self, bucket_name)
     }
 
     /// Open the tree containing the block map.
-    pub fn block_tree(&self) -> Result<BlockTree, MetaError> {
-        self.meta_store.get_block_tree()
+    pub fn block_tree(&self) -> Result<Arc<BlockTree>, MetaError> {
+        Ok(self.shared.block_tree())
     }
 
     /// Check if a bucket with a given name exists.
     pub fn bucket_exists(&self, bucket_name: &str) -> Result<bool, MetaError> {
-        self.meta_store.bucket_exists(bucket_name)
+        super::buckets::bucket_exists(self, bucket_name)
     }
 
     // create a meta object and insert it into the database
@@ -197,7 +168,7 @@ impl CasFS {
         object_data: ObjectData,
     ) -> Result<Object, MetaError> {
         let obj_meta = Object::new(size, hash, object_data);
-        self.meta_store
+        self.namespace
             .insert_meta(bucket_name, key, obj_meta.to_vec())?;
         Ok(obj_meta)
     }
@@ -208,7 +179,7 @@ impl CasFS {
         bucket_name: &str,
         key: &str,
     ) -> Result<Option<Object>, MetaError> {
-        self.meta_store.get_meta(bucket_name, key)
+        super::read_path::get_object_meta(self, bucket_name, key)
     }
 
     pub fn get_object_paths(
@@ -216,61 +187,22 @@ impl CasFS {
         bucket_name: &str,
         key: &str,
     ) -> Result<Option<ObjectPaths>, MetaError> {
-        let obj_meta = self.get_object_meta(bucket_name, key)?;
-        let Some(obj_meta) = obj_meta else {
-            return Ok(None);
-        };
-
-        if obj_meta.is_inlined() {
-            Ok(Some((obj_meta, vec![])))
-        } else {
-            let blocks = obj_meta.blocks();
-            let block_map = self.block_tree()?;
-            let mut paths = Vec::with_capacity(blocks.len());
-            for block in blocks {
-                let block_meta = block_map
-                    .get_block(block)?
-                    .ok_or(MetaError::BlockNotFound)?;
-                paths.push((
-                    block_meta.disk_path(self.fs_root().clone()),
-                    block_meta.size(),
-                ));
-            }
-            Ok(Some((obj_meta, paths)))
-        }
+        super::read_path::get_object_paths(self, bucket_name, key)
     }
 
     // create and insert a new  bucket
     pub fn create_bucket(&self, bucket_name: &str) -> Result<(), MetaError> {
-        let bm = BucketMeta::new(bucket_name.to_string());
-        self.meta_store.insert_bucket(bucket_name, bm.to_vec())
+        super::buckets::create_bucket(self, bucket_name)
     }
 
     /// Remove a bucket and its associated metadata.
     // TODO: this is very much not optimal
     pub async fn bucket_delete(&self, bucket_name: &str) -> Result<(), MetaError> {
-        // remove from the bucket list tree/partition
-        let bucketlist_tree = self.meta_store.get_bucketlist_tree()?;
-        bucketlist_tree.remove(bucket_name.as_bytes())?;
-
-        // removes all objects in the bucket
-        let bucket = self.meta_store.get_bucket_ext(bucket_name)?;
-        for key_val in bucket.iter_kv(None) {
-            let (key, _) = key_val?;
-            self.delete_object(
-                bucket_name,
-                std::str::from_utf8(&key).expect("keys are valid utf-8"),
-            )
-            .await?;
-        }
-
-        // remove the bucket tree/partition itself
-        self.meta_store.drop_bucket(bucket_name)?;
-        Ok(())
+        super::delete_path::bucket_delete(self, bucket_name).await
     }
 
     fn part_key(&self, bucket: &str, key: &str, upload_id: &str, part_number: i64) -> String {
-        format!("{}-{}-{}-{}", bucket, key, upload_id, part_number)
+        format!("{bucket}-{key}-{upload_id}-{part_number}")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -284,9 +216,15 @@ impl CasFS {
         hash: BlockID,
         blocks: Vec<BlockID>,
     ) -> Result<(), MetaError> {
-        let mp_map = self.multipart_tree.clone();
-
+        let mp_map = self.shared.multipart_tree();
         let storage_key = self.part_key(&bucket, &key, &upload_id, part_number);
+
+        tracing::debug!(
+            "CasFS: insert_multipart_part storage_key={}, size={}, blocks={}",
+            storage_key,
+            size,
+            blocks.len()
+        );
 
         let mp = MultiPart::new(size, part_number, bucket, key, upload_id, hash, blocks);
 
@@ -301,9 +239,22 @@ impl CasFS {
         upload_id: &str,
         part_number: i64,
     ) -> Result<Option<MultiPart>, MetaError> {
-        let mp_map = self.multipart_tree.clone();
+        let mp_map = self.shared.multipart_tree();
         let part_key = self.part_key(bucket, key, upload_id, part_number);
-        mp_map.get_multipart_part(part_key.as_bytes())
+
+        tracing::debug!("CasFS: get_multipart_part storage_key={}", part_key);
+
+        let result = mp_map.get_multipart_part(part_key.as_bytes());
+
+        if let Ok(Some(ref mp)) = result {
+            tracing::debug!(
+                "CasFS: get_multipart_part found storage_key={}, blocks={}",
+                part_key,
+                mp.blocks().len()
+            );
+        }
+
+        result
     }
 
     pub fn remove_multipart_part(
@@ -313,49 +264,27 @@ impl CasFS {
         upload_id: &str,
         part_number: i64,
     ) -> Result<(), MetaError> {
-        let mp_map = self.multipart_tree.clone();
+        let mp_map = self.shared.multipart_tree();
         let part_key = self.part_key(bucket, key, upload_id, part_number);
+
+        tracing::debug!("CasFS: remove_multipart_part storage_key={}", part_key);
+
         mp_map.remove(part_key.as_bytes())
     }
 
     pub fn key_exists(&self, bucket: &str, key: &str) -> Result<bool, MetaError> {
-        let bucket = self.get_bucket(bucket)?;
-        bucket.contains_key(key.as_bytes())
+        super::buckets::key_exists(self, bucket, key)
     }
 
     /// Get a list of all buckets in the system.
     pub fn list_buckets(&self) -> Result<Vec<BucketMeta>, MetaError> {
-        self.meta_store.list_buckets()
+        super::buckets::list_buckets(self)
     }
 
     /// Delete an object from a bucket.
     /// it also delete keys under it's tree
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), MetaError> {
-        let path_map = self.path_tree()?;
-
-        // get blocks that safe to delete
-        let blocks_to_delete = self.meta_store.delete_object(bucket, key)?;
-
-        // Now
-        // - delete all the blocks from disk
-        // - and unlink them in the path map.
-        for block in blocks_to_delete {
-            async_fs::remove_file(block.disk_path(self.root.clone()))
-                .await
-                .expect("Could not delete file");
-            // Now that the path is free it can be removed from the path map
-            if let Err(e) = path_map.remove(block.path()) {
-                // Only print error, we might be able to remove the other ones. If we exist
-                // here, those will be left dangling.
-                error!(
-                    "Could not unlink path {} from path map: {}",
-                    hex_string(block.path()),
-                    e
-                );
-            };
-        }
-
-        Ok(())
+        super::delete_path::delete_object(self, bucket, key).await
     }
 
     // convenient function to store an object to disk and then store it's metada
@@ -363,24 +292,13 @@ impl CasFS {
         &self,
         bucket_name: &str,
         key: &str,
-        data: ByteStream,
+        data: AsyncByteStream,
+        len: usize,
     ) -> io::Result<Object> {
-        let (blocks, content_hash, size) = self.store_object(bucket_name, key, data).await?;
-        let obj = self
-            .create_object_meta(
-                bucket_name,
-                key,
-                size,
-                content_hash,
-                ObjectData::SinglePart { blocks },
-            )
-            .unwrap();
-        Ok(obj)
+        super::write_path::store_single_object_and_meta(self, bucket_name, key, data, len).await
     }
 
     /// Save the stream of bytes to disk.
-    ///
-    /// old_obj_meta is an optional Object that is Some if the key already exists in the metadata.
     ///
     /// The data is streamed in chunks, and each chunk is hashed and stored on disk.
     /// The hash of each chunk is used as a key to store the data in the database.
@@ -391,158 +309,9 @@ impl CasFS {
         &self,
         bucket_name: &str,
         key: &str,
-        data: ByteStream,
+        data: AsyncByteStream,
     ) -> io::Result<(Vec<BlockID>, BlockID, u64)> {
-        let old_obj_meta = match self.get_object_meta(bucket_name, key) {
-            Ok(Some(obj_meta)) => Some(obj_meta),
-            _ => None,
-        };
-        let old_obj_meta = Arc::new(old_obj_meta);
-
-        let (tx, rx) = unbounded();
-        let mut content_hash = Md5::new();
-        let data = BufferedByteStream::new(data);
-        let mut size = 0;
-        data.map(|res| match res {
-            Ok(buffers) => buffers.into_iter().map(Ok).collect(),
-            Err(e) => vec![Err(e)],
-        })
-        .map(stream::iter)
-        .flatten()
-        .inspect(|maybe_bytes| {
-            if let Ok(bytes) = maybe_bytes {
-                content_hash.update(bytes);
-                size += bytes.len() as u64;
-                self.metrics.bytes_received(bytes.len());
-            }
-        })
-        .zip(stream::repeat((tx, old_obj_meta)))
-        .enumerate()
-        .for_each_concurrent(
-            5,
-            |(idx, (maybe_chunk, (mut tx, old_obj_meta)))| async move {
-                if let Err(e) = maybe_chunk {
-                    if let Err(e) = tx
-                        .send(Err(std::io::Error::new(e.kind(), e.to_string())))
-                        .await
-                    {
-                        error!("Could not convey result: {}", e);
-                    }
-                    return;
-                }
-                // unwrap is safe as we checked that there is no error above
-                let bytes: Vec<u8> = maybe_chunk.unwrap();
-                let mut hasher = Md5::new();
-                hasher.update(&bytes);
-                let block_hash: BlockID = hasher.finalize().into();
-                let data_len = bytes.len();
-
-                // check if this key already has this block
-                let key_has_block = if let Some(obj) = old_obj_meta.as_ref() {
-                    obj.has_block(&block_hash)
-                } else {
-                    false
-                };
-
-                // begin the transaction
-                // there are two main things we need to do here:
-                // 1. write the meta to the database
-                //      - if the block already exists, we don't need to write it to the storage
-                //      - if the block does not exist, we need to write it to the storage
-                // 2. write the actual block to disk
-                //
-                // we commit the meta database transaction after writing the block to disk
-                let mut store_tx = self.meta_store.begin_transaction();
-                let write_meta_result = store_tx.write_block(block_hash, data_len, key_has_block);
-
-                let mut pm = PendingMarker::new(self.metrics.clone());
-
-                let block = match write_meta_result {
-                    Err(e) => {
-                        if let Err(e) = tx.send(Err(e.into())).await {
-                            error!("Could not send transaction error: {}", e);
-                        }
-                        return;
-                    }
-                    Ok((false, _)) => {
-                        // the block already exists, no need to write it to the storage
-                        pm.block_ignored();
-
-                        Box::new(store_tx).commit().unwrap();
-
-                        if let Err(e) = tx.send(Ok((idx, block_hash))).await {
-                            error!("Could not send block id: {}", e);
-                        }
-                        return;
-                    }
-                    Ok((true, block)) => {
-                        // the block does not exist, we need to write it to the storage
-                        pm.block_pending();
-                        block
-                    }
-                };
-
-                let mut store_tx = Some(store_tx);
-                // write the actual block to disk
-                // if the disk operation fails, the database transaction is rolled back.
-                let block_path = block.disk_path(self.root.clone());
-                if let Err(e) = self
-                    .async_fs
-                    .create_dir_all(block_path.parent().unwrap())
-                    .await
-                {
-                    if let Some(store_tx) = store_tx.take() {
-                        Box::new(store_tx).rollback();
-                    }
-
-                    if let Err(e) = tx.send(Err(e)).await {
-                        pm.block_write_error();
-                        error!("Could not send path create error: {}", e);
-                        return;
-                    }
-                }
-                if let Err(e) = self.async_fs.write(&block_path, &bytes).await {
-                    if let Some(store_tx) = store_tx.take() {
-                        Box::new(store_tx).rollback();
-                    }
-
-                    if let Err(e) = tx.send(Err(e)).await {
-                        pm.block_write_error();
-                        error!("Could not send block write error: {}", e);
-                        return;
-                    }
-                }
-
-                // commit the database transaction
-                if let Some(store_tx) = store_tx.take() {
-                    if let Err(err) = Box::new(store_tx).commit() {
-                        // TODO FIXME if the transaction fails, we need to delete the block from the storage
-                        if let Err(e) = tx.send(Err(err.into())).await {
-                            pm.block_write_error();
-                            error!("Could not send transaction error: {}", e);
-                        }
-                        return;
-                    }
-                }
-
-                pm.block_written(bytes.len());
-
-                if let Err(e) = tx.send(Ok((idx, block_hash))).await {
-                    error!("Could not send block id: {}", e);
-                }
-            },
-        )
-        .await;
-
-        let mut ids = rx.try_collect::<Vec<(usize, BlockID)>>().await?;
-        // Make sure the chunks are in the proper order
-        ids.sort_by_key(|a| a.0);
-
-        Ok((
-            ids.into_iter().map(|(_, id)| id).collect(),
-            content_hash.finalize().into(),
-            size,
-        ))
+        super::write_path::store_object(self, bucket_name, key, data).await
     }
 
     // Store an object inlined in the metadata.
@@ -552,45 +321,37 @@ impl CasFS {
         key: &str,
         data: Vec<u8>,
     ) -> Result<Object, MetaError> {
-        let content_hash = Md5::digest(&data).into();
-        let size = data.len() as u64;
-        let obj = self.create_object_meta(
-            bucket_name,
-            key,
-            size,
-            content_hash,
-            ObjectData::Inline { data },
-        )?;
-        Ok(obj)
+        super::write_path::store_inlined_object(self, bucket_name, key, data)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::AsyncByteStream;
     use super::*;
     use bytes::Bytes;
     use futures::stream;
     use once_cell::sync::Lazy;
-    use rusoto_core::ByteStream;
     use tempfile::tempdir;
 
     const TEST_ENGINES: [StorageEngine; 2] = [StorageEngine::Fjall, StorageEngine::FjallNotx];
 
-    static METRICS: Lazy<SharedMetrics> = Lazy::new(|| SharedMetrics::new());
+    static METRICS: Lazy<SharedMetrics> = Lazy::new(SharedMetrics::default);
 
     fn setup_test_fs(storage_engine: StorageEngine) -> (CasFS, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let meta_path = dir.path().join("meta");
         let metrics = METRICS.clone();
 
-        let fs = CasFS::new(
+        let fs = CasFS::single_namespace(
             dir.path().to_path_buf(),
             meta_path,
             metrics,
             storage_engine,
             Some(1),
             Some(Durability::Buffer),
-        );
+        )
+        .unwrap();
         (fs, dir)
     }
 
@@ -600,23 +361,21 @@ mod tests {
     }
 
     impl MockFs {
-        fn new(should_fail_write: bool) -> Self {
-            Self { should_fail_write }
+        fn new() -> Self {
+            Self {
+                should_fail_write: false,
+            }
         }
     }
 
-    #[async_trait]
     impl AsyncFileSystem for MockFs {
-        async fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
+        fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
             Ok(())
         }
 
-        async fn write(&self, _path: &std::path::Path, _contents: &[u8]) -> std::io::Result<()> {
-            if self.should_fail_write {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Mock write failure",
-                ))
+        fn write(&self, _path: &std::path::Path, _contents: &[u8]) -> std::io::Result<()> {
+            if !self.should_fail_write {
+                Err(std::io::Error::other("Mock write failure"))
             } else {
                 Ok(())
             }
@@ -625,9 +384,9 @@ mod tests {
 
     impl CasFS {
         #[cfg(test)]
-        fn with_mock_fs(mut self, write_failed: bool) -> (Self, MockFs) {
+        fn with_mock_fs(mut self) -> (Self, MockFs) {
             // Changed return type
-            let mock_fs = MockFs::new(write_failed);
+            let mock_fs = MockFs::new();
             self.async_fs = Box::new(mock_fs.clone()); // Implement Clone for MockFs
             (self, mock_fs)
         }
@@ -645,7 +404,8 @@ mod tests {
     #[tokio::test]
     async fn test_store_object_write_failure() {
         for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine).0.with_mock_fs(true);
+            let (fs, _dir) = setup_test_fs(engine);
+            let (fs, _mock) = fs.with_mock_fs();
             do_test_store_object_write_failure(fs).await;
         }
     }
@@ -656,7 +416,7 @@ mod tests {
         fs.create_bucket(bucket_name).unwrap();
 
         let test_data = b"test data".repeat(100);
-        let stream = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
+        let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
 
         let result = fs.store_object(bucket_name, key, stream).await;
         assert!(result.is_err());
@@ -668,8 +428,8 @@ mod tests {
 
         // Verify no blocks were stored in metadata
         // the block must be rolled back
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
-        assert_eq!(block_tree.is_empty(), true);
+        let block_tree = fs.shared.block_tree();
+        assert_eq!(block_tree.len().unwrap(), 0);
 
         // Verify object metadata was not created
         assert!(!fs.key_exists(bucket_name, key).unwrap());
@@ -693,13 +453,14 @@ mod tests {
         let test_data = b"long test data".repeat(100).to_vec();
         let test_data_2 = test_data.clone();
         let test_data_len = test_data.len();
-        let stream = ByteStream::new(stream::once(
-            async move { Ok(Bytes::from(test_data.clone())) },
-        ));
+        let stream =
+            AsyncByteStream::new(stream::once(
+                async move { Ok(Bytes::from(test_data.clone())) },
+            ));
 
         // Store object
         let obj = fs
-            .store_single_object_and_meta(BUCKET_NAME, KEY1, stream)
+            .store_single_object_and_meta(BUCKET_NAME, KEY1, stream, test_data_len)
             .await
             .unwrap();
 
@@ -708,29 +469,29 @@ mod tests {
         assert_eq!(obj.blocks().len(), 1);
 
         // Verify block & path was stored
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
-        assert!(block_tree.len() > 0);
+        let block_tree = fs.shared.block_tree();
+        assert!(block_tree.len().unwrap() > 0);
         let stored_block = block_tree.get_block(&obj.blocks()[0]).unwrap().unwrap();
         assert_eq!(stored_block.size(), test_data_len);
         assert_eq!(stored_block.rc(), 1);
-        assert_eq!(
+        assert!(
             fs.path_tree()
                 .unwrap()
                 .contains_key(stored_block.path())
-                .unwrap(),
-            true
+                .unwrap()
         );
 
         // Store the same data again with different key
         // - The same block should be returned
         // - The refcount should be increased
 
-        let stream = ByteStream::new(stream::once(
-            async move { Ok(Bytes::from(test_data_2.clone())) },
-        ));
+        let stream =
+            AsyncByteStream::new(stream::once(
+                async move { Ok(Bytes::from(test_data_2.clone())) },
+            ));
 
         let new_obj = fs
-            .store_single_object_and_meta(BUCKET_NAME, KEY2, stream)
+            .store_single_object_and_meta(BUCKET_NAME, KEY2, stream, test_data_len)
             .await
             .unwrap();
 
@@ -779,20 +540,22 @@ mod tests {
 
         // Create ByteStream from test data
         let test_data = b"long test data".repeat(100).to_vec();
+        let test_data_len = test_data.len();
         let test_data_2 = test_data.clone();
         let test_data_3 = test_data.clone();
-        let stream = ByteStream::new(stream::once(
-            async move { Ok(Bytes::from(test_data.clone())) },
-        ));
+        let stream =
+            AsyncByteStream::new(stream::once(
+                async move { Ok(Bytes::from(test_data.clone())) },
+            ));
 
         // Store object
         let obj = fs
-            .store_single_object_and_meta(bucket_name, key1, stream)
+            .store_single_object_and_meta(bucket_name, key1, stream, test_data_len)
             .await
             .unwrap();
 
         // Initial refcount must be 1
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
@@ -803,12 +566,12 @@ mod tests {
             // Refcount must not be increased
 
             let stream =
-                ByteStream::new(stream::once(
+                AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_2.clone())) },
                 ));
 
             let new_obj = fs
-                .store_single_object_and_meta(bucket_name, key1, stream)
+                .store_single_object_and_meta(bucket_name, key1, stream, test_data_len)
                 .await
                 .unwrap();
 
@@ -821,12 +584,12 @@ mod tests {
             // Test  using a new key
             // Refcount must be increased
             let stream =
-                ByteStream::new(stream::once(
+                AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_3.clone())) },
                 ));
 
             let new_obj = fs
-                .store_single_object_and_meta(bucket_name, key2, stream)
+                .store_single_object_and_meta(bucket_name, key2, stream, test_data_len)
                 .await
                 .unwrap();
 
@@ -857,27 +620,25 @@ mod tests {
 
         // Create test data and stream
         let test_data = b"test data".to_vec();
-        let stream = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
+        let test_data_len = test_data.len();
+        let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
 
         // Store object
         let obj = fs
-            .store_single_object_and_meta(bucket_name, key, stream)
+            .store_single_object_and_meta(bucket_name, key, stream, test_data_len)
             .await
             .unwrap();
 
         // Verify object exists
         let exists = fs.key_exists(bucket_name, key).unwrap();
-        assert_eq!(exists, true);
+        assert!(exists);
 
         // verify blocks and path exist
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         let mut stored_paths = Vec::new();
         for id in obj.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
-            assert_eq!(
-                fs.path_tree().unwrap().contains_key(block.path()).unwrap(),
-                true
-            );
+            assert!(fs.path_tree().unwrap().contains_key(block.path()).unwrap());
             stored_paths.push(block.path().to_vec());
         }
 
@@ -886,16 +647,16 @@ mod tests {
 
         // Verify object no longer exists
         let exists = fs.key_exists(bucket_name, key).unwrap();
-        assert_eq!(exists, false);
+        assert!(!exists);
 
         // Verify blocks were cleaned up
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj.blocks() {
             assert!(block_tree.get_block(id).unwrap().is_none());
         }
         // Verify paths were cleaned up
         for path in stored_paths {
-            assert_eq!(fs.path_tree().unwrap().contains_key(&path).unwrap(), false);
+            assert!(!fs.path_tree().unwrap().contains_key(&path).unwrap());
         }
     }
 
@@ -926,16 +687,17 @@ mod tests {
 
         // Create test data
         let test_data = b"test data".to_vec();
+        let test_data_len = test_data.len();
         let test_data2 = test_data.clone();
-        let stream1 = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
+        let stream1 = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
 
         // Store first object
         let obj1 = fs
-            .store_single_object_and_meta(bucket, key1, stream1)
+            .store_single_object_and_meta(bucket, key1, stream1, test_data_len)
             .await
             .unwrap();
         // Verify blocks  exist with rc=1
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
@@ -943,10 +705,11 @@ mod tests {
 
         // Store same data with different key
 
-        let stream2 = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data2)) }));
+        let stream2 =
+            AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data2)) }));
 
         let obj2 = fs
-            .store_single_object_and_meta(bucket, key2, stream2)
+            .store_single_object_and_meta(bucket, key2, stream2, test_data_len)
             .await
             .unwrap();
 
@@ -954,7 +717,7 @@ mod tests {
         assert_eq!(obj1.blocks(), obj2.blocks());
         assert_eq!(obj1.hash(), obj2.hash());
         // Verify blocks  exist with rc=2
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 2);
@@ -964,7 +727,7 @@ mod tests {
         fs.delete_object(bucket, key1).await.unwrap();
 
         // Verify blocks still exist
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
@@ -1003,16 +766,17 @@ mod tests {
 
         // Create test data
         let test_data = b"test data".to_vec();
+        let test_data_len = test_data.len();
         let test_data2 = test_data.clone();
-        let stream1 = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
+        let stream1 = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data)) }));
 
         // Store first object
         let obj1 = fs
-            .store_single_object_and_meta(bucket, key1, stream1)
+            .store_single_object_and_meta(bucket, key1, stream1, test_data_len)
             .await
             .unwrap();
         // Verify blocks  exist with rc=1
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
@@ -1020,10 +784,11 @@ mod tests {
 
         // Store same data with same key
 
-        let stream2 = ByteStream::new(stream::once(async move { Ok(Bytes::from(test_data2)) }));
+        let stream2 =
+            AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(test_data2)) }));
 
         let obj2 = fs
-            .store_single_object_and_meta(bucket, key1, stream2)
+            .store_single_object_and_meta(bucket, key1, stream2, test_data_len)
             .await
             .unwrap();
 
@@ -1031,7 +796,7 @@ mod tests {
         assert_eq!(obj1.blocks(), obj2.blocks());
         assert_eq!(obj1.hash(), obj2.hash());
         // Verify blocks  exist with rc=1
-        let block_tree = fs.meta_store.get_block_tree().unwrap();
+        let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
             let block = block_tree.get_block(id).unwrap().unwrap();
             assert_eq!(block.rc(), 1);

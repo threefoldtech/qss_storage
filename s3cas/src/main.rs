@@ -150,14 +150,14 @@ async fn run(args: ServerConfig) -> anyhow::Result<()> {
 
     // provider
     let metrics = s3cas::metrics::SharedMetrics::new();
-    let casfs = CasFS::new(
+    let casfs = CasFS::single_namespace(
         args.fs_root.clone(),
         args.meta_root.clone(),
-        metrics.clone(),
+        metrics.to_cas(),
         storage_engine,
         args.inline_metadata_size,
         Some(args.durability),
-    );
+    )?;
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
     let s3fs = s3cas::metrics::MetricFs::new(s3fs, metrics.clone());
 
@@ -179,7 +179,7 @@ async fn run(args: ServerConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     let local_addr = listener.local_addr()?;
 
-    let hyper_service = service.into_shared();
+    let hyper_service = service;
 
     // metrics server
     // Add after the main listener setup

@@ -1,10 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use once_cell::sync::Lazy;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rusoto_core::ByteStream;
-use s3_cas::cas::fs::{CasFS, StorageEngine};
-use s3_cas::metastore::Durability;
-use s3_cas::metrics::SharedMetrics;
+use s3cas::cas::fs::{CasFS, StorageEngine};
+use s3cas::metastore::Durability;
+use s3cas::metrics::SharedMetrics;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -46,7 +46,7 @@ fn create_test_bucket(fs: &CasFS, name: &str) {
 
 // Helper to create random data of specified size
 fn create_random_data(size: usize) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut data = vec![0u8; size];
     rng.fill(&mut data[..]);
     data
@@ -76,7 +76,7 @@ fn bench_store_methods(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("store_inlined_object", size), |b| {
             b.iter(|| {
                 let data = create_random_data(size);
-                let key = format!("inline-key-{}", rand::thread_rng().gen::<u32>());
+                let key = format!("inline-key-{}", rand::rng().random::<u32>());
                 black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
             })
         });
@@ -87,7 +87,7 @@ fn bench_store_methods(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     let data = create_random_data(size);
-                    let key = format!("single-key-{}", rand::thread_rng().gen::<u32>());
+                    let key = format!("single-key-{}", rand::rng().random::<u32>());
                     let stream = vec_to_bytestream(data);
                     black_box(rt.block_on(fs.store_single_object_and_meta(
                         bucket_name,
@@ -124,7 +124,7 @@ fn bench_inlined_object_sizes(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("percentage_of_max", percentage), |b| {
             b.iter(|| {
                 let data = create_random_data(size);
-                let key = format!("key-{}", rand::thread_rng().gen::<u32>());
+                let key = format!("key-{}", rand::rng().random::<u32>());
                 black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
             })
         });
@@ -151,7 +151,7 @@ fn bench_store_methods_overhead(c: &mut Criterion) {
     group.bench_function("store_inlined_object_overhead", |b| {
         b.iter(|| {
             let data = create_random_data(size);
-            let key = format!("inline-key-{}", rand::thread_rng().gen::<u32>());
+            let key = format!("inline-key-{}", rand::rng().random::<u32>());
             black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
         })
     });
@@ -160,7 +160,7 @@ fn bench_store_methods_overhead(c: &mut Criterion) {
     group.bench_function("store_single_object_and_meta_overhead", |b| {
         b.iter(|| {
             let data = create_random_data(size);
-            let key = format!("single-key-{}", rand::thread_rng().gen::<u32>());
+            let key = format!("single-key-{}", rand::rng().random::<u32>());
             let stream = vec_to_bytestream(data);
             black_box(rt.block_on(fs.store_single_object_and_meta(bucket_name, &key, stream)))
                 .unwrap()

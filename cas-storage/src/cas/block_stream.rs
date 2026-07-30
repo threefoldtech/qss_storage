@@ -2,7 +2,7 @@ use crate::metrics::SharedMetrics;
 
 use super::range_request::RangeRequest;
 use bytes::Bytes;
-use futures::{ready, AsyncRead, AsyncSeek, Future, Stream};
+use futures::{AsyncRead, AsyncSeek, Future, Stream, ready};
 use std::{
     io,
     path::PathBuf,
@@ -67,21 +67,22 @@ impl Stream for BlockStream {
         // since we skip files we don't need to read from, this file always has at least _some_
         // bytes to read, and hence seek is always within bounds (even though it is technically not
         // an error if it isn't).
-        if !self.has_seeked && start > processed {
-            if let Some(ref mut file) = self.file {
-                return match Pin::new(file)
-                    .poll_seek(cx, io::SeekFrom::Current((start - processed) as i64))
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-                    Poll::Ready(Ok(_)) => {
-                        self.has_seeked = true;
-                        // TODO: this can be `n`
-                        self.processed += (start - processed) as usize;
-                        self.poll_next(cx)
-                    }
-                };
-            }
+        if !self.has_seeked
+            && start > processed
+            && let Some(ref mut file) = self.file
+        {
+            return match Pin::new(file)
+                .poll_seek(cx, io::SeekFrom::Current((start - processed) as i64))
+            {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Ok(_)) => {
+                    self.has_seeked = true;
+                    // TODO: this can be `n`
+                    self.processed += (start - processed) as usize;
+                    self.poll_next(cx)
+                }
+            };
         }
 
         // if we have an open file, try to read it

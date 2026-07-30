@@ -1,8 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::cas::StorageEngine;
-use metastore::{FjallStore, FjallStoreNotx, MetaStore};
+use cas_storage::{FjallStore, FjallStoreNotx, MetaStore, StorageEngine};
 
 pub fn num_keys(
     meta_root: PathBuf,
@@ -20,7 +19,8 @@ pub fn num_keys(
         }
     };
 
-    let bucket_keys = meta_store.num_keys(bucket_name)?;
+    // Per-tree key count is not on MetaStore; reach into the underlying Store.
+    let bucket_keys = meta_store.get_underlying_store().num_keys(bucket_name)?;
     Ok(bucket_keys)
 }
 
