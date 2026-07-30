@@ -336,6 +336,10 @@ mod tests {
         ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
             <FjallStoreNotx as Store>::tree_ext_open(self, name)
         }
+
+        fn num_keys(&self, name: &str) -> Result<usize, MetaError> {
+            <FjallStoreNotx as Store>::num_keys(self, name)
+        }
     }
 
     fn setup_store() -> (FjallStoreNotx, tempfile::TempDir) {
@@ -355,4 +359,12 @@ mod tests {
         let (store, _dir) = setup_store();
         test_utils::test_range_filter(&store);
     }
+
+    // ---- tfstor-extension: BEGIN ----
+    #[test]
+    fn test_num_keys() {
+        let (store, _dir) = setup_store();
+        test_utils::test_num_keys(&store);
+    }
+    // ---- tfstor-extension: END ----
 }

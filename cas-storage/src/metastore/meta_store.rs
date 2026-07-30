@@ -353,15 +353,21 @@ impl MetaStore {
         self.store.begin_transaction()
     }
 
+    // ---- tfstor-extension: BEGIN ----
     /// Returns the total number of keys in the bucket tree.
     ///
     /// This is primarily used for monitoring and debugging purposes.
     ///
     /// # Returns
-    /// The number of keys in the bucket tree
-    pub fn num_keys(&self) -> usize {
-        self.store.num_keys(DEFAULT_BUCKET_TREE).unwrap()
+    /// The number of keys in the bucket tree, or the backend error that
+    /// prevented counting them.
+    ///
+    /// Upstream returns a bare `usize` and `unwrap()`s the store call, turning
+    /// any backend error into a panic in a debugging helper.
+    pub fn num_keys(&self) -> Result<usize, MetaError> {
+        self.store.num_keys(DEFAULT_BUCKET_TREE)
     }
+    // ---- tfstor-extension: END ----
 
     /// Returns the total disk space used by the metadata store.
     ///

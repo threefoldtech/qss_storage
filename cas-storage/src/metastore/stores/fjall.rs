@@ -129,10 +129,18 @@ impl Store for FjallStore {
         Transaction::new(Box::new(FjallTransaction::new(tx, Arc::new(self.clone()))))
     }
 
-    fn num_keys(&self, _: &str) -> Result<usize, MetaError> {
-        unimplemented!("fjall with transaction does not support number of keys");
-        // fjall with transaction does not support this
+    // ---- tfstor-extension: BEGIN ----
+    // Upstream leaves this `unimplemented!()`, which panics on the default
+    // `--metadata-db fjall` path. A read transaction can count a keyspace just
+    // fine (same call `FjallTree::len` below already uses).
+    fn num_keys(&self, tree_name: &str) -> Result<usize, MetaError> {
+        let partition = self.get_partition(tree_name)?;
+        self.db
+            .read_tx()
+            .len(&*partition)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))
     }
+    // ---- tfstor-extension: END ----
 
     fn disk_space(&self) -> u64 {
         self.db.disk_space().unwrap_or(0)
@@ -417,6 +425,10 @@ mod tests {
         ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
             <FjallStore as Store>::tree_ext_open(self, name)
         }
+
+        fn num_keys(&self, name: &str) -> Result<usize, MetaError> {
+            <FjallStore as Store>::num_keys(self, name)
+        }
     }
 
     #[test]
@@ -430,4 +442,12 @@ mod tests {
         let (store, _dir) = setup_store();
         test_utils::test_range_filter(&store);
     }
+
+    // ---- tfstor-extension: BEGIN ----
+    #[test]
+    fn test_num_keys() {
+        let (store, _dir) = setup_store();
+        test_utils::test_num_keys(&store);
+    }
+    // ---- tfstor-extension: END ----
 }

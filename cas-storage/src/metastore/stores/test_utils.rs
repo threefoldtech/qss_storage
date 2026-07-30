@@ -5,7 +5,38 @@ use crate::metastore::{BaseMetaTree, BlockID, MetaError, MetaTreeExt, Object, Ob
 pub trait TestStore {
     fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError>;
     fn get_bucket_ext(&self, name: &str) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError>;
+    // ---- tfstor-extension: BEGIN ----
+    fn num_keys(&self, name: &str) -> Result<usize, MetaError>;
+    // ---- tfstor-extension: END ----
 }
+
+// ---- tfstor-extension: BEGIN ----
+/// Guards against `Store::num_keys` regressing to `unimplemented!()` on any
+/// backend: it must count the keys of a named tree, not panic.
+pub fn test_num_keys(store: &impl TestStore) {
+    let bucket_name = "test-num-keys";
+
+    let bucket = store.tree_open(bucket_name).unwrap();
+    assert_eq!(store.num_keys(bucket_name).unwrap(), 0);
+
+    let test_keys = ["a", "b", "c", "d", "e"];
+    for key in &test_keys {
+        let obj = Object::new(
+            1024,
+            BlockID::from([1; 16]),
+            ObjectData::SinglePart {
+                blocks: vec![BlockID::from([1; 16])],
+            },
+        );
+        bucket.insert(key.as_bytes(), obj.to_vec()).unwrap();
+    }
+
+    assert_eq!(store.num_keys(bucket_name).unwrap(), test_keys.len());
+
+    // A tree that was never written to still counts, and counts zero.
+    assert_eq!(store.num_keys("test-num-keys-empty").unwrap(), 0);
+}
+// ---- tfstor-extension: END ----
 
 pub fn test_get_bucket_keys(store: &impl TestStore) {
     let bucket_name = "testbucketkeys";
