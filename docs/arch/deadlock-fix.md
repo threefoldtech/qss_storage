@@ -97,9 +97,15 @@ weakening is easy to under-state:
 - **Before**: a failed disk write rolled the record back. Dangling records
   required a crash in a narrow window.
 - **After**: the record is already committed when the disk write starts. A
-  failed disk write leaves a committed record pointing at a file that never
-  landed -- and the code's only response is metrics
-  (`block_write_error`, the `BlockWriteGuard` state machine). A subsequent
+  failed disk write triggers metrics (`block_write_error`, the
+  `BlockWriteGuard` state machine) and a best-effort compensating delete
+  (`cleanup_on_failure`, `write_path.rs:184-195`, in-tree since `e349d9d`)
+  that removes the just-committed record. The compensation is unserialized
+  and unconditional, so it narrows the dangling-record window without
+  closing it: it is skipped on crash or panic, its own failure is
+  warn-and-continue, and under concurrency it can remove a record a
+  same-content PUT just dedup-bumped -- a loss-shaped race analyzed as
+  defect 1 of ADR 0006. Where a dangling record survives, a subsequent
   GET of that object fails with an I/O error.
 
 So the dangling-record state is no longer a *crash* window; it is an
@@ -120,11 +126,15 @@ the fix moved a failure class from "impossible" to "counted and ignored".
 - **`spawn_blocking` for the disk write, transaction held**: still awaits
   (on the join handle) under the guard. Same deadlock. Not a fix at all.
 - **Compensating delete on failure**: keep commit-before-I/O, and on disk
-  failure open a *new* short transaction that removes/decrements the
-  just-committed record. Shrinks the dangling-record window back to
-  crash-only without ever holding a lock across I/O. The notx backend's
-  hand-rolled rollback already demonstrates the pattern in-tree. Cheap,
-  local, and not yet done -- the standing candidate improvement.
+  failure remove/decrement the just-committed record. A version of this
+  shipped in `e349d9d` as `cleanup_on_failure` (write_path.rs:184-195),
+  predating this document's rewrite, which wrongly described it as not
+  done. The shipped form is an unconditional out-of-tx remove, and ADR
+  0006's review found it is itself a loss bug under concurrency (it can
+  delete a record a concurrent dedup-hit PUT now depends on). A corrected
+  form would decrement-or-remove-if-rc==1 inside one transaction -- but
+  ADR 0006's file-first protocol removes the need for compensation
+  entirely, so that repair is moot.
 - **Two-phase records** (commit `pending`, write disk, commit `finalize`):
   the rigorous version of the previous point; failures leave a
   self-describing pending record fsck can treat distinctly. Costs a second
