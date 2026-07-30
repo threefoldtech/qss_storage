@@ -73,7 +73,7 @@ pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
 
     let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
-    debug_assert!(obj_meta.size() as usize == block_size);
+    debug_assert!(obj_meta.size() == block_size as u64);
     let mut block_stream = BlockStream::new(paths, block_size, RangeRequest::All, metrics.to_cas());
 
     // Create the destination file

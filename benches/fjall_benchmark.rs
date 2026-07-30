@@ -49,6 +49,7 @@ fn create_test_bucket(name: &str) -> Vec<u8> {
 }
 
 // Helper to create a test object with specified size
+#[allow(clippy::cast_possible_truncation)] // moduli and array index bound the casts
 fn create_test_object(size: usize) -> Vec<u8> {
     // The payload is built but not stored in the object (the object records
     // the size and an empty block list). Kept because building it is part of

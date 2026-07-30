@@ -221,15 +221,23 @@ impl Stream for BlockStream {
             && start > processed
             && let Some(ref mut file) = self.file
         {
-            return match Pin::new(file)
-                .poll_seek(cx, io::SeekFrom::Current((start - processed) as i64))
-            {
+            // `start` comes from a client Range header and is not clamped to
+            // the object size, so the skip distance must be checked before it
+            // is narrowed for the seek and the `processed` bookkeeping.
+            let skip = start - processed;
+            let (Ok(skip_seek), Ok(skip_len)) = (i64::try_from(skip), usize::try_from(skip)) else {
+                return Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "range start does not fit the platform address space",
+                ))));
+            };
+            return match Pin::new(file).poll_seek(cx, io::SeekFrom::Current(skip_seek)) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
                 Poll::Ready(Ok(_)) => {
                     self.has_seeked = true;
                     // TODO: this can be `n`
-                    self.processed += (start - processed) as usize;
+                    self.processed += skip_len;
                     self.poll_next(cx)
                 }
             };
@@ -259,10 +267,10 @@ impl Stream for BlockStream {
 
         // if we have an open file, try to read it
         if let Some(ref mut file) = self.file {
-            let mut cap = end - processed + 1;
-            if cap > 4096 {
-                cap = 4096;
-            }
+            // `end` is client-controlled and unclamped: saturate so
+            // `end == u64::MAX` cannot overflow, and the min bounds the
+            // narrowing cast.
+            let cap = (end - processed).saturating_add(1).min(4096);
             let mut buf = vec![0; cap as usize];
             return match Pin::new(file).poll_read(cx, &mut buf) {
                 Poll::Pending => Poll::Pending,

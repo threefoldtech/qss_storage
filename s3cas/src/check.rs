@@ -200,7 +200,7 @@ async fn read_object(
     }
 
     let block_size: usize = paths.iter().map(|(_, size)| size).sum();
-    debug_assert!(obj_meta.size() as usize == block_size);
+    debug_assert!(obj_meta.size() == block_size as u64);
 
     let mut block_stream = BlockStream::new(paths, block_size, RangeRequest::All, metrics.to_cas());
     let mut data = Vec::with_capacity(block_size);
@@ -249,6 +249,7 @@ mod tests {
     }
 
     /// Stores one multi-block object and hands back the store it lives in.
+    #[allow(clippy::cast_possible_truncation)] // the modulus bounds the cast
     async fn store_object(dir: &TempDir, opts: &StoreOptions) -> CasFS {
         let casfs = casfs_at(dir, opts);
         casfs.create_bucket("bucket").unwrap();

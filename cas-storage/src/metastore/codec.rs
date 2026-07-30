@@ -36,6 +36,7 @@ pub(crate) fn put_len(out: &mut Vec<u8>, value: usize) {
 /// to know which width the store that wrote it uses. All ids in one record
 /// come from a single store and therefore share a width; an empty list writes
 /// width 0, the only case in which 0 is a legal width.
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn put_id_list(out: &mut Vec<u8>, ids: &[BlockId]) {
     let width = ids.first().map_or(0, BlockId::len);
     debug_assert!(

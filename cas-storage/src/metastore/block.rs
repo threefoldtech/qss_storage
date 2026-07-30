@@ -62,6 +62,8 @@ impl BlockId {
                 buf[..bytes.len()].copy_from_slice(bytes);
                 Ok(Self {
                     bytes: buf,
+                    // the match arm bounds the length to 16 or 32
+                    #[allow(clippy::cast_possible_truncation)]
                     len: bytes.len() as u8,
                 })
             }
@@ -95,6 +97,8 @@ impl BlockId {
 }
 
 impl From<[u8; BLOCKID_SIZE]> for BlockId {
+    // both widths are compile-time constants well below 256
+    #[allow(clippy::cast_possible_truncation)]
     fn from(bytes: [u8; BLOCKID_SIZE]) -> Self {
         let mut buf = [0u8; MAX_BLOCKID_SIZE];
         buf[..BLOCKID_SIZE].copy_from_slice(&bytes);
@@ -106,6 +110,8 @@ impl From<[u8; BLOCKID_SIZE]> for BlockId {
 }
 
 impl From<[u8; MAX_BLOCKID_SIZE]> for BlockId {
+    // both widths are compile-time constants well below 256
+    #[allow(clippy::cast_possible_truncation)]
     fn from(bytes: [u8; MAX_BLOCKID_SIZE]) -> Self {
         Self {
             bytes,
@@ -139,6 +145,8 @@ pub struct Block {
 /// size u64 | path_len u8 | path[path_len] | rc u64
 /// ```
 impl From<&Block> for Vec<u8> {
+    // the debug_assert below bounds the only narrowing cast
+    #[allow(clippy::cast_possible_truncation)]
     fn from(b: &Block) -> Self {
         // The path length is a single byte: a path is a prefix of a block
         // hash, so it is at most one full hash width (32) < 256 bytes.
