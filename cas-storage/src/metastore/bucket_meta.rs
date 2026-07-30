@@ -93,8 +93,16 @@ impl TryFrom<&[u8]> for BucketMeta {
         }
         Ok(BucketMeta {
             ctime: i64::from_le_bytes(value[..8].try_into().unwrap()),
-            // SAFETY: this is safe because we only store valid strings in the first place.
-            name: unsafe { String::from_utf8_unchecked(value[8 + PTR_SIZE..].to_vec()) },
+            // ---- tfstor-extension: BEGIN ----
+            // Upstream used `String::from_utf8_unchecked` here, arguing that only
+            // valid strings are ever written. That covers the write path only:
+            // these bytes come back from a database file, where the invariant can
+            // be broken by corruption, a truncated write, or a format change. The
+            // cost of validating a bucket name is irrelevant next to undefined
+            // behaviour, so validate and report a malformed record instead.
+            name: String::from_utf8(value[8 + PTR_SIZE..].to_vec())
+                .map_err(|_| FsError::MalformedObject)?,
+            // ---- tfstor-extension: END ----
         })
     }
 }

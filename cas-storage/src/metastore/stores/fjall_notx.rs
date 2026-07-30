@@ -311,11 +311,22 @@ impl MetaTreeExt for FjallTreeNotx {
             Box::new(pairs)
         };
 
-        Box::new(skip_filtered.map(|(raw_key, raw_value)| {
-            let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
+        // ---- tfstor-extension: BEGIN ----
+        // See the matching comment in `stores/fjall.rs`: the key comes off disk,
+        // so it is validated rather than assumed. `range_filter` has an
+        // infallible item type, so an invalid key is logged and skipped.
+        Box::new(skip_filtered.filter_map(|(raw_key, raw_value)| {
+            let key = match String::from_utf8(raw_key.to_vec()) {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::error!("Skipping key that is not valid UTF-8: {}", e);
+                    return None;
+                }
+            };
             let obj = Object::try_from(&*raw_value).unwrap();
-            (key, obj)
+            Some((key, obj))
         }))
+        // ---- tfstor-extension: END ----
     }
 }
 

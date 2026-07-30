@@ -88,12 +88,18 @@ impl TryFrom<&[u8]> for MultiPart {
         if value.len() < 8 + 3 * PTR_SIZE + bucket_len {
             return Err(FsError::MalformedObject);
         }
-        // SAFETY: Safe as we only insert valid strings
-        let bucket = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 2 * PTR_SIZE..8 + 2 * PTR_SIZE + bucket_len].to_vec(),
-            )
-        };
+        // ---- tfstor-extension: BEGIN ----
+        // Upstream used `String::from_utf8_unchecked` for the three string fields
+        // below, on the grounds that only valid strings are ever inserted. That
+        // argument covers the write path, not the read path: these bytes come
+        // back off disk, where corruption, a truncated write or a format change
+        // breaks the invariant, and the penalty for breaking it is undefined
+        // behaviour rather than an error. Bucket names, keys and upload IDs are
+        // short, so validation costs nothing worth having.
+        let bucket =
+            String::from_utf8(value[8 + 2 * PTR_SIZE..8 + 2 * PTR_SIZE + bucket_len].to_vec())
+                .map_err(|_| FsError::MalformedObject)?;
+        // ---- tfstor-extension: END ----
 
         let key_len = usize::from_le_bytes(
             value[8 + 2 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len]
@@ -103,13 +109,12 @@ impl TryFrom<&[u8]> for MultiPart {
         if value.len() < 8 + 4 * PTR_SIZE + bucket_len + key_len {
             return Err(FsError::MalformedObject);
         }
-        // SAFETY: Safe as we only insert valid strings
-        let key = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 3 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len + key_len]
-                    .to_vec(),
-            )
-        };
+        // ---- tfstor-extension: BEGIN ----
+        let key = String::from_utf8(
+            value[8 + 3 * PTR_SIZE + bucket_len..8 + 3 * PTR_SIZE + bucket_len + key_len].to_vec(),
+        )
+        .map_err(|_| FsError::MalformedObject)?;
+        // ---- tfstor-extension: END ----
 
         let upload_id_len = usize::from_le_bytes(
             value[8 + 3 * PTR_SIZE + bucket_len + key_len..8 + 4 * PTR_SIZE + bucket_len + key_len]
@@ -119,14 +124,14 @@ impl TryFrom<&[u8]> for MultiPart {
         if value.len() < 8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE {
             return Err(FsError::MalformedObject);
         }
-        // SAFETY: Safe as we only insert valid strings
-        let upload_id = unsafe {
-            String::from_utf8_unchecked(
-                value[8 + 4 * PTR_SIZE + bucket_len + key_len
-                    ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len]
-                    .to_vec(),
-            )
-        };
+        // ---- tfstor-extension: BEGIN ----
+        let upload_id = String::from_utf8(
+            value[8 + 4 * PTR_SIZE + bucket_len + key_len
+                ..8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len]
+                .to_vec(),
+        )
+        .map_err(|_| FsError::MalformedObject)?;
+        // ---- tfstor-extension: END ----
 
         let block_len = usize::from_le_bytes(
             value[8 + 4 * PTR_SIZE + bucket_len + key_len + upload_id_len + BLOCKID_SIZE

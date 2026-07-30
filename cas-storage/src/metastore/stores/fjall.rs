@@ -118,13 +118,36 @@ impl Store for FjallStore {
 
     fn begin_transaction(&self) -> Transaction {
         tracing::debug!(target: "cas_storage::locks", "Transaction started");
-        // Use unsafe to extend lifetime to 'static since the transaction
-        // won't outlive the store
+        // ---- tfstor-extension: BEGIN ----
+        // Upstream's comment here was "the transaction won't outlive the store",
+        // which states the conclusion without the two facts it rests on. Both are
+        // spelled out below, because both are silently breakable by an unrelated
+        // edit.
+        //
+        // SAFETY: `self.db.write_tx()` borrows the `SingleWriterTxDatabase`, and
+        // that borrow is laundered to `'static` here. Two properties make the
+        // laundered lifetime true in practice:
+        //
+        // 1. Liveness. The `FjallTransaction` built on the next line owns an
+        //    `Arc<FjallStore>` cloned from `self`, and `FjallStore::db` is an
+        //    `Arc<SingleWriterTxDatabase>`. The database therefore stays alive
+        //    for at least as long as the transaction, whatever happens to the
+        //    `FjallStore` this method was called on.
+        // 2. Drop order. `FjallTransaction` declares `tx` before `store`, and
+        //    Rust drops struct fields in declaration order, so the transaction
+        //    (and the single-writer lock guard inside it) is released before the
+        //    `Arc<FjallStore>` that keeps the database alive. See the field-order
+        //    note on the struct.
+        //
+        // Neither property is enforced by the compiler. Removing the `Arc` from
+        // `FjallTransaction`, or swapping its two fields, reintroduces a
+        // use-after-free without any diagnostic.
         let tx = unsafe {
             std::mem::transmute::<fjall::SingleWriterWriteTx<'_>, fjall::SingleWriterWriteTx<'static>>(
                 self.db.write_tx(),
             )
         };
+        // ---- tfstor-extension: END ----
 
         Transaction::new(Box::new(FjallTransaction::new(tx, Arc::new(self.clone()))))
     }
@@ -148,8 +171,19 @@ impl Store for FjallStore {
 }
 
 pub struct FjallTransaction {
+    // ---- tfstor-extension: BEGIN ----
+    // FIELD ORDER IS LOAD-BEARING. DO NOT REORDER.
+    //
+    // `tx` holds a transaction whose lifetime was laundered to `'static` in
+    // `FjallStore::begin_transaction`; it borrows the database owned (via `Arc`)
+    // by `store`. Fields drop in declaration order, so `tx` must be declared
+    // first to guarantee the transaction is released before the `Arc<FjallStore>`
+    // that keeps the database alive. Swapping these two lines produces a
+    // use-after-free that the compiler cannot see, because the `'static` in the
+    // type is a lie the `unsafe` block told it.
     tx: Option<fjall::SingleWriterWriteTx<'static>>,
     store: Arc<FjallStore>,
+    // ---- tfstor-extension: END ----
 }
 
 impl FjallTransaction {
@@ -161,8 +195,54 @@ impl FjallTransaction {
     }
 }
 
+// ---- tfstor-extension: BEGIN ----
+// SAFETY: `FjallTransaction` is `Send` by assertion, not by derivation. The
+// blocker is `fjall::SingleWriterWriteTx`, which holds a
+// `std::sync::MutexGuard<'_, ()>` for fjall's single-writer lock, and std's
+// guard is `!Send`. Everything else in the struct (`Arc<FjallStore>`, the
+// transaction's `Database` handle, its memtables and snapshot nonce) is already
+// `Send + Sync`.
+//
+// This impl is REQUIRED: `TransactionBackend` has a `Send + Sync` supertrait
+// bound, so `Box<dyn TransactionBackend>` will not accept `FjallTransaction`
+// without it. Deleting it fails the build.
+//
+// What makes it sound, stated as plainly as it can be: the single-writer lock
+// means at most one `FjallTransaction` exists at a time, so there is no shared
+// mutable state to race on, and the transaction's own data is thread-agnostic.
+// The residual assumption is about the guard, not the data -- a mutex guard may
+// only be released on the thread that acquired it on platforms whose mutex is
+// thread-affine (POSIX `pthread_mutex_t`). Rust's std makes no promise either
+// way, which is exactly why the guard is `!Send`.
+//
+// In this codebase the assumption holds because of how transactions are used,
+// not because of anything the type enforces: the only caller
+// (`cas::write_path::store_object`) begins a transaction and commits or drops it
+// within one uninterrupted synchronous stretch, with no `.await` in between, so
+// the guard is always released on the thread that took it. On Linux, std's mutex
+// is a futex and cross-thread release is fine regardless.
+//
+// If a future ever holds a `Transaction` across an `.await`, a tokio worker
+// steal can move the guard to another thread, and this impl stops being a
+// formality and starts being a real, platform-dependent claim. Do not do that
+// without revisiting this comment.
 unsafe impl Send for FjallTransaction {}
-unsafe impl Sync for FjallTransaction {}
+
+// `unsafe impl Sync for FjallTransaction {}` was here and has been DELETED.
+// It was never needed: `MutexGuard<'_, T>` is `Sync` when `T: Sync`, so
+// `FjallTransaction` gets a perfectly ordinary auto `Sync` impl, and the
+// `Send + Sync` supertrait bound is satisfied without any assertion. Every
+// `TransactionBackend` method takes `&mut self` in any case, so shared-reference
+// access does not arise. Removing it restores the compiler's ability to notice
+// if a future field makes shared access unsound.
+//
+// The assertion below pins that claim: if a field is ever added that is not
+// `Sync`, this fails at the definition instead of being papered over.
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<FjallTransaction>();
+};
+// ---- tfstor-extension: END ----
 
 impl TransactionBackend for FjallTransaction {
     fn commit(&mut self) -> Result<(), MetaError> {
@@ -394,11 +474,25 @@ impl MetaTreeExt for FjallTree {
             Box::new(pairs)
         };
 
-        Box::new(skip_filtered.map(|(raw_key, raw_value)| {
-            let key = unsafe { String::from_utf8_unchecked(raw_key.to_vec()) };
+        // ---- tfstor-extension: BEGIN ----
+        // Upstream used `String::from_utf8_unchecked` on the raw key. The key
+        // comes straight off disk, so a corrupt or truncated record turns into
+        // undefined behaviour instead of a bad result. `range_filter` yields an
+        // infallible item type, so a key that is not valid UTF-8 is skipped and
+        // logged -- the same treatment the iterator above already gives to keys
+        // the backend fails to read (`filter_map(|g| g.into_inner().ok())`).
+        Box::new(skip_filtered.filter_map(|(raw_key, raw_value)| {
+            let key = match String::from_utf8(raw_key.to_vec()) {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::error!("Skipping key that is not valid UTF-8: {}", e);
+                    return None;
+                }
+            };
             let obj = Object::try_from(&*raw_value).unwrap();
-            (key, obj)
+            Some((key, obj))
         }))
+        // ---- tfstor-extension: END ----
     }
 }
 

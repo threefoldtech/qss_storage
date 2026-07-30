@@ -43,7 +43,25 @@ impl BlockStream {
         }
     }
 }
-unsafe impl Sync for BlockStream {}
+// ---- tfstor-extension: BEGIN ----
+// `unsafe impl Sync for BlockStream {}` was here and has been DELETED. It came
+// with no justification, and it turns out it never needed one: every field of
+// `BlockStream` is already `Sync` -- `Vec<(PathBuf, usize)>`, plain integers and
+// a `bool`, `RangeRequest`, the `Arc`-backed `SharedMetrics`, `async_fs::File`,
+// and `open_fut`, whose boxed future is declared `+ Send + Sync` in the struct.
+// So the compiler hands out an ordinary auto `Sync` impl and the workspace
+// builds with the assertion gone.
+//
+// The static assertion below keeps that honest: if someone adds a field that is
+// not `Sync` (a `Cell`, an `Rc`, a future without the `Sync` bound), this line
+// fails the build at the definition, which is where the decision belongs --
+// rather than the old behaviour, where an `unsafe impl` would have silently
+// asserted the new field's soundness on the author's behalf.
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<BlockStream>();
+};
+// ---- tfstor-extension: END ----
 
 impl Stream for BlockStream {
     type Item = io::Result<Bytes>;
