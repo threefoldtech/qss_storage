@@ -2,7 +2,8 @@
 
 **Status**: Proposed (revised 2026-07-30 after adversarial code review;
 13-agent verification pass, all Context claims below carry file:line
-evidence)
+evidence; all six adversarially re-derived claims survived skeptic
+refutation)
 **Date**: 2026-07-30
 
 ---
@@ -33,8 +34,9 @@ which the previous revision of this ADR understated:
    - **loss race**: a concurrent same-content PUT dedup-bumps rc 1->2 and
      skips its own disk write (`write_path.rs:151-163`); the failing
      writer's cleanup then removes the rc=2 record -- the other PUT's
-     committed object references a block with no record and no file.
-     GET fails with `BlockNotFound` (`read_path.rs:29-31`).
+     committed object references a block with no record and no complete
+     file (the failed write may have left a partial). GET fails with
+     `BlockNotFound` (`read_path.rs:29-31`).
    Any dangling record that survives also *poisons dedup*: a later PUT of
    the same content bumps it, skips the write, and commits a live object
    over a file that never landed. Loss, not leakage.
@@ -51,7 +53,9 @@ which the previous revision of this ADR understated:
    via journal `sync_all` *before* the file bytes enter page cache; a
    power cut in the writeback window recovers a record whose file is
    missing, zero-length, or partial -- loss at the strongest configured
-   durability. On `fjall_notx` the knob is dropped entirely
+   durability, and client-visible with certainty via the dedup-poisoning
+   chain of defect 1 (the next same-content PUT skips its write against
+   the recovered record). On `fjall_notx` the knob is dropped entirely
    (`fjall_notx.rs:110-117`, commit is a no-op at `:150-152`): it fsyncs
    nothing there, not even metadata.
 4. **Executor starvation**: the sync 1 MiB writes park tokio workers for
