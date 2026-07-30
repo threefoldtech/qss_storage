@@ -176,10 +176,14 @@ impl FjallStore {
             .open()
             .unwrap();
 
-        let durability = match durability.unwrap_or(Durability::Fdatasync) {
+        // The mapping follows the POSIX names: fsync flushes data and
+        // metadata (fjall SyncAll, strongest), fdatasync flushes data only
+        // (fjall SyncData, weaker but faster). The default is the strongest
+        // mode, same persist behavior as before the names were untangled.
+        let durability = match durability.unwrap_or(Durability::Fsync) {
             Durability::Buffer => fjall::PersistMode::Buffer,
-            Durability::Fsync => fjall::PersistMode::SyncData,
-            Durability::Fdatasync => fjall::PersistMode::SyncAll,
+            Durability::Fsync => fjall::PersistMode::SyncAll,
+            Durability::Fdatasync => fjall::PersistMode::SyncData,
         };
 
         FjallStoreOf::from_db(

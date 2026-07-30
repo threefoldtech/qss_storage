@@ -111,6 +111,16 @@ struct definition. Same `const _` static assertion in its place.
 `TestStore` trait, wired into both backends' test modules. Upstream had no
 coverage for `Store::num_keys`, which is how the `unimplemented!()` survived.
 
+### `Durability` mapping untangled (H12)
+The enum's doc comments always described POSIX semantics (`Fsync` = data +
+metadata, strongest; `Fdatasync` = data only, weaker), but the mapping onto
+fjall was crossed: `Fsync` -> `SyncData`, `Fdatasync` -> `SyncAll`, with
+`Fdatasync` as the default. Swapped so the names tell the truth
+(`Fsync` -> `SyncAll`, `Fdatasync` -> `SyncData`) and the defaults (library,
+respd, s3cas CLI) moved from `Fdatasync` to `Fsync` -- so the default persist
+behavior is bit-for-bit unchanged, and only explicit flag users see a change:
+they now get what the flag name promised.
+
 ### The two fjall backends deduplicated
 Finding B1 of `docs/as-built/04-code-health.md`. `stores/fjall.rs` and
 `stores/fjall_notx.rs` were near-copies: same function inventory, 161

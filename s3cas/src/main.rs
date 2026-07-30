@@ -59,8 +59,8 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        default_value = "fdatasync",
-        help = "Durability level (buffer, fsync, fdatasync)"
+        default_value = "fsync",
+        help = "Durability level (buffer, fsync, fdatasync); fsync is strongest"
     )]
     durability: Durability,
 }
