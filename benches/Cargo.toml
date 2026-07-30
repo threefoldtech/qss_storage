@@ -1,0 +1,28 @@
+[package]
+name = "qss-benches"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "Criterion benchmarks for the cas-storage metadata and CAS layers"
+publish = false
+
+[dependencies]
+cas-storage = { path = "../cas-storage" }
+
+[[bench]]
+name = "fjall_benchmark"
+path = "fjall_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "casfs_benchmark"
+path = "casfs_benchmark.rs"
+harness = false
+
+[dev-dependencies]
+bytes.workspace = true
+criterion.workspace = true
+futures.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

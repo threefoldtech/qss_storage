@@ -1,19 +1,20 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use once_cell::sync::Lazy;
-use rand::{Rng, RngExt};
-use rusoto_core::ByteStream;
-use s3cas::cas::fs::{CasFS, StorageEngine};
-use s3cas::metastore::Durability;
-use s3cas::metrics::SharedMetrics;
+//! Benchmarks for the CasFS write paths.
+//!
+//! Compares the inlined-metadata write path against the regular
+//! block-storage write path across a range of object sizes.
+
+use bytes::Bytes;
+use cas_storage::{AsyncByteStream, CasFS, Durability, SharedMetrics, StorageEngine};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use futures::stream;
+use rand::RngExt;
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-// Create a single shared metrics instance to avoid registry conflicts
-static METRICS: Lazy<SharedMetrics> = Lazy::new(|| SharedMetrics::new());
-
 fn get_shared_metrics() -> SharedMetrics {
-    METRICS.clone()
+    SharedMetrics::default()
 }
 
 // Helper function to create a temporary CasFS with FjallNoTx
@@ -27,14 +28,15 @@ fn setup_casfs() -> (CasFS, TempDir) {
     let inlined_metadata_size = Some(1024); // Use a reasonable inline metadata size for benchmarking
     let durability = Some(Durability::Buffer); // Use buffer durability for benchmarking
 
-    let fs = CasFS::new(
+    let fs = CasFS::single_namespace(
         root_path,
         meta_path,
         metrics,
         storage_engine,
         inlined_metadata_size,
         durability,
-    );
+    )
+    .unwrap();
 
     (fs, dir)
 }
@@ -52,9 +54,9 @@ fn create_random_data(size: usize) -> Vec<u8> {
     data
 }
 
-// Convert Vec<u8> to ByteStream for store_single_object_and_meta
-fn vec_to_bytestream(data: Vec<u8>) -> ByteStream {
-    ByteStream::from(data)
+// Convert Vec<u8> to AsyncByteStream for store_single_object_and_meta
+fn vec_to_bytestream(data: Vec<u8>) -> AsyncByteStream {
+    AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) }))
 }
 
 fn bench_store_methods(c: &mut Criterion) {
@@ -88,11 +90,13 @@ fn bench_store_methods(c: &mut Criterion) {
                 b.iter(|| {
                     let data = create_random_data(size);
                     let key = format!("single-key-{}", rand::rng().random::<u32>());
+                    let len = data.len();
                     let stream = vec_to_bytestream(data);
                     black_box(rt.block_on(fs.store_single_object_and_meta(
                         bucket_name,
                         &key,
                         stream,
+                        len,
                     )))
                     .unwrap()
                 })
@@ -161,8 +165,9 @@ fn bench_store_methods_overhead(c: &mut Criterion) {
         b.iter(|| {
             let data = create_random_data(size);
             let key = format!("single-key-{}", rand::rng().random::<u32>());
+            let len = data.len();
             let stream = vec_to_bytestream(data);
-            black_box(rt.block_on(fs.store_single_object_and_meta(bucket_name, &key, stream)))
+            black_box(rt.block_on(fs.store_single_object_and_meta(bucket_name, &key, stream, len)))
                 .unwrap()
         })
     });

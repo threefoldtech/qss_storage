@@ -3,6 +3,7 @@ members = [
     "cas-storage",
     "s3cas",
     "respd",
+    "benches",
 ]
 resolver = "2"
 

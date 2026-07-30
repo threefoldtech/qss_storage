@@ -1,30 +1,38 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::{Rng, RngExt};
-use s3cas::metastore::{
+//! Comparative benchmarks for the two fjall metadata backends.
+//!
+//! `FjallStore` is transactional (fjall's single-writer transactional
+//! database), `FjallStoreNotx` is not (rollback is implemented in our own
+//! code). Both are driven through the same `MetaStore` facade, so every
+//! scenario below measures the backend and nothing else.
+
+use cas_storage::{
     Block, BlockID, BucketMeta, FjallStore, FjallStoreNotx, MetaStore, Object, ObjectData,
 };
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use rand::RngExt;
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::TempDir;
 
-// Helper function to create a temporary FjallStore
-fn setup_fjall_store() -> (FjallStore, TempDir) {
+// Helper function to create a temporary MetaStore backed by FjallStore
+fn setup_fjall_store() -> (MetaStore, TempDir) {
     let dir = TempDir::new().unwrap();
     let store = FjallStore::new(
         dir.path().to_path_buf(),
         Some(1024), // Use a reasonable inline metadata size for benchmarking
         None,       // Use default durability
     );
-    (store, dir)
+    (MetaStore::new(store, Some(1024)), dir)
 }
 
-// Helper function to create a temporary FjallStoreNotx
-fn setup_fjall_notx_store() -> (FjallStoreNotx, TempDir) {
+// Helper function to create a temporary MetaStore backed by FjallStoreNotx
+fn setup_fjall_notx_store() -> (MetaStore, TempDir) {
     let dir = TempDir::new().unwrap();
     let store = FjallStoreNotx::new(
         dir.path().to_path_buf(),
         Some(1024), // Use a reasonable inline metadata size for benchmarking
     );
-    (store, dir)
+    (MetaStore::new(store, Some(1024)), dir)
 }
 
 // Helper to create a test bucket
@@ -35,17 +43,17 @@ fn create_test_bucket(name: &str) -> Vec<u8> {
 
 // Helper to create a test object with specified size
 fn create_test_object(size: usize) -> Vec<u8> {
+    // The payload is built but not stored in the object (the object records
+    // the size and an empty block list). Kept because building it is part of
+    // what the mixed workload measures.
     let mut data = vec![0u8; size];
-    // Fill with some pattern
-    for i in 0..size {
-        data[i] = (i % 256) as u8;
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
     }
+    black_box(data);
 
     // Create a dummy block ID
-    let mut block_id = [0u8; 16];
-    for i in 0..16 {
-        block_id[i] = i as u8;
-    }
+    let block_id: BlockID = std::array::from_fn(|i| i as u8);
 
     // Create object with SinglePart data
     let obj = Object::new(
@@ -198,7 +206,7 @@ fn bench_get_meta(c: &mut Criterion) {
 
         // Insert some test objects
         for i in 0..100 {
-            let key = format!("key-{}", i);
+            let key = format!("key-{i}");
             let obj = create_test_object(1024);
             store.insert_meta(bucket_name, &key, obj).unwrap();
         }
@@ -220,7 +228,7 @@ fn bench_get_meta(c: &mut Criterion) {
 
         // Insert some test objects
         for i in 0..100 {
-            let key = format!("key-{}", i);
+            let key = format!("key-{i}");
             let obj = create_test_object(1024);
             store.insert_meta(bucket_name, &key, obj).unwrap();
         }
@@ -246,7 +254,7 @@ fn bench_list_buckets(c: &mut Criterion) {
 
         // Create some test buckets
         for i in 0..50 {
-            let bucket_name = format!("bucket-{}", i);
+            let bucket_name = format!("bucket-{i}");
             let bucket_data = create_test_bucket(&bucket_name);
             store.insert_bucket(&bucket_name, bucket_data).unwrap();
         }
@@ -264,7 +272,7 @@ fn bench_list_buckets(c: &mut Criterion) {
 
         // Create some test buckets
         for i in 0..50 {
-            let bucket_name = format!("bucket-{}", i);
+            let bucket_name = format!("bucket-{i}");
             let bucket_data = create_test_bucket(&bucket_name);
             store.insert_bucket(&bucket_name, bucket_data).unwrap();
         }
@@ -338,14 +346,14 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
                 // Insert some objects
                 for i in 0..10 {
-                    let key = format!("key-{}", i);
+                    let key = format!("key-{i}");
                     let obj = create_test_object(1024 * (i + 1));
                     store.insert_meta(&bucket_name, &key, obj).unwrap();
                 }
 
                 // Read some objects
                 for i in 0..5 {
-                    let key = format!("key-{}", i);
+                    let key = format!("key-{i}");
                     black_box(store.get_meta(&bucket_name, &key)).unwrap();
                 }
 
@@ -374,14 +382,14 @@ fn bench_mixed_workload(c: &mut Criterion) {
 
                 // Insert some objects
                 for i in 0..10 {
-                    let key = format!("key-{}", i);
+                    let key = format!("key-{i}");
                     let obj = create_test_object(1024 * (i + 1));
                     store.insert_meta(&bucket_name, &key, obj).unwrap();
                 }
 
                 // Read some objects
                 for i in 0..5 {
-                    let key = format!("key-{}", i);
+                    let key = format!("key-{i}");
                     black_box(store.get_meta(&bucket_name, &key)).unwrap();
                 }
 

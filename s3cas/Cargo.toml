@@ -41,9 +41,3 @@ once_cell = { workspace = true }
 tempfile = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-criterion = { workspace = true }
-rand = { workspace = true }
-
-# Benches in ../benches/ are stale (reference removed crate-internal paths
-# like crate::cas::fs). They were already broken pre-port and need a rewrite
-# against the cas-storage public API before being re-enabled.
