@@ -1,0 +1,118 @@
+# qss_storage.toml -- configuration for s3cas and respd.
+#
+# Copy this file to qss_storage.toml (working directory) or to
+# /etc/qss_storage/qss_storage.toml, and delete what you do not need: every
+# key below is optional, and an absent key falls back to the built-in default
+# shown in its comment.
+#
+# Precedence, highest first:
+#
+#   1. CLI flags       (e.g. --port 9000)
+#   2. this file       (--config <path>, then ./qss_storage.toml,
+#                       then /etc/qss_storage/qss_storage.toml)
+#   3. built-in defaults
+#
+# A --config path that does not exist is an error, not a fall-through. Unknown
+# keys are an error too: a typo in a storage daemon's configuration should stop
+# it, not be ignored.
+
+# ---------------------------------------------------------------------------
+# [store] -- how every store this deployment opens is created and opened.
+# Both binaries read this table.
+# ---------------------------------------------------------------------------
+[store]
+
+# Write durability of the metadata database: "buffer", "fsync" or
+# "fdatasync". POSIX names: fsync is data + metadata (strongest), fdatasync is
+# data only, buffer leaves the write to the OS page cache.
+# Default: "fsync"
+durability = "fsync"
+
+# Objects (s3cas) or values (respd) at or below this many bytes are stored
+# inside their metadata record instead of as blocks. Leave the key out for the
+# backend default. respd defaults to 1, which inlines everything it can.
+# Default: unset for s3cas, 1 for respd
+#inline_metadata_size = 1
+
+# Metadata database backend: "fjall" (transactional) or "fjall_notx"
+# (non-transactional, rollback handled in our code).
+# respd ignores this key: it is fjall-only.
+# Default: "fjall"
+metadata_db = "fjall"
+
+# Re-hash each whole block on read and refuse to serve one whose bytes no
+# longer hash to its address. Costs a full buffer plus a hash per block, and
+# covers whole-object reads only (a range request cannot be re-hashed against
+# a whole-block address). respd ignores this key: it stores no blocks.
+# Default: false
+verify_on_read = false
+
+# ---------------------------------------------------------------------------
+# [store.hash] -- how blocks are addressed.
+#
+# Applies ONLY when a store is created. An existing store is addressed by the
+# hash recorded in its (immutable) QSST header; if this section disagrees with
+# the store that was opened, the header wins and s3cas logs a warning at
+# startup. To change the hash of a deployment, create a new store.
+# ---------------------------------------------------------------------------
+[store.hash]
+
+# Block hash algorithm. "blake3" is the only value this build accepts.
+# Default: "blake3"
+algo = "blake3"
+
+# Block address width in bytes: 32 (256 bit, the default) or 16 (128 bit,
+# truncated BLAKE3 -- smaller metadata, for trusted-tenant deployments).
+# Default: 32
+width = 32
+
+# ---------------------------------------------------------------------------
+# [s3] -- the s3cas server. respd ignores this table.
+# ---------------------------------------------------------------------------
+[s3]
+
+# Address the S3 endpoint binds. Default: "localhost"
+host = "localhost"
+
+# Port the S3 endpoint binds. Default: 8014
+port = 8014
+
+# S3 credentials. Authentication is mandatory: s3cas refuses to start unless
+# both the access key and the secret key are supplied, here or on the command
+# line (--access-key / --secret-key). There is no default.
+access_key = "CHANGE_ME"
+secret_key = "CHANGE_ME"
+
+# s3cas reads --fs-root and --meta-root from the command line only; they have
+# no key here.
+
+# ---------------------------------------------------------------------------
+# [s3.metrics] -- the prometheus endpoint, served by s3cas at /metrics.
+# ---------------------------------------------------------------------------
+[s3.metrics]
+
+# Address the metrics endpoint binds. Default: "localhost"
+host = "localhost"
+
+# Port the metrics endpoint binds. Default: 9100
+port = 9100
+
+# ---------------------------------------------------------------------------
+# [resp] -- the respd server. s3cas ignores this table.
+# ---------------------------------------------------------------------------
+[resp]
+
+# Address respd binds. Default: "127.0.0.1"
+host = "127.0.0.1"
+
+# Port respd binds. Default: 6379
+port = 6379
+
+# Directory holding respd's database. Created if missing.
+# Default: "./data"
+data_dir = "./data"
+
+# Password required for admin commands. If this key is absent and --admin is
+# not passed, every connection is granted admin privileges.
+# Default: unset
+#admin_password = "CHANGE_ME"

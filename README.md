@@ -45,6 +45,38 @@ cargo build --release -p respd
 
 With this feature, the data blocks will be deleted when they aren't used anymore.
 
+## Configuration
+
+Both servers read a single TOML file, `qss_storage.toml`. Start from
+[`qss_storage.toml.example`](./qss_storage.toml.example), which documents every
+key and its default:
+
+```bash
+cp qss_storage.toml.example qss_storage.toml
+$EDITOR qss_storage.toml
+cargo run -p s3cas -- server          # no flags needed
+cargo run -p respd
+```
+
+Settings are resolved per field, highest precedence first:
+
+1. **CLI flags** -- `--port 9000` beats whatever the file says about the port,
+   and nothing else.
+2. **The config file** -- the first of: the path given to `--config`, then
+   `./qss_storage.toml`, then `/etc/qss_storage/qss_storage.toml`. A `--config`
+   path that does not exist is an error rather than a fall-through, and each
+   binary logs at startup which file it loaded (or that it found none).
+3. **Built-in defaults** -- listed in the example file next to each key.
+
+An unknown key anywhere in the file is a startup error: a misspelled setting
+should stop the daemon, not be silently ignored.
+
+The `[store]` table is shared by both binaries; `[s3]` is read by s3cas only
+and `[resp]` by respd only. `[store.hash]` applies when a store is *created*:
+an existing store is addressed by the hash recorded in its immutable header, so
+a config that disagrees with the store it opened gets a warning at startup, and
+changing the block hash of a deployment means creating a new store.
+
 ## respd Features
 
 The respd server implements some basic Redis commands and also provides additional commands for namespace and data management that are not part of the standard Redis protocol.

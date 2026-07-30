@@ -56,7 +56,13 @@ impl TestServer {
 
                 // Create a shared storage instance
                 let storage = Arc::new(
-                    respd::storage::Storage::new(thread_data_dir, None).expect("can open storage"),
+                    respd::storage::Storage::new(
+                        thread_data_dir,
+                        None,
+                        cas_storage::Durability::Fsync,
+                        cas_storage::HeaderSpec::default(),
+                    )
+                    .expect("can open storage"),
                 );
 
                 // Create a shared namespace cache

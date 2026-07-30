@@ -26,20 +26,25 @@ impl Storage {
     /// versioning, and what makes a store from before the format refuse to
     /// open instead of being read as garbage.
     ///
+    /// `durability` and `header` come from the config file merge in `main`;
+    /// `header` applies only if the store is created now, since an existing
+    /// one is opened on the header it already carries.
+    ///
     /// # Errors
     ///
     /// [`MetaError::Header`] if the directory holds a store this build will
     /// not open; the message names the store and the reason.
-    pub fn new(data_dir: PathBuf, inlined_metadata_size: Option<usize>) -> Result<Self, MetaError> {
+    pub fn new(
+        data_dir: PathBuf,
+        inlined_metadata_size: Option<usize>,
+        durability: Durability,
+        header: HeaderSpec,
+    ) -> Result<Self, MetaError> {
         // Create the metastore with FjallStore backend
-        // Strongest persist mode (POSIX fsync semantics: data + metadata);
-        // same behavior as before the Durability naming was untangled.
-        let (store, _header) = MetaStore::open_or_create(
-            data_dir,
-            inlined_metadata_size,
-            HeaderSpec::default(),
-            |path| FjallStore::new(path, inlined_metadata_size, Some(Durability::Fsync)),
-        )?;
+        let (store, _header) =
+            MetaStore::open_or_create(data_dir, inlined_metadata_size, header, |path| {
+                FjallStore::new(path, inlined_metadata_size, Some(durability))
+            })?;
 
         Ok(Self { store })
     }

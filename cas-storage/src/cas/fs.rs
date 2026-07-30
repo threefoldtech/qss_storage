@@ -25,7 +25,12 @@ pub struct CasFS {
     pub(super) verify_on_read: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Which metadata database backend a store uses.
+///
+/// Deserialized through [`FromStr`] (`try_from = "String"`) so the config file
+/// spelling is exactly the CLI flag spelling: `fjall` or `fjall_notx`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
 pub enum StorageEngine {
     // fjall with transactions support
     Fjall,
@@ -42,8 +47,30 @@ impl FromStr for StorageEngine {
         match s.to_lowercase().as_str() {
             "fjall" => Ok(StorageEngine::Fjall),
             "fjall_notx" => Ok(StorageEngine::FjallNotx),
-            _ => Err(format!("Unknown storage engine: {s}")),
+            _ => Err(format!(
+                "unknown storage engine: {s} (expected fjall or fjall_notx)"
+            )),
         }
+    }
+}
+
+impl TryFrom<String> for StorageEngine {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl std::fmt::Display for StorageEngine {
+    /// Writes the spelling [`FromStr`] accepts, so a value read from a config
+    /// file round-trips through a log line unchanged.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = match self {
+            StorageEngine::Fjall => "fjall",
+            StorageEngine::FjallNotx => "fjall_notx",
+        };
+        f.write_str(name)
     }
 }
 

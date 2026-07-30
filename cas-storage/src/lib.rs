@@ -68,12 +68,18 @@
 //! ```
 
 pub mod cas;
+pub mod config;
 pub mod hasher;
 pub mod metastore;
 pub mod metrics;
 
 // Re-export the block hasher (used by both the cas and metastore layers)
 pub use hasher::{Hasher, HasherError};
+
+// Re-export the config file types (the binaries merge these with their flags)
+pub use config::{
+    ConfigError, HashConfig, MetricsConfig, QssStorageConfig, RespConfig, S3Config, StoreConfig,
+};
 
 // Re-export main types from metastore
 pub use metastore::{

@@ -171,7 +171,13 @@ pub trait Store: Send + Sync + Debug + 'static {
 ///
 /// This enum represents different levels of durability that can be used
 /// when configuring storage operations.
-#[derive(Debug, Clone, Copy)]
+///
+/// The `try_from = "String"` deserialization routes the config file through
+/// the same [`FromStr`] the CLI flag uses, so `durability = "fdatasync"` in
+/// `qss_storage.toml` and `--durability fdatasync` cannot drift apart, and a
+/// typo is reported with the same message in both places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
 pub enum Durability {
     /// Data is buffered in memory and will be written to disk later.
     /// This provides the highest performance but lowest durability.
@@ -201,7 +207,30 @@ impl FromStr for Durability {
             "buffer" => Ok(Durability::Buffer),
             "fsync" => Ok(Durability::Fsync),
             "fdatasync" => Ok(Durability::Fdatasync),
-            _ => Err(format!("Unknown durability option: {s}")),
+            _ => Err(format!(
+                "unknown durability option: {s} (expected buffer, fsync or fdatasync)"
+            )),
         }
+    }
+}
+
+impl TryFrom<String> for Durability {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl std::fmt::Display for Durability {
+    /// Writes the spelling [`FromStr`] accepts, so a value read from a config
+    /// file round-trips through a log line unchanged.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = match self {
+            Durability::Buffer => "buffer",
+            Durability::Fsync => "fsync",
+            Durability::Fdatasync => "fdatasync",
+        };
+        f.write_str(name)
     }
 }

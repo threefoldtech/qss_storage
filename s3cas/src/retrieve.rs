@@ -7,6 +7,7 @@ use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::metrics::SharedMetrics;
+use crate::store_options::StoreOptions;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
 use cas_storage::RangeRequest;
@@ -14,18 +15,21 @@ use cas_storage::StorageEngine;
 
 #[derive(Parser, Debug)]
 pub struct RetrieveConfig {
+    #[arg(
+        long,
+        help = "Path to qss_storage.toml (default: ./qss_storage.toml, then \
+                /etc/qss_storage/qss_storage.toml)"
+    )]
+    pub config: Option<PathBuf>,
+
     #[arg(long, default_value = ".")]
     pub meta_root: PathBuf,
 
     #[arg(long, default_value = ".")]
     pub fs_root: PathBuf,
 
-    #[arg(
-        long,
-        default_value = "fjall",
-        help = "Metadata DB  (fjall, fjall_notx)"
-    )]
-    pub metadata_db: StorageEngine,
+    #[arg(long, help = "Metadata DB  (fjall, fjall_notx); default fjall")]
+    pub metadata_db: Option<StorageEngine>,
 
     #[arg(required = true, help = "Bucket name")]
     pub bucket: String,
@@ -37,19 +41,20 @@ pub struct RetrieveConfig {
     pub dest: String,
 }
 
+/// `store` is the merge of this command's flags with the config file; see
+/// [`StoreOptions`].
 #[tokio::main]
-pub async fn retrieve(args: RetrieveConfig) -> Result<()> {
-    let storage_engine = args.metadata_db;
+pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
     let metrics = SharedMetrics::new();
     let casfs = CasFS::single_namespace(
         args.fs_root.clone(),
         args.meta_root.clone(),
         metrics.to_cas(),
-        storage_engine,
-        None,
-        None,
-        None,
-        false, // verify_on_read
+        store.metadata_db,
+        store.inline_metadata_size,
+        Some(store.durability),
+        Some(store.header_spec()),
+        store.verify_on_read,
     )?;
 
     let (obj_meta, paths) = match casfs.get_object_paths(&args.bucket, &args.key)? {
