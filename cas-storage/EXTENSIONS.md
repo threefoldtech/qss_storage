@@ -1,25 +1,21 @@
-# cas-storage extensions (tfstor fork)
+# cas-storage provenance and change record
+
+> **Ownership decision (2026-07-30):** qss_storage is now the primary home
+> of this code. The upstream (`threefoldtech/s3-cas`) and the older
+> lineages it descends from are considered obsolete; there is no plan to
+> rebase on upstream or to upstream changes back. This directory is owned
+> code and may be refactored freely. The `tfstor-extension` markers and
+> the sections below are retained as a historical record of how this tree
+> diverged from the vendored snapshot, not as a rebase manual. A broader
+> renaming pass (tfstor -> qss) is planned separately.
 
 > Naming note: `tfstor` is the former name of this repository (renamed to
-> `qss_storage` in 2026-07). The `tfstor-extension` markers keep the old
-> name deliberately -- renaming them would create churn against upstream
-> for no functional gain.
+> `qss_storage` in 2026-07).
 
-This `cas-storage/` was vendored from
-`https://github.com/threefoldtech/s3-cas` at commit **`b28eac0`** (2026-05).
-
-The tfstor workspace ships a small extension to the upstream trait surface,
-needed by the `respd` Redis-protocol frontend that lives alongside `s3cas`
-in this repo. Everything else is byte-identical to the upstream snapshot.
-
-If you're rebasing on a newer upstream:
-
-1. Replace this directory with the new upstream snapshot.
-2. Re-apply the additions listed below (each block is marked with
-   `// ---- tfstor-extension: BEGIN/END ----`).
-3. Run `cargo test -p cas-storage -p respd -p s3cas`.
-
-The end goal is to upstream these so the fork can dissolve.
+This `cas-storage/` was originally vendored from
+`https://github.com/threefoldtech/s3-cas` at commit **`b28eac0`** (2026-05),
+then extended for the `respd` Redis-protocol frontend and subsequently
+fixed and refactored in place (see "What was fixed" below).
 
 ## What was added
 
@@ -126,9 +122,10 @@ handling, and write-path locking semantics. They share their range
 plumbing with the existing `iter_all` (which is now a one-line wrapper
 around `iter_kv(None)`).
 
-## Upstreaming sketch
+## Upstreaming sketch (historical -- moot per the 2026-07-30 ownership decision)
 
-A PR to threefoldtech/s3-cas would:
+Kept for the record only; no upstream PRs are planned. A PR to
+threefoldtech/s3-cas would have:
 
 1. Add `fn iter_kv(Option<Vec<u8>>)` and `fn iter_kv_backward(Option<Vec<u8>>)`
    to `MetaTreeExt`, document them, and adjust `iter_all` to be a default

@@ -142,7 +142,14 @@ impl Session {
                 }
             }
 
-            let consumed = self.serve_buffered_frames(&buffer).await;
+            let consumed = match self.serve_buffered_frames(&buffer).await {
+                Ok(consumed) => consumed,
+                // The client is unreachable (encode or socket write failed, and
+                // the error is already logged); nothing further can be
+                // delivered, so drop the connection instead of reading more
+                // commands whose replies would be lost.
+                Err(WriteFailed) => break,
+            };
 
             // Remove processed data using split_to which is zero-copy
             if consumed > 0 {
@@ -155,9 +162,10 @@ impl Session {
     }
 
     /// Answer every complete frame sitting in `buffer`, returning how many
-    /// bytes were consumed. Stops early on a partial frame, a malformed frame,
-    /// or a failed write.
-    async fn serve_buffered_frames(&mut self, buffer: &[u8]) -> usize {
+    /// bytes were consumed. Stops early on a partial frame or a malformed
+    /// frame; a failed write is fatal for the session and returned as an
+    /// error so the caller drops the connection.
+    async fn serve_buffered_frames(&mut self, buffer: &[u8]) -> Result<usize, WriteFailed> {
         let mut pos = 0;
 
         while pos < buffer.len() {
@@ -168,9 +176,7 @@ impl Session {
                     pos += len;
 
                     let response = self.dispatch(frame).await;
-                    if self.write_response(&response).await.is_err() {
-                        break;
-                    }
+                    self.write_response(&response).await?;
                 }
                 Ok(None) => break, // Need more data
                 Err(e) => {
@@ -180,7 +186,7 @@ impl Session {
             }
         }
 
-        pos
+        Ok(pos)
     }
 
     /// Route one frame to its handler.
