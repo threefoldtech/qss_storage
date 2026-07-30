@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 
-use super::{BLOCKID_SIZE, BlockID, CONTENT_HASH_SIZE, ContentHash, FsError, PTR_SIZE};
+use super::{BLOCKID_SIZE, BlockId, CONTENT_HASH_SIZE, ContentHash, FsError, PTR_SIZE};
 
 /// Represents an object in the storage system with its metadata and content (for Inline objects).
 ///
@@ -51,7 +51,7 @@ pub enum ObjectData {
     /// Used for regular objects that are uploaded in a single operation.
     SinglePart {
         /// References to the data blocks that make up the object
-        blocks: Vec<BlockID>,
+        blocks: Vec<BlockId>,
     },
 
     /// The object is a multipart object, with blocks stored separately.
@@ -60,7 +60,7 @@ pub enum ObjectData {
     /// large objects or when resumable uploads are needed.
     MultiPart {
         /// References to the data blocks that make up the object
-        blocks: Vec<BlockID>,
+        blocks: Vec<BlockId>,
         /// The number of parts uploaded for this object
         /// Required for proper ETag calculation and verification
         parts: usize,
@@ -182,8 +182,8 @@ impl Object {
     /// For inline objects, this returns an empty slice.
     ///
     /// # Returns
-    /// A slice of BlockIDs
-    pub fn blocks(&self) -> &[BlockID] {
+    /// A slice of block ids
+    pub fn blocks(&self) -> &[BlockId] {
         match &self.data {
             ObjectData::SinglePart { blocks } => blocks,
             ObjectData::MultiPart { blocks, .. } => blocks,
@@ -198,7 +198,7 @@ impl Object {
     ///
     /// # Returns
     /// `true` if the object contains the block, `false` otherwise
-    pub fn has_block(&self, block: &BlockID) -> bool {
+    pub fn has_block(&self, block: &BlockId) -> bool {
         match &self.data {
             ObjectData::SinglePart { blocks } => blocks.contains(block),
             ObjectData::MultiPart { blocks, .. } => blocks.contains(block),
@@ -304,7 +304,7 @@ impl From<&Object> for Vec<u8> {
                 raw_data.extend_from_slice(&blocks.len().to_le_bytes());
                 blocks
                     .iter()
-                    .for_each(|block| raw_data.extend_from_slice(block));
+                    .for_each(|block| raw_data.extend_from_slice(block.as_slice()));
 
                 // Write parts count for MultiPart only
                 if let ObjectData::MultiPart { parts, .. } = &o.data {
@@ -406,9 +406,12 @@ impl TryFrom<&[u8]> for Object {
                 let mut blocks = Vec::with_capacity(block_len);
 
                 // blocks: BLOCKID_SIZE * block_len bytes
+                // blocks are stored at BLOCKID_SIZE each; the record does not
+                // yet describe its own id width (that arrives with the v1
+                // record format), so the width is the one the store writes.
                 for chunk in value[pos..pos + (BLOCKID_SIZE * block_len)].chunks_exact(BLOCKID_SIZE)
                 {
-                    blocks.push(chunk.try_into().unwrap());
+                    blocks.push(BlockId::from_slice(chunk)?);
                 }
                 pos += BLOCKID_SIZE * block_len;
 
@@ -458,7 +461,10 @@ mod tests {
                     1024,
                     ContentHash([1; CONTENT_HASH_SIZE]),
                     ObjectData::SinglePart {
-                        blocks: vec![[2; BLOCKID_SIZE], [3; BLOCKID_SIZE]],
+                        blocks: vec![
+                            BlockId::from([2; BLOCKID_SIZE]),
+                            BlockId::from([3; BLOCKID_SIZE]),
+                        ],
                     },
                 ),
             ),
@@ -468,7 +474,10 @@ mod tests {
                     2048,
                     ContentHash([4; CONTENT_HASH_SIZE]),
                     ObjectData::MultiPart {
-                        blocks: vec![[5; BLOCKID_SIZE], [6; BLOCKID_SIZE]],
+                        blocks: vec![
+                            BlockId::from([5; BLOCKID_SIZE]),
+                            BlockId::from([6; BLOCKID_SIZE]),
+                        ],
                         parts: 2,
                     },
                 ),

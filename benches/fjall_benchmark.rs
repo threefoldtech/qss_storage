@@ -6,7 +6,7 @@
 //! scenario below measures the backend and nothing else.
 
 use cas_storage::{
-    Block, BlockID, BucketMeta, ContentHash, FjallStore, FjallStoreNotx, MetaStore, Object,
+    Block, BlockId, BucketMeta, ContentHash, FjallStore, FjallStoreNotx, MetaStore, Object,
     ObjectData,
 };
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -66,17 +66,17 @@ fn create_test_object(size: usize) -> Vec<u8> {
 }
 
 // Helper to create a block ID
-fn create_block_id(id: u8) -> BlockID {
+fn create_block_id(id: u8) -> BlockId {
     let mut block_id = [0u8; 16];
     block_id[0] = id;
-    block_id
+    BlockId::from(block_id)
 }
 
 // Helper to create a test block
-fn create_test_block(id: u8, size: usize) -> (BlockID, Vec<u8>) {
+fn create_test_block(id: u8, size: usize) -> (BlockId, Vec<u8>) {
     let block_id = create_block_id(id);
     // Create path from block_id
-    let path = block_id.to_vec();
+    let path = block_id.as_slice().to_vec();
     let block = Block::new(size, path);
     (block_id, block.to_vec())
 }

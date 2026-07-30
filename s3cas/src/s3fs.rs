@@ -28,7 +28,7 @@ use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 
 use crate::metrics::SharedMetrics;
-use cas_storage::{BlockID, ContentHash, MultiPart, ObjectData};
+use cas_storage::{BlockId, ContentHash, MultiPart, ObjectData};
 use cas_storage::{BlockStream, CasFS, parse_range_request};
 
 const MAX_KEYS: i32 = 1000;
@@ -136,7 +136,7 @@ impl S3 for S3FS {
         }
 
         let (content_hash, size) = calculate_multipart_hash(&parts);
-        let blocks: Vec<BlockID> = parts
+        let blocks: Vec<BlockId> = parts
             .iter()
             .flat_map(|mp| mp.blocks().iter().copied())
             .collect();

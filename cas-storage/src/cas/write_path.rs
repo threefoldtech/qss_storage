@@ -4,9 +4,8 @@ use std::sync::Arc;
 use super::buffered_byte_stream::BufferedByteStream;
 use super::byte_stream::AsyncByteStream;
 use super::fs::CasFS;
-use crate::metastore::{BlockID, ContentHash, MetaError, Object, ObjectData};
+use crate::metastore::{BlockId, ContentHash, MetaError, Object, ObjectData};
 use crate::metrics::SharedMetrics;
-use faster_hex::hex_string;
 use futures::{
     channel::mpsc::unbounded,
     sink::SinkExt,
@@ -75,7 +74,7 @@ pub(super) async fn store_object(
     bucket_name: &str,
     key: &str,
     data: AsyncByteStream,
-) -> io::Result<(Vec<BlockID>, ContentHash, u64)> {
+) -> io::Result<(Vec<BlockId>, ContentHash, u64)> {
     let old_obj_meta = match fs.get_object_meta(bucket_name, key) {
         Ok(Some(obj_meta)) => Some(obj_meta),
         _ => None,
@@ -116,7 +115,7 @@ pub(super) async fn store_object(
             let bytes: Vec<u8> = maybe_chunk.unwrap();
             let mut hasher = Md5::new();
             hasher.update(&bytes);
-            let block_hash: BlockID = hasher.finalize().into();
+            let block_hash = BlockId::from(<[u8; 16]>::from(hasher.finalize()));
             let data_len = bytes.len();
 
             // check if this key already has this block
@@ -187,10 +186,10 @@ pub(super) async fn store_object(
                 // We accept potential data leakage here if this cleanup fails,
                 // as per the design principles (leakage is better than data loss).
                 let tree = fs.shared.block_tree();
-                if let Err(e) = tree.remove(&block_hash) {
-                    tracing::warn!(block = %hex_string(&block_hash), error = %e, "Failed to cleanup orphan block metadata");
+                if let Err(e) = tree.remove(block_hash.as_slice()) {
+                    tracing::warn!(block = %block_hash.to_hex(), error = %e, "Failed to cleanup orphan block metadata");
                 } else {
-                    tracing::debug!(block = %hex_string(&block_hash), "Cleaned up orphan block metadata");
+                    tracing::debug!(block = %block_hash.to_hex(), "Cleaned up orphan block metadata");
                 }
             };
 
@@ -220,11 +219,11 @@ pub(super) async fn store_object(
     )
     .await;
 
-    let mut ids = rx.try_collect::<Vec<(usize, BlockID)>>().await?;
+    let mut ids = rx.try_collect::<Vec<(usize, BlockId)>>().await?;
     // Make sure the chunks are in the proper order
     ids.sort_by_key(|a| a.0);
 
-    let blocks: Vec<BlockID> = ids.into_iter().map(|(_, id)| id).collect();
+    let blocks: Vec<BlockId> = ids.into_iter().map(|(_, id)| id).collect();
 
     tracing::Span::current().record("size", size);
     tracing::Span::current().record("blocks", blocks.len());

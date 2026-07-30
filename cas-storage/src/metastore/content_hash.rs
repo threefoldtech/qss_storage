@@ -9,7 +9,7 @@ pub const CONTENT_HASH_SIZE: usize = 16;
 /// MD5 digest of an object's (or multipart part's) full content -- the source
 /// of the S3 ETag.
 ///
-/// This is never a block address. Block addressing uses `BlockID`; mixing the
+/// This is never a block address. Block addressing uses `BlockId`; mixing the
 /// two silently corrupts either the ETag a client sees or the location a block
 /// is read from, which is why they are distinct types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

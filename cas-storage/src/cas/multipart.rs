@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::metastore::{
-    BLOCKID_SIZE, BaseMetaTree, BlockID, CONTENT_HASH_SIZE, ContentHash, FsError, MetaError,
+    BLOCKID_SIZE, BaseMetaTree, BlockId, CONTENT_HASH_SIZE, ContentHash, FsError, MetaError,
     PTR_SIZE,
 };
 
@@ -16,7 +16,7 @@ pub struct MultiPart {
     key: String,
     upload_id: String,
     hash: ContentHash,
-    blocks: Vec<BlockID>,
+    blocks: Vec<BlockId>,
 }
 
 impl MultiPart {
@@ -27,7 +27,7 @@ impl MultiPart {
         key: String,
         upload_id: String,
         hash: ContentHash,
-        blocks: Vec<BlockID>,
+        blocks: Vec<BlockId>,
     ) -> Self {
         Self {
             size,
@@ -40,7 +40,7 @@ impl MultiPart {
         }
     }
 
-    pub fn blocks(&self) -> &[BlockID] {
+    pub fn blocks(&self) -> &[BlockId] {
         &self.blocks
     }
 
@@ -83,7 +83,7 @@ impl From<&MultiPart> for Vec<u8> {
         out.extend_from_slice(mp.hash.as_slice());
         out.extend_from_slice(&mp.blocks.len().to_le_bytes());
         for block in &mp.blocks {
-            out.extend_from_slice(block);
+            out.extend_from_slice(block.as_slice());
         }
 
         out
@@ -202,7 +202,7 @@ impl TryFrom<&[u8]> for MultiPart {
             [8 + 5 * PTR_SIZE + bucket_len + key_len + upload_id_len + CONTENT_HASH_SIZE..]
             .chunks_exact(BLOCKID_SIZE)
         {
-            blocks.push(chunk.try_into().unwrap());
+            blocks.push(BlockId::from_slice(chunk)?);
         }
 
         Ok(MultiPart {

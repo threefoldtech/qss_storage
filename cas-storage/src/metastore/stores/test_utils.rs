@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::metastore::{
-    BaseMetaTree, BlockID, ContentHash, MetaError, MetaTreeExt, Object, ObjectData,
+    BaseMetaTree, BlockId, ContentHash, MetaError, MetaTreeExt, Object, ObjectData,
 };
 
 pub trait TestStore {
@@ -86,7 +86,7 @@ pub fn test_num_keys(store: &impl TestStore) {
             1024,
             ContentHash::from([1; 16]),
             ObjectData::SinglePart {
-                blocks: vec![BlockID::from([1; 16])],
+                blocks: vec![BlockId::from([1; 16])],
             },
         );
         bucket.insert(key.as_bytes(), obj.to_vec()).unwrap();
@@ -112,7 +112,7 @@ pub fn test_get_bucket_keys(store: &impl TestStore) {
             1024,
             ContentHash::from([1; 16]),
             ObjectData::SinglePart {
-                blocks: vec![BlockID::from([1; 16])],
+                blocks: vec![BlockId::from([1; 16])],
             },
         );
         bucket.insert(key.as_bytes(), obj.to_vec()).unwrap();
@@ -158,7 +158,7 @@ pub fn test_range_filter(store: &impl TestStore) {
             data.len() as u64,
             ContentHash::from([1; 16]),
             ObjectData::SinglePart {
-                blocks: vec![BlockID::from([1; 16])],
+                blocks: vec![BlockId::from([1; 16])],
             },
         );
         bucket.insert(key.as_bytes(), obj.to_vec()).unwrap();

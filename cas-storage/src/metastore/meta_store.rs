@@ -2,9 +2,7 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use super::{
-    BLOCKID_SIZE, BaseMetaTree, Block, BlockID, BucketMeta, MetaError, MetaTreeExt, Object, Store,
-};
+use super::{BaseMetaTree, Block, BlockId, BucketMeta, MetaError, MetaTreeExt, Object, Store};
 
 /// `MetaStore` is a struct that provides methods to interact with the metadata store.
 ///
@@ -298,18 +296,18 @@ impl MetaStore {
 
         // Process all blocks in the object
         for block_id in obj.blocks() {
-            match block_tree.get(block_id)? {
+            match block_tree.get(block_id.as_slice())? {
                 Some(block_data) => {
                     let mut block = Block::try_from(&*block_data)?;
 
                     // If this is the last reference to the block, delete it
                     if block.rc() == 1 {
                         tracing::debug!(
-                            block_hash = %hex::encode(block_id),
+                            block_hash = %block_id.to_hex(),
                             rc = block.rc(),
                             "Block rc==1: deleting block and marking for file deletion"
                         );
-                        block_tree.remove(block_id)?;
+                        block_tree.remove(block_id.as_slice())?;
                         to_delete.push(block);
                     } else {
                         // Otherwise decrement the reference count
@@ -317,17 +315,17 @@ impl MetaStore {
                         block.decrement_refcount();
                         let new_rc = block.rc();
                         tracing::debug!(
-                            block_hash = %hex::encode(block_id),
+                            block_hash = %block_id.to_hex(),
                             old_rc = old_rc,
                             new_rc = new_rc,
                             "Block rc>1: decrementing refcount"
                         );
-                        block_tree.insert(block_id, block.to_vec())?;
+                        block_tree.insert(block_id.as_slice(), block.to_vec())?;
                     }
                 }
                 None => {
                     tracing::warn!(
-                        block_hash = %hex::encode(block_id),
+                        block_hash = %block_id.to_hex(),
                         "Block not found in tree during deletion"
                     );
                     continue; // Block not found, skip it
@@ -476,20 +474,15 @@ impl BlockTree {
     /// Returns an iterator over all blocks in the tree.
     ///
     /// # Returns
-    /// An iterator yielding (BlockID, Block) tuples
-    pub fn iter_all(&self) -> Box<dyn Iterator<Item = Result<(BlockID, Block), MetaError>> + '_> {
-        use crate::metastore::block::BLOCKID_SIZE;
-
+    /// An iterator yielding (BlockId, Block) tuples
+    pub fn iter_all(&self) -> Box<dyn Iterator<Item = Result<(BlockId, Block), MetaError>> + '_> {
         Box::new(self.tree.iter_all().map(|result| match result {
             Ok((key, value)) => {
-                // Parse the block ID from the key
-                let block_id: BlockID = if key.len() >= BLOCKID_SIZE {
-                    let mut id = [0u8; BLOCKID_SIZE];
-                    id.copy_from_slice(&key[..BLOCKID_SIZE]);
-                    id
-                } else {
-                    return Err(MetaError::OtherDBError("Malformed block key".to_string()));
-                };
+                // The key *is* the block address, at whatever width the store
+                // wrote it (16 or 32 bytes); anything else is a foreign key in
+                // the block tree.
+                let block_id = BlockId::from_slice(&key)
+                    .map_err(|e| MetaError::OtherDBError(format!("Malformed block key: {e}")))?;
                 // Deserialize the block
                 Block::try_from(&*value)
                     .map(|block| (block_id, block))
@@ -553,12 +546,15 @@ impl Transaction {
     /// * The Block object
     pub fn write_block(
         &mut self,
-        block_hash: BlockID,
+        block_hash: BlockId,
         data_len: usize,
         key_has_block: bool,
     ) -> Result<(bool, Block), MetaError> {
         // Check if the block already exists
-        match self.backend.get(DEFAULT_BLOCK_TREE, &block_hash)? {
+        match self
+            .backend
+            .get(DEFAULT_BLOCK_TREE, block_hash.as_slice())?
+        {
             // Block exists
             Some(block_data) => {
                 let mut block = Block::try_from(&*block_data as &[u8])?;
@@ -569,17 +565,20 @@ impl Transaction {
                     block.increment_refcount();
                     let new_rc = block.rc();
                     tracing::debug!(
-                        block_hash = %hex::encode(block_hash),
+                        block_hash = %block_hash.to_hex(),
                         old_rc = old_rc,
                         new_rc = new_rc,
                         key_has_block = key_has_block,
                         "Block exists: incrementing refcount"
                     );
-                    self.backend
-                        .insert(DEFAULT_BLOCK_TREE, &block_hash, block.to_vec())?;
+                    self.backend.insert(
+                        DEFAULT_BLOCK_TREE,
+                        block_hash.as_slice(),
+                        block.to_vec(),
+                    )?;
                 } else {
                     tracing::debug!(
-                        block_hash = %hex::encode(block_hash),
+                        block_hash = %block_hash.to_hex(),
                         rc = block.rc(),
                         key_has_block = key_has_block,
                         "Block exists: NOT incrementing (key already has it)"
@@ -590,10 +589,28 @@ impl Transaction {
             }
             // Block doesn't exist, create it
             None => {
+                // Find the shortest prefix of the hash that is not already
+                // claimed by a different block; that prefix becomes this
+                // block's on-disk path. The full-width prefix is part of the
+                // search (it was not, which is how prefix exhaustion used to
+                // leave idx at 0 and write an empty path that later panicked
+                // in Block::disk_path).
+                let width = block_hash.len();
                 let mut idx = 0;
-                for index in 1..BLOCKID_SIZE {
-                    match self.backend.get(DEFAULT_PATH_TREE, &block_hash[..index]) {
-                        Ok(Some(_)) => continue,
+                for index in 1..=width {
+                    match self
+                        .backend
+                        .get(DEFAULT_PATH_TREE, &block_hash.as_slice()[..index])
+                    {
+                        Ok(Some(existing)) => {
+                            // The full-width key can only be held by this very
+                            // hash, since a path entry stores the hash that
+                            // owns it. Then the path is already ours to use.
+                            if index == width && existing == block_hash.as_slice() {
+                                idx = index;
+                            }
+                            continue;
+                        }
                         Ok(None) => {
                             idx = index;
                             break;
@@ -602,15 +619,29 @@ impl Transaction {
                     }
                 }
 
+                if idx == 0 {
+                    // Every prefix up to and including the full hash is taken
+                    // by another hash. For a real hash this cannot happen: the
+                    // full-width prefix is the hash itself, so a different hash
+                    // holding it would be a hash collision. Refuse rather than
+                    // write a zero-length path.
+                    return Err(MetaError::OtherDBError(format!(
+                        "path tree exhausted for block {}: every prefix is taken by another hash",
+                        block_hash.to_hex()
+                    )));
+                }
+
+                let path = block_hash.as_slice()[..idx].to_vec();
+
                 // insert this new path
                 self.backend
-                    .insert(DEFAULT_PATH_TREE, &block_hash[..idx], block_hash.to_vec())?;
+                    .insert(DEFAULT_PATH_TREE, &path, block_hash.as_slice().to_vec())?;
 
                 // insert this new block
-                let block = Block::new(data_len, block_hash[..idx].to_vec());
+                let block = Block::new(data_len, path);
 
                 tracing::debug!(
-                    block_hash = %hex::encode(block_hash),
+                    block_hash = %block_hash.to_hex(),
                     rc = block.rc(),
                     data_len = data_len,
                     key_has_block = key_has_block,
@@ -618,7 +649,7 @@ impl Transaction {
                 );
 
                 self.backend
-                    .insert(DEFAULT_BLOCK_TREE, &block_hash, block.to_vec())?;
+                    .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())?;
 
                 Ok((true, block))
             }
@@ -660,4 +691,93 @@ pub(crate) trait TransactionBackend: Send + Sync {
     /// # Returns
     /// Success or an error if the insertion fails
     fn insert(&mut self, tree_name: &str, key: &[u8], data: Vec<u8>) -> Result<(), MetaError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metastore::{BLOCKID_SIZE, FjallStore};
+    use tempfile::{TempDir, tempdir};
+
+    fn test_store() -> (MetaStore, TempDir) {
+        let dir = tempdir().unwrap();
+        let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None);
+        (MetaStore::new(store, None), dir)
+    }
+
+    /// Claims every prefix of `hash` of length `1..=upto` in the path tree for
+    /// a *different* block, which is what a run of unlucky collisions would
+    /// leave behind.
+    fn claim_prefixes(meta: &MetaStore, hash: &BlockId, upto: usize) {
+        let path_tree = meta.get_path_tree().unwrap();
+        let squatter = BlockId::from([0xffu8; BLOCKID_SIZE]);
+        for index in 1..=upto {
+            path_tree
+                .insert(&hash.as_slice()[..index], squatter.as_slice().to_vec())
+                .unwrap();
+        }
+    }
+
+    /// Regression: with every prefix shorter than the full hash taken, the
+    /// block used to be written with a zero-length path, which then panicked
+    /// in `Block::disk_path`. It must fall back to the full-width path.
+    #[test]
+    fn write_block_falls_back_to_full_width_path() {
+        let (meta, dir) = test_store();
+        let hash = BlockId::from([0xaau8; BLOCKID_SIZE]);
+        claim_prefixes(&meta, &hash, BLOCKID_SIZE - 1);
+
+        let mut tx = meta.begin_transaction();
+        let (new, block) = tx.write_block(hash, 42, false).unwrap();
+        tx.commit().unwrap();
+
+        assert!(new);
+        assert!(!block.path().is_empty(), "block path must never be empty");
+        assert_eq!(block.path(), hash.as_slice());
+        // The path is usable: this panics on an empty path.
+        let _ = block.disk_path(dir.path().to_path_buf());
+    }
+
+    /// If even the full-width key is held by a different hash -- impossible for
+    /// a real hash, since that key *is* the hash -- writing must fail loudly
+    /// instead of storing an empty path.
+    #[test]
+    fn write_block_refuses_when_every_prefix_is_taken() {
+        let (meta, _dir) = test_store();
+        let hash = BlockId::from([0xaau8; BLOCKID_SIZE]);
+        claim_prefixes(&meta, &hash, BLOCKID_SIZE);
+
+        let mut tx = meta.begin_transaction();
+        let err = tx.write_block(hash, 42, false).unwrap_err();
+        tx.rollback();
+
+        match err {
+            MetaError::OtherDBError(msg) => assert!(
+                msg.contains("path tree exhausted"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The ordinary case: a fresh hash takes the one-byte prefix, and a second
+    /// hash sharing that first byte takes the two-byte prefix.
+    #[test]
+    fn write_block_uses_shortest_free_prefix() {
+        let (meta, _dir) = test_store();
+        let first = BlockId::from([0x11u8; BLOCKID_SIZE]);
+        let mut second_bytes = [0x11u8; BLOCKID_SIZE];
+        second_bytes[1] = 0x22;
+        let second = BlockId::from(second_bytes);
+
+        let mut tx = meta.begin_transaction();
+        let (_, first_block) = tx.write_block(first, 1, false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(first_block.path(), &[0x11]);
+
+        let mut tx = meta.begin_transaction();
+        let (_, second_block) = tx.write_block(second, 1, false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(second_block.path(), &[0x11, 0x22]);
+    }
 }

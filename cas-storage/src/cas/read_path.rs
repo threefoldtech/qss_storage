@@ -27,7 +27,7 @@ pub(super) fn get_object_paths(
     let mut paths = Vec::with_capacity(blocks.len());
     for block in blocks {
         let block_meta = block_map
-            .get_block(block)?
+            .get_block(block.as_slice())?
             .ok_or(MetaError::BlockNotFound)?;
         paths.push((
             block_meta.disk_path(fs.fs_root().clone()),

@@ -8,7 +8,7 @@ use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
-    BaseMetaTree, BlockID, BlockTree, BucketMeta, ContentHash, Durability, FjallStore,
+    BaseMetaTree, BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore,
     FjallStoreNotx, MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
@@ -214,7 +214,7 @@ impl CasFS {
         part_number: i64,
         upload_id: String,
         hash: ContentHash,
-        blocks: Vec<BlockID>,
+        blocks: Vec<BlockId>,
     ) -> Result<(), MetaError> {
         let mp_map = self.shared.multipart_tree();
         let storage_key = self.part_key(&bucket, &key, &upload_id, part_number);
@@ -310,7 +310,7 @@ impl CasFS {
         bucket_name: &str,
         key: &str,
         data: AsyncByteStream,
-    ) -> io::Result<(Vec<BlockID>, ContentHash, u64)> {
+    ) -> io::Result<(Vec<BlockId>, ContentHash, u64)> {
         super::write_path::store_object(self, bucket_name, key, data).await
     }
 
@@ -471,7 +471,10 @@ mod tests {
         // Verify block & path was stored
         let block_tree = fs.shared.block_tree();
         assert!(block_tree.len().unwrap() > 0);
-        let stored_block = block_tree.get_block(&obj.blocks()[0]).unwrap().unwrap();
+        let stored_block = block_tree
+            .get_block(obj.blocks()[0].as_slice())
+            .unwrap()
+            .unwrap();
         assert_eq!(stored_block.size(), test_data_len);
         assert_eq!(stored_block.rc(), 1);
         assert!(
@@ -497,7 +500,10 @@ mod tests {
 
         assert_eq!(new_obj.blocks(), obj.blocks());
 
-        let stored_block = block_tree.get_block(&new_obj.blocks()[0]).unwrap().unwrap();
+        let stored_block = block_tree
+            .get_block(new_obj.blocks()[0].as_slice())
+            .unwrap()
+            .unwrap();
         assert_eq!(stored_block.rc(), 2);
     }
 
@@ -587,7 +593,7 @@ mod tests {
         // Initial refcount must be 1
         let block_tree = fs.shared.block_tree();
         for id in obj.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
         }
 
@@ -607,7 +613,10 @@ mod tests {
 
             assert_eq!(new_obj.blocks(), obj.blocks());
 
-            let stored_block = block_tree.get_block(&new_obj.blocks()[0]).unwrap().unwrap();
+            let stored_block = block_tree
+                .get_block(new_obj.blocks()[0].as_slice())
+                .unwrap()
+                .unwrap();
             assert_eq!(stored_block.rc(), 1);
         }
         {
@@ -625,7 +634,10 @@ mod tests {
 
             assert_eq!(new_obj.blocks(), obj.blocks());
 
-            let stored_block = block_tree.get_block(&new_obj.blocks()[0]).unwrap().unwrap();
+            let stored_block = block_tree
+                .get_block(new_obj.blocks()[0].as_slice())
+                .unwrap()
+                .unwrap();
             assert_eq!(stored_block.rc(), 2);
         }
     }
@@ -667,7 +679,7 @@ mod tests {
         let block_tree = fs.shared.block_tree();
         let mut stored_paths = Vec::new();
         for id in obj.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert!(fs.path_tree().unwrap().contains_key(block.path()).unwrap());
             stored_paths.push(block.path().to_vec());
         }
@@ -682,7 +694,7 @@ mod tests {
         // Verify blocks were cleaned up
         let block_tree = fs.shared.block_tree();
         for id in obj.blocks() {
-            assert!(block_tree.get_block(id).unwrap().is_none());
+            assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
         }
         // Verify paths were cleaned up
         for path in stored_paths {
@@ -729,7 +741,7 @@ mod tests {
         // Verify blocks  exist with rc=1
         let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
         }
 
@@ -749,7 +761,7 @@ mod tests {
         // Verify blocks  exist with rc=2
         let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 2);
         }
 
@@ -759,7 +771,7 @@ mod tests {
         // Verify blocks still exist
         let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
         }
 
@@ -768,7 +780,7 @@ mod tests {
 
         // Verify blocks are gone
         for id in obj1.blocks() {
-            assert!(block_tree.get_block(id).unwrap().is_none());
+            assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
         }
     }
 
@@ -808,7 +820,7 @@ mod tests {
         // Verify blocks  exist with rc=1
         let block_tree = fs.shared.block_tree();
         for id in obj1.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
         }
 
@@ -828,7 +840,7 @@ mod tests {
         // Verify blocks  exist with rc=1
         let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
-            let block = block_tree.get_block(id).unwrap().unwrap();
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
             assert_eq!(block.rc(), 1);
         }
 
@@ -837,7 +849,7 @@ mod tests {
 
         // Verify blocks are gone
         for id in obj1.blocks() {
-            assert!(block_tree.get_block(id).unwrap().is_none());
+            assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
         }
     }
 }

@@ -8,7 +8,7 @@ mod object;
 mod stores;
 mod traits;
 
-pub use block::{BLOCKID_SIZE, Block, BlockID};
+pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE};
 pub use bucket_meta::BucketMeta;
 pub use constants::*;
 pub use content_hash::{CONTENT_HASH_SIZE, ContentHash};

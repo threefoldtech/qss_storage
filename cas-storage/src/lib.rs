@@ -72,7 +72,7 @@ pub use metastore::{
     BaseMetaTree,
     // Metadata structures
     Block,
-    BlockID,
+    BlockId,
     BlockTree,
     BucketMeta,
     ContentHash,
