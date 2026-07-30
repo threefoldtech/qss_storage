@@ -38,7 +38,7 @@ status. Commits are on `development`.
 | H10 truncating casts | Open | -- |
 | H11 module style | Open (cosmetic) | -- |
 | H12 Durability naming | Open -- needs decision | -- |
-| B1 duplicated backends | Open -- needs decision (upstream PR vs accept) | -- |
+| B1 duplicated backends | **Fixed** -- shared half extracted to `stores/fjall_common.rs`, generic over a `FjallFlavor` trait; the two stores are aliases of it with unchanged public API. The rebase argument is moot per the ownership decision at the top of `cas-storage/EXTENSIONS.md` | `541cc5d` |
 | B2 oversized functions | **Fixed** -- `from_frame` 388 -> 47-line dispatch table with per-command parsers; `process` -> 10-line delegate to `Session` | `721b53a`, `cfb271b` |
 | B3 edition split / toolchain | **Fixed** -- workspace on edition 2024, toolchain pinned 1.97 | `e4a795b`, `0777c36` |
 | B4 pedantic backlog | Open | -- |
