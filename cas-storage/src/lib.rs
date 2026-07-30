@@ -63,8 +63,12 @@
 //! ```
 
 pub mod cas;
+pub mod hasher;
 pub mod metastore;
 pub mod metrics;
+
+// Re-export the block hasher (used by both the cas and metastore layers)
+pub use hasher::{Hasher, HasherError};
 
 // Re-export main types from metastore
 pub use metastore::{
