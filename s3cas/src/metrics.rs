@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use prometheus::{
-    register_int_counter, register_int_counter_vec, register_int_gauge, IntCounter, IntCounterVec,
-    IntGauge,
+    IntCounter, IntCounterVec, IntGauge, register_int_counter, register_int_counter_vec,
+    register_int_gauge,
 };
-use s3s::dto::*;
 use s3s::S3;
+use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result};
 use std::{ops::Deref, sync::Arc};
 

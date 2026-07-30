@@ -11,10 +11,10 @@ use std::env;
 
 use aws_config::SdkConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 
 use aws_sdk_s3::types::BucketLocationConstraint;
 //use aws_sdk_s3::types::ChecksumMode;

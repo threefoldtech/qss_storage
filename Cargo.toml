@@ -8,7 +8,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2018"
+edition = "2024"
 authors = ["Lee Smet <lee.smet@hotmail.com>"]
 readme = "README.md"
 

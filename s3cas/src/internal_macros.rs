@@ -96,9 +96,7 @@ macro_rules! try_ {
 
 /// Create a `NotSupported` error
 macro_rules! not_supported {
-    ($msg:expr) => {{
-        code_error!(NotSupported, $msg)
-    }};
+    ($msg:expr) => {{ code_error!(NotSupported, $msg) }};
 }
 
 /// Create a `InvalidRequest` error

@@ -102,7 +102,7 @@ impl Command {
                     _ => {
                         return Err(CommandError::Protocol(
                             "Command name must be a bulk string".to_string(),
-                        ))
+                        ));
                     }
                 };
 
@@ -122,7 +122,7 @@ impl Command {
                                 _ => {
                                     return Err(CommandError::Protocol(
                                         "MGET key must be a bulk string".to_string(),
-                                    ))
+                                    ));
                                 }
                             };
                             keys.push(key);
@@ -143,7 +143,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "SELECT namespace must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -156,7 +156,7 @@ impl Command {
                                 _ => {
                                     return Err(CommandError::Protocol(
                                         "SELECT password must be a bulk string".to_string(),
-                                    ))
+                                    ));
                                 }
                             }
                         } else {
@@ -178,7 +178,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "NSNEW name must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -194,7 +194,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "NSINFO name must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -217,7 +217,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "NSSET namespace must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -226,7 +226,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "NSSET property must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -235,7 +235,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "NSSET value must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -255,7 +255,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "DEL key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -271,7 +271,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "EXISTS key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -287,7 +287,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "CHECK key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -302,7 +302,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "GET key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
                         Ok(Command::Get { key })
@@ -316,7 +316,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "SET key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
                         let value = match &array[2] {
@@ -324,7 +324,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "SET value must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
                         Ok(Command::Set { key, value })
@@ -338,7 +338,7 @@ impl Command {
                                 _ => {
                                     return Err(CommandError::Protocol(
                                         "PING message must be a bulk string".to_string(),
-                                    ))
+                                    ));
                                 }
                             }
                         } else {
@@ -356,7 +356,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "LENGTH key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -374,7 +374,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "KEYTIME key must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
 
@@ -390,7 +390,7 @@ impl Command {
                             _ => {
                                 return Err(CommandError::Protocol(
                                     "AUTH password must be a bulk string".to_string(),
-                                ))
+                                ));
                             }
                         };
                         Ok(Command::Auth { password })
@@ -419,7 +419,7 @@ impl Command {
                                 _ => {
                                     return Err(CommandError::Protocol(
                                         "SCAN cursor must be a bulk string".to_string(),
-                                    ))
+                                    ));
                                 }
                             }
                         } else {
@@ -446,7 +446,7 @@ impl Command {
                                 _ => {
                                     return Err(CommandError::Protocol(
                                         "RSCAN cursor must be a bulk string".to_string(),
-                                    ))
+                                    ));
                                 }
                             }
                         } else {

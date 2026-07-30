@@ -10,6 +10,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use cas_storage::AsyncByteStream;
+use s3s::S3;
+use s3s::S3Result;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
 use s3s::dto::{
@@ -23,13 +25,11 @@ use s3s::dto::{
     ListObjectsV2Output, PutObjectInput, PutObjectOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::s3_error;
-use s3s::S3Result;
-use s3s::S3;
 use s3s::{S3Request, S3Response};
 
 use crate::metrics::SharedMetrics;
-use cas_storage::{parse_range_request, BlockStream, CasFS};
 use cas_storage::{BlockID, ObjectData};
+use cas_storage::{BlockStream, CasFS, parse_range_request};
 
 const MAX_KEYS: i32 = 1000;
 
@@ -105,9 +105,10 @@ impl S3 for S3FS {
         let mut cnt: i32 = 0;
         for part in multipart_upload.parts.iter().flatten() {
             // validate part number
-            let part_number = try_!(part
-                .part_number
-                .ok_or_else(|| { io::Error::new(io::ErrorKind::NotFound, "Missing part_number") }));
+            let part_number =
+                try_!(part.part_number.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Missing part_number")
+                }));
             cnt = cnt.wrapping_add(1);
             if part_number != cnt {
                 try_!(Err(io::Error::other("InvalidPartOrder")));

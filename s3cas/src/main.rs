@@ -5,14 +5,14 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http_body_util::Full;
 use prometheus::Encoder;
-use tracing::{info, Level};
+use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use s3cas::cas::{CasFS, StorageEngine};
-use s3cas::check::{check_integrity, CheckConfig};
+use s3cas::check::{CheckConfig, check_integrity};
 use s3cas::inspect::{disk_space, num_keys};
 use s3cas::metastore::Durability;
-use s3cas::retrieve::{retrieve, RetrieveConfig};
+use s3cas::retrieve::{RetrieveConfig, retrieve};
 
 #[derive(Parser)]
 #[command(version)]
