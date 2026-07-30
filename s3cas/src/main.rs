@@ -14,7 +14,7 @@ use cas_storage::config::{
 };
 use s3cas::cas::{CasFS, StorageEngine};
 use s3cas::check::{CheckConfig, check_integrity};
-use s3cas::inspect::{disk_space, num_keys};
+use s3cas::inspect::{disk_space, headers, num_keys};
 use s3cas::metastore::Durability;
 use s3cas::retrieve::{RetrieveConfig, retrieve};
 use s3cas::store_options::StoreOptions;
@@ -194,6 +194,9 @@ pub enum InspectCommand {
         bucket_name: String,
     },
     DiskSpace,
+
+    /// Print the QSST store header of every metadata DB under the meta root
+    Header,
 }
 
 fn setup_tracing() {
@@ -224,8 +227,21 @@ fn main() -> Result<()> {
                     println!("Number of keys in bucket '{}': {}", bucket_name, num_keys);
                 }
                 InspectCommand::DiskSpace => {
-                    let disk_space = disk_space(meta_root, &store)?;
-                    println!("Disk space: {}", disk_space);
+                    // Two databases, two numbers: reporting either one alone
+                    // reads as the store's footprint while being a fraction
+                    // of it.
+                    let space = disk_space(meta_root, &store)?;
+                    println!("Disk space, namespace DB: {}", space.namespace);
+                    match space.blocks {
+                        Some(blocks) => println!("Disk space, blocks DB:    {blocks}"),
+                        None => println!("Disk space, blocks DB:    (none)"),
+                    }
+                    println!("Disk space, total:        {}", space.total());
+                }
+                InspectCommand::Header => {
+                    for entry in headers(meta_root, &store)? {
+                        print!("{}", entry.render());
+                    }
                 }
             }
         }

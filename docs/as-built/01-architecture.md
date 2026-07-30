@@ -72,8 +72,13 @@ coordinating daemon.
 - `server` -- runs the S3 HTTP service. hyper + `hyper-util` serving an
   `s3s::service::S3Service`, with `S3FS` (`s3cas/src/s3fs.rs`) as the `S3`
   trait implementation. `run()` is 131 lines.
-- `inspect num-keys | disk-space` -- read-only metadata queries.
-- `check` -- integrity checking (`s3cas/src/check.rs`).
+- `inspect num-keys | disk-space | header` -- read-only metadata queries.
+  `num-keys` reads the namespace DB (`<meta_root>/db`); `disk-space` and
+  `header` report on both that and the shared block DB
+  (`<meta_root>/blocks/db`).
+- `check` -- integrity checking (`s3cas/src/check.rs`): every block file
+  re-hashed with the store's hasher, the assembled object re-hashed with MD5
+  against its ETag.
 - `retrieve` -- object extraction (`s3cas/src/retrieve.rs`).
 
 **respd** (`respd/src/main.rs`) is a tokio TCP server speaking RESP2.

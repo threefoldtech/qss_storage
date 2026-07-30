@@ -1,10 +1,12 @@
 //! Benchmarks for the CasFS write paths.
 //!
 //! Compares the inlined-metadata write path against the regular
-//! block-storage write path across a range of object sizes.
+//! block-storage write path across a range of object sizes, and the two block
+//! address widths (BLAKE3 truncated to 16 bytes vs the full 32) against each
+//! other on the block write path.
 
 use bytes::Bytes;
-use cas_storage::{AsyncByteStream, CasFS, Durability, SharedMetrics, StorageEngine};
+use cas_storage::{AsyncByteStream, CasFS, Durability, Hasher, SharedMetrics, StorageEngine};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::stream;
 use rand::RngExt;
@@ -17,8 +19,9 @@ fn get_shared_metrics() -> SharedMetrics {
     SharedMetrics::default()
 }
 
-// Helper function to create a temporary CasFS with FjallNoTx
-fn setup_casfs() -> (CasFS, TempDir) {
+// Helper function to create a temporary CasFS with FjallNoTx, addressing
+// blocks with `hasher`.
+fn setup_casfs_with(hasher: Hasher) -> (CasFS, TempDir) {
     let dir = TempDir::new().unwrap();
     let root_path = dir.path().to_path_buf();
     let meta_path = root_path.clone();
@@ -35,12 +38,17 @@ fn setup_casfs() -> (CasFS, TempDir) {
         storage_engine,
         inlined_metadata_size,
         durability,
-        None,
+        Some(hasher.into()),
         false, // verify_on_read: benchmarks measure the normal read path
     )
     .unwrap();
 
     (fs, dir)
+}
+
+// Helper function to create a temporary CasFS at the default width
+fn setup_casfs() -> (CasFS, TempDir) {
+    setup_casfs_with(Hasher::Blake3W32)
 }
 
 // Helper to create a test bucket
@@ -177,10 +185,64 @@ fn bench_store_methods_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+/// Width 16 against width 32 on the block write path.
+///
+/// One group per width, same object sizes in both, so the two groups line up
+/// benchmark for benchmark. What differs between them is the BLAKE3 output the
+/// block address is taken from (truncated to 16 bytes vs the full 32) and the
+/// 16 extra bytes per block id that the metadata records then carry, so this
+/// is the number behind the width guidance for operators.
+///
+/// Every iteration stamps a fresh counter into the payload: identical bytes
+/// would dedup after the first write and measure the block-exists path instead
+/// of the write path. Sizes stay modest for the same reason the store is a
+/// tempdir -- every iteration leaves a block behind.
+fn bench_hash_width(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let sizes = [4096, 65536];
+
+    for hasher in [Hasher::Blake3W16, Hasher::Blake3W32] {
+        let mut group = c.benchmark_group(format!("store_by_hash_width/w{}", hasher.width()));
+        group.measurement_time(Duration::from_secs(5));
+        group.sample_size(20);
+
+        let (fs, _dir) = setup_casfs_with(hasher);
+        let bucket_name = "test-bucket";
+        create_test_bucket(&fs, bucket_name);
+
+        for &size in &sizes {
+            group.throughput(criterion::Throughput::Bytes(size as u64));
+            group.bench_function(
+                BenchmarkId::new("store_single_object_and_meta", size),
+                |b| {
+                    let mut payload = create_random_data(size);
+                    let mut counter: u64 = 0;
+                    b.iter(|| {
+                        counter += 1;
+                        payload[..8].copy_from_slice(&counter.to_le_bytes());
+                        let key = format!("w{}-{}-{counter}", hasher.width(), size);
+                        let stream = vec_to_bytestream(payload.clone());
+                        black_box(rt.block_on(fs.store_single_object_and_meta(
+                            bucket_name,
+                            &key,
+                            stream,
+                            size,
+                        )))
+                        .unwrap()
+                    })
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_store_methods,
     bench_inlined_object_sizes,
-    bench_store_methods_overhead
+    bench_store_methods_overhead,
+    bench_hash_width
 );
 criterion_main!(benches);

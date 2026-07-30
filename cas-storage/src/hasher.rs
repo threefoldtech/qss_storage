@@ -63,6 +63,16 @@ impl Hasher {
         }
     }
 
+    /// Returns the algorithm name for operators, as printed by the tools.
+    ///
+    /// Both widths report the same name for the same reason both report the
+    /// same [`Hasher::algo_id`]: the width is a separate field.
+    pub fn algo_name(&self) -> &'static str {
+        match self {
+            Hasher::Blake3W16 | Hasher::Blake3W32 => "blake3",
+        }
+    }
+
     /// Returns the block address width in bytes: 16 or 32.
     pub fn width(&self) -> u8 {
         match self {
@@ -202,6 +212,8 @@ mod tests {
         assert_eq!(Hasher::Blake3W32.algo_id(), 1);
         assert_eq!(Hasher::Blake3W16.width(), 16);
         assert_eq!(Hasher::Blake3W32.width(), 32);
+        assert_eq!(Hasher::Blake3W16.algo_name(), "blake3");
+        assert_eq!(Hasher::Blake3W32.algo_name(), "blake3");
     }
 
     #[test]

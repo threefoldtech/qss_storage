@@ -77,7 +77,7 @@ workspace).
 | `metrics.rs` | 390 | Prometheus `SharedMetrics` + `CasMetricsAdapter` |
 | `main.rs` | 278 | clap CLI, four subcommands, server bootstrap |
 | `check.rs` | -- | integrity checking |
-| `inspect.rs` | -- | `num-keys`, `disk-space` |
+| `inspect.rs` | -- | `num-keys`, `disk-space`, `header` |
 | `retrieve.rs` | -- | object extraction |
 | `internal_macros.rs` | -- | `try_!` macro; carries a `TODO: remove` |
 | `lib.rs` | -- | module wiring |

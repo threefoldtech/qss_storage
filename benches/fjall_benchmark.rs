@@ -4,6 +4,12 @@
 //! database), `FjallStoreNotx` is not (rollback is implemented in our own
 //! code). Both are driven through the same `MetaStore` facade, so every
 //! scenario below measures the backend and nothing else.
+//!
+//! No block hashing happens here -- the block ids are made up, not computed --
+//! so the address width has no effect on these numbers. The width comparison
+//! lives in `casfs_benchmark`, which drives the real write path. These stores
+//! are built with `MetaStore::new`, the deliberately unheadered constructor:
+//! there is no store format to validate when the point is the backend.
 
 use cas_storage::{
     Block, BlockId, BucketMeta, ContentHash, FjallStore, FjallStoreNotx, MetaStore, Object,
