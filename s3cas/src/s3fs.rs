@@ -47,9 +47,10 @@ impl std::fmt::Debug for S3FS {
 use cas_storage::RangeRequest;
 impl S3FS {
     pub fn new(casfs: CasFS, metrics: SharedMetrics) -> Self {
-        // Get the current amount of buckets
-        // FIXME: This is a bit of a hack, we should have a better way to get the amount of buckets
-        metrics.set_bucket_count(1); //db.open_tree(BUCKET_META_TREE).unwrap().len());
+        match casfs.list_buckets() {
+            Ok(buckets) => metrics.set_bucket_count(buckets.len()),
+            Err(e) => error!("Could not count buckets for metrics: {}", e),
+        }
 
         Self { casfs, metrics }
     }
@@ -76,6 +77,26 @@ fn calculate_multipart_hash(parts: &[MultiPart]) -> (ContentHash, u64) {
 
 fn fmt_content_range(start: u64, end_inclusive: u64, size: u64) -> String {
     format!("bytes {start}-{end_inclusive}/{size}")
+}
+
+/// Decode a client-supplied `Content-MD5` header: base64 of the raw 16-byte
+/// MD5 digest. A header that does not decode to exactly 16 bytes is rejected
+/// as `InvalidDigest`; comparing the digest against the received body is the
+/// caller's job.
+fn parse_content_md5(header: &str) -> S3Result<[u8; 16]> {
+    use base64::Engine;
+    let invalid = || s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid.");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(header)
+        .map_err(|_| invalid())?;
+    <[u8; 16]>::try_from(bytes).map_err(|_| invalid())
+}
+
+fn bad_digest() -> s3s::S3Error {
+    s3_error!(
+        BadDigest,
+        "The Content-MD5 you specified did not match what we received."
+    )
 }
 
 #[async_trait::async_trait]
@@ -200,7 +221,9 @@ impl S3 for S3FS {
 
         self.metrics.inc_bucket_count();
 
-        let output = CreateBucketOutput::default(); // TODO: handle other fields
+        let output = CreateBucketOutput {
+            location: Some(format!("/{}", input.bucket)),
+        };
         Ok(S3Response::new(output))
     }
 
@@ -379,7 +402,7 @@ impl S3 for S3FS {
 
         let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
-        debug_assert!(obj_meta.size() as usize == block_size);
+        debug_assert!(obj_meta.size() == block_size as u64);
         let mut block_stream = BlockStream::new(paths, block_size, range, self.metrics.to_cas());
         if self.casfs.verify_on_read() {
             // A no-op for a ranged read: a partial block cannot be checked
@@ -620,8 +643,11 @@ impl S3 for S3FS {
             bucket,
             key,
             content_length,
+            content_md5,
             ..
         } = input;
+
+        let expected_md5 = content_md5.as_deref().map(parse_content_md5).transpose()?;
 
         let Some(body) = body else {
             return Err(s3_error!(IncompleteBody));
@@ -631,11 +657,20 @@ impl S3 for S3FS {
             return Err(s3_error!(NoSuchBucket, "Bucket does not exist"));
         }
 
+        let content_length = content_length.ok_or_else(|| {
+            s3_error!(
+                MissingContentLength,
+                "You did not provide the number of bytes in the Content-Length HTTP header."
+            )
+        })?;
+        let len = usize::try_from(content_length)
+            .map_err(|_| s3_error!(InvalidRequest, "Invalid Content-Length HTTP header."))?;
+
         // if the content length is less than the max inlined data length, we store the object in the
         // metadata store, otherwise we store it in the cas layer.
-        if let Some(content_length) = content_length {
+        {
             use futures::TryStreamExt;
-            if content_length <= self.casfs.max_inlined_data_length() as i64 {
+            if len <= self.casfs.max_inlined_data_length() {
                 // Collect stream into Vec<u8>
                 // it is safe to collect the stream into memory as the content length is
                 // considered small
@@ -646,6 +681,11 @@ impl S3 for S3FS {
                     .into_iter()
                     .flatten()
                     .collect();
+                if let Some(expected) = expected_md5
+                    && Md5::digest(&data).as_slice() != expected
+                {
+                    return Err(bad_digest());
+                }
                 let obj_meta = try_!(self.casfs.store_inlined_object(&bucket, &key, data));
 
                 let output = PutObjectOutput {
@@ -658,13 +698,22 @@ impl S3 for S3FS {
 
         // save the datadata
         let converted_stream = convert_stream_error(body);
-        let len = content_length.unwrap() as usize;
         let byte_stream = AsyncByteStream::new(converted_stream);
         let obj_meta = try_!(
             self.casfs
                 .store_single_object_and_meta(&bucket, &key, byte_stream, len)
                 .await
         );
+
+        // The body is hashed while it is being stored, so a Content-MD5
+        // mismatch is only known after the write; roll the object back
+        // before failing the request.
+        if let Some(expected) = expected_md5
+            && obj_meta.hash().as_slice() != expected
+        {
+            try_!(self.casfs.delete_object(&bucket, &key).await);
+            return Err(bad_digest());
+        }
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
@@ -681,12 +730,14 @@ impl S3 for S3FS {
             body,
             bucket,
             content_length,
-            content_md5: _, // TODO: Verify
+            content_md5,
             key,
             part_number,
             upload_id,
             ..
         } = req.input;
+
+        let expected_md5 = content_md5.as_deref().map(parse_content_md5).transpose()?;
 
         let Some(body) = body else {
             return Err(s3_error!(IncompleteBody));
@@ -708,17 +759,30 @@ impl S3 for S3FS {
         // and replaced with the object metadata in metastore in the `complete_multipart_upload` function.
         let (blocks, hash, size) = try_!(self.casfs.store_object(&bucket, &key, byte_stream).await);
 
-        if size != content_length as u64 {
+        if u64::try_from(content_length) != Ok(size) {
             return Err(s3_error!(
                 InvalidRequest,
                 "You did not send the amount of bytes specified by the Content-Length HTTP header."
             ));
         }
 
+        // The part was just stored, so its size fits the address space.
+        let part_size = usize::try_from(size)
+            .map_err(|_| s3_error!(InternalError, "part size exceeds address space"))?;
+
+        // Like the length check above, this fails the part before it is
+        // registered; the blocks already written stay behind, addressed by
+        // content, and are reused if the part is retried with the same data.
+        if let Some(expected) = expected_md5
+            && hash.as_slice() != expected
+        {
+            return Err(bad_digest());
+        }
+
         try_!(self.casfs.insert_multipart_part(
             bucket,
             key,
-            size as usize,
+            part_size,
             part_number as i64,
             upload_id,
             hash,

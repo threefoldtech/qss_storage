@@ -31,6 +31,7 @@ hyper-util = { workspace = true }
 hyper = { workspace = true }
 http-body-util = { workspace = true }
 clap = { workspace = true }
+base64 = "0.23.0"
 
 [dev-dependencies]
 s3s-aws = { workspace = true }
