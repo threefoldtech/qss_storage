@@ -85,394 +85,223 @@ pub enum Command {
     // Add more commands as needed
 }
 
+/// A command frame split into its name and argument frames.
+///
+/// `argv[0]` is the command name itself, so argument indices below match the
+/// wire positions (`argv[1]` is the first real argument) and all arity numbers
+/// count the command name.
+struct Args {
+    /// Upper-cased command name, also used verbatim in error messages.
+    name: String,
+    argv: Vec<Frame>,
+}
+
+impl Args {
+    /// Split a frame into name plus arguments, rejecting non-command frames.
+    fn from_frame(frame: Frame) -> Result<Self, CommandError> {
+        let argv = match frame {
+            Frame::Array(array) => array,
+            _ => {
+                return Err(CommandError::Protocol(
+                    "Command must be an array".to_string(),
+                ));
+            }
+        };
+
+        if argv.is_empty() {
+            return Err(CommandError::WrongNumberOfArguments(
+                "empty command".to_string(),
+            ));
+        }
+
+        let name = match &argv[0] {
+            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_uppercase(),
+            _ => {
+                return Err(CommandError::Protocol(
+                    "Command name must be a bulk string".to_string(),
+                ));
+            }
+        };
+
+        Ok(Self { name, argv })
+    }
+
+    fn len(&self) -> usize {
+        self.argv.len()
+    }
+
+    fn wrong_arity(&self) -> CommandError {
+        CommandError::WrongNumberOfArguments(self.name.clone())
+    }
+
+    /// Require exactly `n` frames (command name included).
+    fn arity_exact(&self, n: usize) -> Result<(), CommandError> {
+        if self.len() == n {
+            Ok(())
+        } else {
+            Err(self.wrong_arity())
+        }
+    }
+
+    /// Require at least `n` frames (command name included).
+    fn arity_min(&self, n: usize) -> Result<(), CommandError> {
+        if self.len() >= n {
+            Ok(())
+        } else {
+            Err(self.wrong_arity())
+        }
+    }
+
+    /// Require at most `n` frames (command name included).
+    fn arity_max(&self, n: usize) -> Result<(), CommandError> {
+        if self.len() <= n {
+            Ok(())
+        } else {
+            Err(self.wrong_arity())
+        }
+    }
+
+    /// Require between `min` and `max` frames (command name included).
+    fn arity_range(&self, min: usize, max: usize) -> Result<(), CommandError> {
+        self.arity_min(min)?;
+        self.arity_max(max)
+    }
+
+    /// Read the bulk string at `idx` as raw bytes. `what` names the argument in
+    /// the error message, e.g. `SET value must be a bulk string`.
+    fn bytes_at(&self, idx: usize, what: &str) -> Result<Bytes, CommandError> {
+        match &self.argv[idx] {
+            Frame::BulkString(bytes) => Ok(Bytes::from(bytes.clone())),
+            _ => Err(CommandError::Protocol(format!(
+                "{} {} must be a bulk string",
+                self.name, what
+            ))),
+        }
+    }
+
+    /// Read the bulk string at `idx` as a lossy UTF-8 `String`.
+    fn string_at(&self, idx: usize, what: &str) -> Result<String, CommandError> {
+        match &self.argv[idx] {
+            Frame::BulkString(bytes) => Ok(String::from_utf8_lossy(bytes).to_string()),
+            _ => Err(CommandError::Protocol(format!(
+                "{} {} must be a bulk string",
+                self.name, what
+            ))),
+        }
+    }
+
+    /// Same as `string_at`, but yields `None` when the argument was not sent.
+    fn opt_string_at(&self, idx: usize, what: &str) -> Result<Option<String>, CommandError> {
+        if idx < self.len() {
+            Ok(Some(self.string_at(idx, what)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// `<CMD>` with no arguments: DBSIZE, FLUSH, NSLIST, TIME.
+fn parse_no_args(args: &Args, cmd: Command) -> Result<Command, CommandError> {
+    args.arity_exact(1)?;
+    Ok(cmd)
+}
+
+/// `<CMD> <arg>`: AUTH, CHECK, DEL, EXISTS, GET, KEYTIME, LENGTH, NSINFO, NSNEW.
+fn parse_one_arg<F>(args: &Args, what: &str, make: F) -> Result<Command, CommandError>
+where
+    F: FnOnce(String) -> Command,
+{
+    args.arity_exact(2)?;
+    Ok(make(args.string_at(1, what)?))
+}
+
+/// `<CMD> [cursor]`: SCAN, RSCAN. Cursor "0" means "start from the beginning".
+fn parse_cursor<F>(args: &Args, make: F) -> Result<Command, CommandError>
+where
+    F: FnOnce(Option<String>) -> Command,
+{
+    args.arity_max(2)?;
+    let cursor = args
+        .opt_string_at(1, "cursor")?
+        .filter(|cursor| cursor != "0");
+    Ok(make(cursor))
+}
+
+/// `MGET key [key ...]`
+fn parse_mget(args: &Args) -> Result<Command, CommandError> {
+    args.arity_min(2)?;
+    let mut keys = Vec::with_capacity(args.len() - 1);
+    for idx in 1..args.len() {
+        keys.push(args.string_at(idx, "key")?);
+    }
+    Ok(Command::MGet { keys })
+}
+
+/// `SET key value` (trailing arguments are accepted and ignored)
+fn parse_set(args: &Args) -> Result<Command, CommandError> {
+    args.arity_min(3)?;
+    let key = args.string_at(1, "key")?;
+    let value = args.bytes_at(2, "value")?;
+    Ok(Command::Set { key, value })
+}
+
+/// `PING [message]`
+fn parse_ping(args: &Args) -> Result<Command, CommandError> {
+    let message = args.opt_string_at(1, "message")?;
+    Ok(Command::Ping { message })
+}
+
+/// `SELECT namespace [password]`
+fn parse_select(args: &Args) -> Result<Command, CommandError> {
+    args.arity_range(2, 3)?;
+    let namespace = args.string_at(1, "namespace")?;
+    let password = args.opt_string_at(2, "password")?;
+    Ok(Command::Select {
+        namespace,
+        password,
+    })
+}
+
+/// `NSSET namespace property value`
+fn parse_nsset(args: &Args) -> Result<Command, CommandError> {
+    args.arity_exact(4)?;
+    let namespace = args.string_at(1, "namespace")?;
+    let property = args.string_at(2, "property")?;
+    let value = args.string_at(3, "value")?;
+    Ok(Command::NSSet {
+        namespace,
+        property,
+        value,
+    })
+}
+
 impl Command {
     /// Parse a Redis protocol frame into a command
     pub fn from_frame(frame: Frame) -> Result<Self, CommandError> {
-        match frame {
-            Frame::Array(array) => {
-                if array.is_empty() {
-                    return Err(CommandError::WrongNumberOfArguments(
-                        "empty command".to_string(),
-                    ));
-                }
+        let args = Args::from_frame(frame)?;
 
-                // Extract the command name from the first element
-                let command_name = match &array[0] {
-                    Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_uppercase(),
-                    _ => {
-                        return Err(CommandError::Protocol(
-                            "Command name must be a bulk string".to_string(),
-                        ));
-                    }
-                };
-
-                // Parse the command based on its name
-                match command_name.as_str() {
-                    "MGET" => {
-                        if array.len() < 2 {
-                            return Err(CommandError::WrongNumberOfArguments("MGET".to_string()));
-                        }
-
-                        let mut keys = Vec::with_capacity(array.len() - 1);
-                        for item in array.iter().skip(1) {
-                            let key = match item {
-                                Frame::BulkString(bytes) => {
-                                    String::from_utf8_lossy(bytes).to_string()
-                                }
-                                _ => {
-                                    return Err(CommandError::Protocol(
-                                        "MGET key must be a bulk string".to_string(),
-                                    ));
-                                }
-                            };
-                            keys.push(key);
-                        }
-
-                        Ok(Command::MGet { keys })
-                    }
-                    "SELECT" => {
-                        // SELECT command should accept 2 or 3 arguments
-                        // 2 args: SELECT namespace
-                        // 3 args: SELECT namespace password
-                        if array.len() < 2 || array.len() > 3 {
-                            return Err(CommandError::WrongNumberOfArguments("SELECT".to_string()));
-                        }
-
-                        let namespace = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "SELECT namespace must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        // Parse optional password if provided
-                        let password = if array.len() == 3 {
-                            match &array[2] {
-                                Frame::BulkString(bytes) => {
-                                    Some(String::from_utf8_lossy(bytes).to_string())
-                                }
-                                _ => {
-                                    return Err(CommandError::Protocol(
-                                        "SELECT password must be a bulk string".to_string(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        Ok(Command::Select {
-                            namespace,
-                            password,
-                        })
-                    }
-                    "NSNEW" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("NSNEW".to_string()));
-                        }
-
-                        let name = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "NSNEW name must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::NSNew { name })
-                    }
-                    "NSINFO" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("NSINFO".to_string()));
-                        }
-
-                        let name = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "NSINFO name must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::NSInfo { name })
-                    }
-                    "NSLIST" => {
-                        if array.len() != 1 {
-                            return Err(CommandError::WrongNumberOfArguments("NSLIST".to_string()));
-                        }
-
-                        Ok(Command::NSList)
-                    }
-                    "NSSET" => {
-                        if array.len() != 4 {
-                            return Err(CommandError::WrongNumberOfArguments("NSSET".to_string()));
-                        }
-
-                        let namespace = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "NSSET namespace must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        let property = match &array[2] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "NSSET property must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        let value = match &array[3] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "NSSET value must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::NSSet {
-                            namespace,
-                            property,
-                            value,
-                        })
-                    }
-                    "DEL" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("DEL".to_string()));
-                        }
-
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "DEL key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::Del { key })
-                    }
-                    "EXISTS" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("EXISTS".to_string()));
-                        }
-
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "EXISTS key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::Exists { key })
-                    }
-                    "CHECK" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("CHECK".to_string()));
-                        }
-
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "CHECK key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::Check { key })
-                    }
-                    "GET" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("GET".to_string()));
-                        }
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "GET key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-                        Ok(Command::Get { key })
-                    }
-                    "SET" => {
-                        if array.len() < 3 {
-                            return Err(CommandError::WrongNumberOfArguments("SET".to_string()));
-                        }
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "SET key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-                        let value = match &array[2] {
-                            Frame::BulkString(bytes) => Bytes::from(bytes.clone()),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "SET value must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-                        Ok(Command::Set { key, value })
-                    }
-                    "PING" => {
-                        let message = if array.len() > 1 {
-                            match &array[1] {
-                                Frame::BulkString(bytes) => {
-                                    Some(String::from_utf8_lossy(bytes).to_string())
-                                }
-                                _ => {
-                                    return Err(CommandError::Protocol(
-                                        "PING message must be a bulk string".to_string(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        Ok(Command::Ping { message })
-                    }
-                    "LENGTH" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("LENGTH".to_string()));
-                        }
-
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "LENGTH key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::Length { key })
-                    }
-                    "KEYTIME" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments(
-                                "KEYTIME".to_string(),
-                            ));
-                        }
-
-                        let key = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "KEYTIME key must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-
-                        Ok(Command::KeyTime { key })
-                    }
-                    "AUTH" => {
-                        if array.len() != 2 {
-                            return Err(CommandError::WrongNumberOfArguments("AUTH".to_string()));
-                        }
-
-                        let password = match &array[1] {
-                            Frame::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            _ => {
-                                return Err(CommandError::Protocol(
-                                    "AUTH password must be a bulk string".to_string(),
-                                ));
-                            }
-                        };
-                        Ok(Command::Auth { password })
-                    }
-                    "DBSIZE" => {
-                        if array.len() != 1 {
-                            return Err(CommandError::WrongNumberOfArguments("DBSIZE".to_string()));
-                        }
-                        Ok(Command::DBSize)
-                    }
-                    "SCAN" => {
-                        if array.len() > 2 {
-                            return Err(CommandError::WrongNumberOfArguments("SCAN".to_string()));
-                        }
-
-                        let cursor = if array.len() == 2 {
-                            match &array[1] {
-                                Frame::BulkString(bytes) => {
-                                    let cursor_str = String::from_utf8_lossy(bytes).to_string();
-                                    if cursor_str == "0" {
-                                        None
-                                    } else {
-                                        Some(cursor_str)
-                                    }
-                                }
-                                _ => {
-                                    return Err(CommandError::Protocol(
-                                        "SCAN cursor must be a bulk string".to_string(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        Ok(Command::Scan { cursor })
-                    }
-                    "RSCAN" => {
-                        if array.len() > 2 {
-                            return Err(CommandError::WrongNumberOfArguments("RSCAN".to_string()));
-                        }
-
-                        let cursor = if array.len() == 2 {
-                            match &array[1] {
-                                Frame::BulkString(bytes) => {
-                                    let cursor_str = String::from_utf8_lossy(bytes).to_string();
-                                    if cursor_str == "0" {
-                                        None
-                                    } else {
-                                        Some(cursor_str)
-                                    }
-                                }
-                                _ => {
-                                    return Err(CommandError::Protocol(
-                                        "RSCAN cursor must be a bulk string".to_string(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        Ok(Command::RScan { cursor })
-                    }
-                    "FLUSH" => {
-                        if array.len() != 1 {
-                            return Err(CommandError::WrongNumberOfArguments("FLUSH".to_string()));
-                        }
-                        Ok(Command::Flush)
-                    }
-                    "TIME" => {
-                        if array.len() != 1 {
-                            return Err(CommandError::WrongNumberOfArguments("TIME".to_string()));
-                        }
-                        Ok(Command::Time)
-                    }
-                    _ => Err(CommandError::UnknownCommand(command_name)),
-                }
-            }
-            _ => Err(CommandError::Protocol(
-                "Command must be an array".to_string(),
-            )),
+        match args.name.as_str() {
+            "AUTH" => parse_one_arg(&args, "password", |password| Command::Auth { password }),
+            "CHECK" => parse_one_arg(&args, "key", |key| Command::Check { key }),
+            "DBSIZE" => parse_no_args(&args, Command::DBSize),
+            "DEL" => parse_one_arg(&args, "key", |key| Command::Del { key }),
+            "EXISTS" => parse_one_arg(&args, "key", |key| Command::Exists { key }),
+            "FLUSH" => parse_no_args(&args, Command::Flush),
+            "GET" => parse_one_arg(&args, "key", |key| Command::Get { key }),
+            "KEYTIME" => parse_one_arg(&args, "key", |key| Command::KeyTime { key }),
+            "LENGTH" => parse_one_arg(&args, "key", |key| Command::Length { key }),
+            "MGET" => parse_mget(&args),
+            "NSINFO" => parse_one_arg(&args, "name", |name| Command::NSInfo { name }),
+            "NSLIST" => parse_no_args(&args, Command::NSList),
+            "NSNEW" => parse_one_arg(&args, "name", |name| Command::NSNew { name }),
+            "NSSET" => parse_nsset(&args),
+            "PING" => parse_ping(&args),
+            "RSCAN" => parse_cursor(&args, |cursor| Command::RScan { cursor }),
+            "SCAN" => parse_cursor(&args, |cursor| Command::Scan { cursor }),
+            "SELECT" => parse_select(&args),
+            "SET" => parse_set(&args),
+            "TIME" => parse_no_args(&args, Command::Time),
+            _ => Err(CommandError::UnknownCommand(args.name)),
         }
     }
 }
