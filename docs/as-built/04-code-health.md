@@ -28,7 +28,7 @@ status. Commits are on `development`.
 | H1 reachable panic | **Fixed** -- `FjallStore::num_keys` delegates to `read_tx().len()`; regression test in the shared backend battery | `58ca932` |
 | H2 transmute + Send/Sync | **Addressed** -- SAFETY argument written, field order marked load-bearing, `unsafe impl Sync` deleted (auto impl suffices), `Send` kept with an honest argument | `16591a5` |
 | H3 pointer-width format | **Fixed** -- format v1: all length/count fields are `u64`, `PTR_SIZE` and `constants.rs` deleted, records length-exact, block-id lists self-describing (width byte); golden byte vectors pin the layout. No backward compatibility: pre-v1 stores read as decode errors until the store header lands | `a0c6471` |
-| H4 MD5 cross-tenant substitution | **Recorded** -- ADR 0002 amended: migration is now a prerequisite for untrusted multi-tenancy; interim mitigations stated | `9dabfe1` |
+| H4 MD5 cross-tenant substitution | **Fixed** -- recorded in ADR 0002 first (`9dabfe1`), then closed: blocks are BLAKE3-addressed, default width 32. Untrusted multi-tenancy now requires the default W32 store; the 16-byte width is documented as a trusted-tenant option, so a deployment that opts into it opts out of this guarantee. No dedup-hit content verification was built -- see the ADR's "As implemented" section for why | `23ed542` (with `43d6594`, `03c5cf5`) |
 | H5 BlockStream Sync | **Fixed** -- deleted; static assertion in its place | `16591a5` |
 | H6 unchecked UTF-8 | **Fixed** -- all six sites validate; `range_filter` sites log-and-skip (trait signature unchanged, see EXTENSIONS.md) | `16591a5` |
 | (H2 adjacent) FjallNoTransaction unsafe impls | **Fixed** -- both redundant, deleted with static assertions | `a5722c8` |
@@ -63,6 +63,25 @@ Found and fixed during the pass, beyond the original findings:
 Verification on `development` after the pass: fmt clean, clippy
 `-D warnings` clean including benches, 47 tests passing (twice), both bench
 binaries run to completion.
+
+### ADR 0002 implementation pass (2026-07-30)
+
+The BLAKE3 migration specified in
+[docs/adr/0002-blake3-hash-migration.md](../adr/0002-blake3-hash-migration.md)
+landed in fourteen steps (C1-C14) over commits `8ed2506`..`69c726e`, per
+[docs/plans/adr-0002-implementation.md](../plans/adr-0002-implementation.md).
+It closes two findings from this review: **H3** (on-disk format v1, all
+length and count fields `u64`, at `a0c6471`) and **H4** (blocks addressed by
+BLAKE3, default 32 bytes, at `23ed542`). It does not touch **H7**:
+`content_md5` is still destructured and discarded in `s3cas/src/s3fs.rs`, so
+client-supplied Content-MD5 remains unverified and that finding stays open.
+
+The pass also added machinery this review predates and which is now the
+place to look first when a store misbehaves: a 32-byte QSST header on every
+metadata database (refusal, not migration, on a mismatch), `s3cas inspect
+header` to print it, `s3cas check` verifying block files against the store's
+own hasher, and an opt-in `verify_on_read` that re-hashes whole blocks
+before serving them.
 
 ---
 

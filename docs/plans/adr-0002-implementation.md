@@ -1,5 +1,10 @@
 # ADR 0002 Implementation Plan
 
+**Status: implemented** (2026-07-30, branch `development`, commits
+`8ed2506`..`69c726e`). This file is a historical record of what was planned;
+what was actually built, including where it diverged, is recorded in the
+"As implemented" section of docs/adr/0002-blake3-hash-migration.md.
+
 Implements docs/adr/0002-blake3-hash-migration.md: BLAKE3 block addressing,
 versioned store header, fixed-width on-disk format (v1), and the TOML config
 file. Written as self-contained component specs; sequencing and risk at the

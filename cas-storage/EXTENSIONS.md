@@ -65,6 +65,13 @@ than an error. All six now validate:
 - `metastore/stores/fjall_common.rs` (`range_filter` key; was one copy per
   backend before the dedup below)
 
+The first two now go through `Reader::utf8` (`metastore/codec.rs`), added by
+the format v1 work below, rather than a hand-written `String::from_utf8` per
+field. The behaviour is the same error; the marked regions in
+`bucket_meta.rs` and `multipart.rs` moved onto the `Reader` calls, and
+`multipart.rs`'s two separate regions became one covering all three string
+fields.
+
 The first two sit in `TryFrom` impls and simply return the error. The
 `range_filter` site does not: the trait method yields an infallible
 `(String, Object)` item, so changing the signature would ripple into
@@ -167,6 +174,50 @@ tests from one definition instead of two copies.
 Because the dedup dissolved the code they fenced, the `tfstor-extension`
 markers in these two files are gone; this entry and the comments in
 `fjall_common.rs` are the record.
+
+## What diverged wholesale (ADR 0002, 2026-07-30)
+
+The BLAKE3 migration (`docs/adr/0002-blake3-hash-migration.md`, commits
+`8ed2506`..`69c726e`) rewrote parts of this tree that upstream owns, rather
+than extending them. No marker regions were added for it: the changes are the
+files, not fenced blocks inside them, and per the ownership decision at the
+top of this document there is no rebase to protect. Recorded here so the
+divergence from the `b28eac0` snapshot stays legible:
+
+- **On-disk record format v1** (`a0c6471`). Every length and count field is
+  `u64` LE instead of native-width `usize`; `metastore/constants.rs` and its
+  `PTR_SIZE` are deleted. A new `metastore/codec.rs` (`Reader`, id-list
+  helpers) gives all four record types checked offset arithmetic, exact-length
+  enforcement and typed errors. Upstream's `MultiPart` decoder absorbed
+  trailing garbage as extra block ids through a `chunks_exact` loop over the
+  remainder; the id list is now framed by an `id_width` byte plus a count, so
+  a record decodes without knowing which store wrote it and trailing bytes are
+  reported. Golden byte-layout fixtures pin the layout in each record's test
+  module. Format-breaking, with no migration.
+- **Typed decode errors** (`8ed2506`). `FsError`'s blanket `MalformedObject`
+  is replaced by `Truncated`, `TrailingBytes`, `InvalidUtf8`,
+  `UnknownObjectType`, `InvalidIdWidth` and `LengthOverflow`, plus
+  `MetaError::Corruption`. Seven deserialize sites that panicked now
+  propagate.
+- **`ContentHash` split from the block address** (`7fcc191`). Upstream types
+  `Object.hash` and `MultiPart.hash` as `BlockID` while storing MD5 ETag
+  digests in them. They are now `ContentHash`, a fixed 16-byte newtype, so
+  making the block address a per-store width could not silently widen S3
+  ETags. `s3cas`'s multipart ETag was also fixed to the S3 convention (MD5 of
+  the concatenated part MD5s) from hashing raw block addresses.
+- **`BlockId` newtype** (`c6991e3`). `[u8; 16]` becomes `{ bytes: [u8; 32],
+  len }` with zeroed padding, so the derived `Eq`/`Hash`/`Ord` agree with
+  `as_slice()`. Upstream's prefix-path search could exhaust its prefixes and
+  write an empty path that then panicked in `Block::disk_path`; it now covers
+  the full width and errors on true exhaustion.
+- **`hasher.rs`, `metastore/store_header.rs`, `config.rs`** -- net-new modules
+  with no upstream counterpart: the BLAKE3 `Hasher` enum, the 32-byte QSST
+  store header written by `MetaStore::open_or_create` (with the underscore
+  bucket-name guard that protects the reserved trees), and the
+  `qss_storage.toml` loader.
+
+MD5 remains a dependency of this crate for exactly one reason: the ETag digest
+is computed here, in `cas/write_path.rs`, not in the frontends.
 
 ## Implementations
 

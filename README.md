@@ -43,7 +43,41 @@ cargo build --release -p s3cas
 cargo build --release -p respd
 ```
 
-With this feature, the data blocks will be deleted when they aren't used anymore.
+## Content addressing
+
+Objects are split into 1 MiB blocks addressed by their **BLAKE3** hash, so an
+identical block is stored once and reference counted; the data blocks are
+deleted when they aren't used anymore. The S3 ETag stays MD5 because the
+protocol requires it -- that is a separate 16-byte hash of the whole object,
+never a block address.
+
+The block address width is fixed when a store is created and recorded in its
+header:
+
+- **32 bytes (default).** BLAKE3's native 256-bit output. Use this unless you
+  have a specific reason not to. It is the only width to run with when
+  untrusted tenants share a block store: deduplication is cross-tenant, so a
+  forged address collision would mean one tenant's bytes served in place of
+  another's.
+- **16 bytes.** BLAKE3 truncated to 128 bits. Smaller metadata -- 16 fewer
+  bytes per block id in every record that lists one -- for single-tenant or
+  trusted-tenant deployments. It is not faster: the benchmarks show no
+  measurable write-path difference between the widths, so this is a
+  metadata-size choice and nothing else.
+
+Set it with `[store.hash]` in `qss_storage.toml`. It applies at store creation
+only; there is no migration between widths, so changing it means creating a new
+store. To see what an existing store uses:
+
+```bash
+s3cas inspect --meta-root ./data/meta header
+```
+
+A store whose header is missing or names a hash this build does not support
+refuses to open rather than guessing. Optional read-time integrity checking is
+available with `store.verify_on_read`, and `s3cas check` verifies an object's
+blocks offline. Background in
+[ADR 0002](./docs/adr/0002-blake3-hash-migration.md).
 
 ## Configuration
 
