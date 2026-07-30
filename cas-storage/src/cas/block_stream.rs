@@ -1,14 +1,73 @@
+use crate::hasher::Hasher;
+use crate::metastore::BlockId;
 use crate::metrics::SharedMetrics;
 
 use super::range_request::RangeRequest;
 use bytes::Bytes;
 use futures::{AsyncRead, AsyncSeek, Future, Stream, ready};
+use std::fmt::{self, Display, Formatter};
 use std::{
     io,
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
 };
+
+/// How much is read per poll while buffering a block for verification.
+const VERIFY_READ_CHUNK: usize = 64 * 1024;
+
+/// A stored block whose bytes no longer hash to the address they are filed
+/// under. Reported instead of the data when verification is on.
+#[derive(Debug, Clone)]
+pub struct BlockCorruption {
+    expected: BlockId,
+    actual: BlockId,
+    path: PathBuf,
+}
+
+impl BlockCorruption {
+    /// The address the block is filed under.
+    pub fn expected(&self) -> &BlockId {
+        &self.expected
+    }
+
+    /// What the bytes on disk actually hash to.
+    pub fn actual(&self) -> &BlockId {
+        &self.actual
+    }
+
+    /// The block file that failed the check.
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl Display for BlockCorruption {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "corrupt block {}: file {} hashes to {}",
+            self.expected.to_hex(),
+            self.path.display(),
+            self.actual.to_hex()
+        )
+    }
+}
+
+impl std::error::Error for BlockCorruption {}
+
+impl From<BlockCorruption> for io::Error {
+    fn from(err: BlockCorruption) -> Self {
+        io::Error::new(io::ErrorKind::InvalidData, err)
+    }
+}
+
+/// What a verifying stream checks each block against: the store's hasher and
+/// the block addresses of the object being read, in path order.
+struct BlockVerification {
+    hasher: Hasher,
+    ids: Vec<BlockId>,
+}
 
 /// Implementation of a single stream over potentially multiple on disk data block files.
 pub struct BlockStream {
@@ -21,6 +80,13 @@ pub struct BlockStream {
     range: RangeRequest,
     file: Option<async_fs::File>, // current file to read
     open_fut: Option<Pin<Box<dyn Future<Output = io::Result<async_fs::File>> + Send + Sync>>>,
+    /// `Some` only when this stream verifies; see [`BlockStream::verified`].
+    verify: Option<BlockVerification>,
+    /// Index into `paths` of the file currently open. Only meaningful while
+    /// verifying, which is the only mode that has to name the block it read.
+    reading: usize,
+    /// The block being buffered for verification. Empty otherwise.
+    buf: Vec<u8>,
 }
 
 impl BlockStream {
@@ -40,7 +106,73 @@ impl BlockStream {
             processed: 0,
             open_fut: None,
             range,
+            verify: None,
+            reading: 0,
+            buf: Vec::new(),
         }
+    }
+
+    /// Re-hash every block before serving it, and fail the stream with a
+    /// [`BlockCorruption`] error rather than hand out bytes that no longer
+    /// match their address.
+    ///
+    /// `block_ids` are the object's block addresses in the same order as the
+    /// paths this stream was built from, and `hasher` is the one the store
+    /// addresses blocks with ([`crate::CasFS::hasher`]).
+    ///
+    /// This changes the memory behaviour of the stream: a verified block is
+    /// read whole (a block is at most 1 MiB) and hashed before any of it is
+    /// yielded, instead of being streamed out in small pieces.
+    ///
+    /// # Range requests are not verified
+    ///
+    /// A partial block cannot be checked against a whole-block address, so
+    /// this is a no-op for anything but [`RangeRequest::All`]. Callers may
+    /// therefore apply it unconditionally; a ranged read simply streams
+    /// unverified, as documented on [`crate::CasFS::verify_on_read`].
+    #[must_use]
+    pub fn verified(mut self, hasher: Hasher, block_ids: Vec<BlockId>) -> Self {
+        if matches!(self.range, RangeRequest::All) && block_ids.len() == self.paths.len() {
+            self.verify = Some(BlockVerification {
+                hasher,
+                ids: block_ids,
+            });
+        } else {
+            debug_assert!(
+                block_ids.len() == self.paths.len(),
+                "verification needs one block address per block file"
+            );
+        }
+        self
+    }
+
+    /// Hash the block just buffered, compare it to the address it is filed
+    /// under, and either yield it whole or report the corruption.
+    fn finish_verified_block(&mut self) -> Poll<Option<io::Result<Bytes>>> {
+        let bytes = std::mem::take(&mut self.buf);
+        let verify = self
+            .verify
+            .as_ref()
+            .expect("only reached while verification is on");
+        let idx = self.reading;
+        let Some(expected) = verify.ids.get(idx) else {
+            return Poll::Ready(Some(Err(io::Error::other(format!(
+                "no block address to verify block {idx} against"
+            )))));
+        };
+        let actual = verify.hasher.hash(&bytes);
+        if actual != *expected {
+            let err = BlockCorruption {
+                expected: *expected,
+                actual,
+                path: self.paths[idx].0.clone(),
+            };
+            tracing::error!(error = %err, "Refusing to serve corrupt block");
+            return Poll::Ready(Some(Err(err.into())));
+        }
+        self.processed += bytes.len();
+        self.metrics.bytes_sent(bytes.len());
+        Poll::Ready(Some(Ok(bytes.into())))
     }
 }
 // ---- tfstor-extension: BEGIN ----
@@ -98,6 +230,28 @@ impl Stream for BlockStream {
                     self.has_seeked = true;
                     // TODO: this can be `n`
                     self.processed += (start - processed) as usize;
+                    self.poll_next(cx)
+                }
+            };
+        }
+
+        // verifying reader: buffer the whole block, then hash it before any of
+        // it is handed out. `processed` only advances once a block passes,
+        // which is what keeps the whole-block accounting (and the exit
+        // condition above) intact.
+        if self.verify.is_some()
+            && let Some(ref mut file) = self.file
+        {
+            let mut buf = vec![0; VERIFY_READ_CHUNK];
+            return match Pin::new(file).poll_read(cx, &mut buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Ok(0)) => {
+                    self.file = None;
+                    self.finish_verified_block()
+                }
+                Poll::Ready(Ok(n)) => {
+                    self.buf.extend_from_slice(&buf[..n]);
                     self.poll_next(cx)
                 }
             };
@@ -187,6 +341,9 @@ impl Stream for BlockStream {
             self.open_fut = Some(Box::pin(async_fs::File::open(
                 self.paths[self.fp].0.clone(),
             )));
+            // remember which block this is before the pointer moves on: a
+            // verified block has to be named if it fails the check
+            self.reading = self.fp;
             // increment the file pointer for the next file
             self.fp += 1;
         };

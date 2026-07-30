@@ -380,7 +380,12 @@ impl S3 for S3FS {
         let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
         debug_assert!(obj_meta.size() as usize == block_size);
-        let block_stream = BlockStream::new(paths, block_size, range, self.metrics.to_cas());
+        let mut block_stream = BlockStream::new(paths, block_size, range, self.metrics.to_cas());
+        if self.casfs.verify_on_read() {
+            // A no-op for a ranged read: a partial block cannot be checked
+            // against a whole-block address.
+            block_stream = block_stream.verified(self.casfs.hasher(), obj_meta.blocks().to_vec());
+        }
         let stream = StreamingBlob::wrap(block_stream);
 
         let output = GetObjectOutput {

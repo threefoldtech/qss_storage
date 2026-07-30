@@ -158,6 +158,7 @@ async fn run(args: ServerConfig) -> anyhow::Result<()> {
         args.inline_metadata_size,
         Some(args.durability),
         None,
+        false, // verify_on_read: off until the config file can turn it on
     )?;
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
     let s3fs = s3cas::metrics::MetricFs::new(s3fs, metrics.clone());

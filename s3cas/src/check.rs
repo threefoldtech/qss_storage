@@ -47,6 +47,7 @@ pub async fn check_integrity(args: CheckConfig) -> Result<()> {
         None,
         None,
         None,
+        false, // verify_on_read: this command checks the object hash itself
     )?;
 
     let (obj_meta, _) = match casfs.get_object_paths(&args.bucket, &args.key)? {

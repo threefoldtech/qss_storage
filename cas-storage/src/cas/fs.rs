@@ -22,6 +22,7 @@ pub struct CasFS {
     pub(super) shared: Arc<SharedBlockStore>,
     pub(super) root: PathBuf,
     pub(super) metrics: SharedMetrics,
+    pub(super) verify_on_read: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +66,11 @@ impl CasFS {
     ///
     /// [`MetaError::Header`] if the namespace DB exists but its header is
     /// missing or unacceptable; see [`MetaStore::open_or_create`].
+    ///
+    /// `verify_on_read` turns on block verification on read; see
+    /// [`CasFS::verify_on_read`] for what it does and does not cover. It is a
+    /// constructor parameter until the config file gives it a home.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut root: PathBuf,
         mut namespace_meta_path: PathBuf,
@@ -73,6 +79,7 @@ impl CasFS {
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
+        verify_on_read: bool,
     ) -> Result<Self, MetaError> {
         namespace_meta_path.push("db");
         root.push("blocks");
@@ -107,6 +114,7 @@ impl CasFS {
             shared,
             root,
             metrics,
+            verify_on_read,
         })
     }
 
@@ -121,6 +129,9 @@ impl CasFS {
     /// block hash, and the namespace DB, which inherits it. `spec` applies
     /// only to DBs that are created now; `None` takes
     /// [`HeaderSpec::default`].
+    ///
+    /// `verify_on_read` is passed straight to [`CasFS::new`].
+    #[allow(clippy::too_many_arguments)]
     pub fn single_namespace(
         root: PathBuf,
         meta_path: PathBuf,
@@ -129,6 +140,7 @@ impl CasFS {
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
         spec: Option<HeaderSpec>,
+        verify_on_read: bool,
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
@@ -145,6 +157,7 @@ impl CasFS {
             storage_engine,
             inlined_metadata_size,
             durability,
+            verify_on_read,
         )
     }
 
@@ -152,6 +165,20 @@ impl CasFS {
     /// block store's header at open.
     pub fn hasher(&self) -> crate::hasher::Hasher {
         self.shared.hasher()
+    }
+
+    /// Whether reads re-hash each block and refuse to serve one whose bytes no
+    /// longer hash to its address. Off by default: it costs a full buffer plus
+    /// a hash per block.
+    ///
+    /// # Limitation
+    ///
+    /// Whole blocks only. A range request is served from the same block files
+    /// without verification, because a partial block cannot be re-hashed
+    /// against a whole-block address. Callers that need the guarantee must ask
+    /// for the whole object.
+    pub fn verify_on_read(&self) -> bool {
+        self.verify_on_read
     }
 
     pub(super) fn path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
@@ -354,16 +381,40 @@ impl CasFS {
 mod tests {
     use super::AsyncByteStream;
     use super::*;
+    use crate::cas::block_stream::BlockStream;
+    use crate::cas::range_request::RangeRequest;
+    use crate::hasher::Hasher;
     use bytes::Bytes;
-    use futures::stream;
+    use futures::{StreamExt, stream};
     use once_cell::sync::Lazy;
     use tempfile::tempdir;
 
     const TEST_ENGINES: [StorageEngine; 2] = [StorageEngine::Fjall, StorageEngine::FjallNotx];
 
+    /// Both block address widths a store can be created with. Blocks written
+    /// under one are not addressable under the other, so every behaviour below
+    /// is checked at both.
+    const TEST_WIDTHS: [Hasher; 2] = [Hasher::Blake3W16, Hasher::Blake3W32];
+
+    /// The full backend x address-width matrix every test runs over.
+    fn matrix() -> Vec<(StorageEngine, Hasher)> {
+        TEST_ENGINES
+            .iter()
+            .flat_map(|engine| TEST_WIDTHS.iter().map(move |hasher| (*engine, *hasher)))
+            .collect()
+    }
+
     static METRICS: Lazy<SharedMetrics> = Lazy::new(SharedMetrics::default);
 
-    fn setup_test_fs(storage_engine: StorageEngine) -> (CasFS, tempfile::TempDir) {
+    fn setup_test_fs(storage_engine: StorageEngine, hasher: Hasher) -> (CasFS, tempfile::TempDir) {
+        setup_test_fs_verifying(storage_engine, hasher, false)
+    }
+
+    fn setup_test_fs_verifying(
+        storage_engine: StorageEngine,
+        hasher: Hasher,
+        verify_on_read: bool,
+    ) -> (CasFS, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let meta_path = dir.path().join("meta");
         let metrics = METRICS.clone();
@@ -375,9 +426,11 @@ mod tests {
             storage_engine,
             Some(1),
             Some(Durability::Buffer),
-            None,
+            Some(HeaderSpec::from(hasher)),
+            verify_on_read,
         )
         .unwrap();
+        assert_eq!(fs.hasher(), hasher, "store must open with the asked hasher");
         (fs, dir)
     }
 
@@ -429,8 +482,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_object_write_failure() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             let (fs, _mock) = fs.with_mock_fs();
             do_test_store_object_write_failure(fs).await;
         }
@@ -463,8 +516,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_object() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_object(fs).await;
         }
     }
@@ -539,8 +592,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_empty_object() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_empty_object(fs).await;
         }
     }
@@ -565,8 +618,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_inlined_object() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_inlined_object(fs).await;
         }
     }
@@ -588,8 +641,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_object_refcount() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_object_refcount(fs).await;
         }
     }
@@ -670,8 +723,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_and_delete_object() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_and_delete_object(fs).await;
         }
     }
@@ -730,8 +783,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_and_delete_object_with_refcount_same_blocks_diffkey() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_and_delete_object_with_refcount_same_blocks_diffkey(fs).await;
         }
     }
@@ -812,8 +865,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_and_delete_object_with_refcount_same_blocks_samekey() {
-        for engine in TEST_ENGINES {
-            let (fs, _dir) = setup_test_fs(engine);
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
             do_test_store_and_delete_object_with_refcount_same_blocks_samekey(fs).await;
         }
     }
@@ -877,5 +930,143 @@ mod tests {
         for id in obj1.blocks() {
             assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
         }
+    }
+
+    /// Payload spanning several blocks, with a partial last one. The period is
+    /// coprime with the block size, so no two blocks come out identical and
+    /// deduplication does not collapse them.
+    fn multi_block_data() -> Vec<u8> {
+        (0..BLOCK_SIZE * 2 + 4096)
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_block_files_hash_to_their_address() {
+        for (engine, hasher) in matrix() {
+            let (fs, _dir) = setup_test_fs(engine, hasher);
+            do_test_block_files_hash_to_their_address(fs, hasher).await;
+        }
+    }
+
+    /// End-to-end guard against a write path that hashes with anything but the
+    /// store's own hasher: write an object the normal way, then re-hash each
+    /// block file straight off disk and demand the address back, byte for
+    /// byte.
+    async fn do_test_block_files_hash_to_their_address(fs: CasFS, hasher: Hasher) {
+        const BUCKET: &str = "test-bucket";
+        const KEY: &str = "multi/block";
+        fs.create_bucket(BUCKET).unwrap();
+
+        let data = multi_block_data();
+        let len = data.len();
+        let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) }));
+        let obj = fs
+            .store_single_object_and_meta(BUCKET, KEY, stream, len)
+            .await
+            .unwrap();
+        assert!(obj.blocks().len() > 1, "test data must span several blocks");
+
+        let block_tree = fs.shared.block_tree();
+        for id in obj.blocks() {
+            assert_eq!(id.len(), hasher.width() as usize);
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
+            let path = block.disk_path(fs.fs_root().clone());
+            let on_disk = std::fs::read(&path).unwrap();
+            assert_eq!(on_disk.len(), block.size());
+            assert_eq!(
+                hasher.hash(&on_disk).as_slice(),
+                id.as_slice(),
+                "block file {} does not hash to its address {}",
+                path.display(),
+                id.to_hex()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_on_read_catches_corruption() {
+        // One width is enough here: what is under test is the read-side check,
+        // not the address width, which the matrix above already covers.
+        for engine in TEST_ENGINES {
+            let (fs, _dir) = setup_test_fs_verifying(engine, Hasher::Blake3W32, true);
+            assert!(fs.verify_on_read());
+            do_test_verify_on_read_catches_corruption(fs).await;
+        }
+    }
+
+    async fn do_test_verify_on_read_catches_corruption(fs: CasFS) {
+        const BUCKET: &str = "test-bucket";
+        const KEY: &str = "corrupt/me";
+        fs.create_bucket(BUCKET).unwrap();
+
+        let data = multi_block_data();
+        let original = data.clone();
+        let len = data.len();
+        let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) }));
+        let obj = fs
+            .store_single_object_and_meta(BUCKET, KEY, stream, len)
+            .await
+            .unwrap();
+
+        // An untouched object reads back clean with verification on.
+        assert_eq!(
+            read_whole_object(&fs, BUCKET, KEY, true).await.unwrap(),
+            original
+        );
+
+        // Flip a byte in the second block's file, behind the store's back.
+        let victim = obj.blocks()[1];
+        let block = fs
+            .shared
+            .block_tree()
+            .get_block(victim.as_slice())
+            .unwrap()
+            .unwrap();
+        let path = block.disk_path(fs.fs_root().clone());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Verification on: the read fails, naming the block and its file.
+        let err = read_whole_object(&fs, BUCKET, KEY, fs.verify_on_read())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&victim.to_hex()),
+            "error must name the block: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the block file: {msg}"
+        );
+
+        // Verification off: the same read serves the changed bytes, no error.
+        let served = read_whole_object(&fs, BUCKET, KEY, false).await.unwrap();
+        assert_eq!(served.len(), original.len());
+        assert_ne!(served, original);
+    }
+
+    /// Reads an object the way the S3 GET path does: block paths out of the
+    /// metadata, a `BlockStream` over them, verification attached when asked.
+    async fn read_whole_object(
+        fs: &CasFS,
+        bucket: &str,
+        key: &str,
+        verify: bool,
+    ) -> io::Result<Vec<u8>> {
+        let (obj, paths) = fs.get_object_paths(bucket, key).unwrap().unwrap();
+        let size: usize = paths.iter().map(|(_, size)| size).sum();
+        let mut stream = BlockStream::new(paths, size, RangeRequest::All, METRICS.clone());
+        if verify {
+            stream = stream.verified(fs.hasher(), obj.blocks().to_vec());
+        }
+        let mut out = Vec::with_capacity(size);
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk?);
+        }
+        Ok(out)
     }
 }

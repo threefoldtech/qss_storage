@@ -5,7 +5,8 @@
 //!
 //! ## Features
 //!
-//! - **Content-Addressable Storage**: Objects chunked into 1 MiB blocks, identified by MD5 hash
+//! - **Content-Addressable Storage**: Objects chunked into 1 MiB blocks, addressed by BLAKE3 hash
+//!   (the object ETag stays MD5, as S3 requires)
 //! - **Block Deduplication**: Duplicate blocks stored only once with reference counting
 //! - **Multi-User Support**: Shared block storage with isolated metadata per user
 //! - **Pluggable Backends**: Support for Fjall (transactional) and FjallNotx (non-transactional)
@@ -27,6 +28,7 @@
 //!     None,                // inlined_metadata_size
 //!     Some(Durability::Fsync),
 //!     None,                // header spec (defaults to blake3/32)
+//!     false,               // verify_on_read
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())
@@ -59,6 +61,7 @@
 //!     StorageEngine::Fjall,
 //!     None,
 //!     Some(Durability::Fsync),
+//!     false,               // verify_on_read
 //! )?;
 //! # Ok(())
 //! # }
@@ -108,7 +111,7 @@ pub use cas::{
     SharedBlockStore,
     StorageEngine,
     // Streaming and utilities
-    block_stream::BlockStream,
+    block_stream::{BlockCorruption, BlockStream},
     // Multipart support
     multipart::{MultiPart, MultiPartTree},
     range_request::{RangeRequest, parse_range_request},

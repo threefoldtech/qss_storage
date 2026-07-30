@@ -36,6 +36,7 @@ fn setup_casfs() -> (CasFS, TempDir) {
         inlined_metadata_size,
         durability,
         None,
+        false, // verify_on_read: benchmarks measure the normal read path
     )
     .unwrap();
 

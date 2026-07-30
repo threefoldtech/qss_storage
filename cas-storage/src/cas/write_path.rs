@@ -113,9 +113,10 @@ pub(super) async fn store_object(
             }
             // unwrap is safe as we checked that there is no error above
             let bytes: Vec<u8> = maybe_chunk.unwrap();
-            let mut hasher = Md5::new();
-            hasher.update(&bytes);
-            let block_hash = BlockId::from(<[u8; 16]>::from(hasher.finalize()));
+            // Block addresses come from the store's own hasher, which is
+            // fixed at store creation and read back from the header. MD5
+            // below is the object ETag and a different thing entirely.
+            let block_hash = fs.shared.hasher().hash(&bytes);
             let data_len = bytes.len();
 
             // check if this key already has this block

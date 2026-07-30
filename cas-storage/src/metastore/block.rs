@@ -6,11 +6,11 @@ use super::{
     codec::{Reader, put_len},
 };
 
-/// Size of a block identifier in bytes (16 bytes, equivalent to an MD5 hash)
+/// Narrow block address width in bytes: BLAKE3 truncated to 128 bits.
 ///
-/// This is the width every block address is built at today. The width becomes
-/// a per-store runtime choice later, at which point this constant disappears;
-/// `BlockId` already carries its own width so that change does not ripple.
+/// The width a store addresses blocks at is a per-store choice recorded in its
+/// header, so this is the narrow end of the range rather than the one true
+/// width; `BlockId` carries its own width alongside its bytes.
 pub const BLOCKID_SIZE: usize = 16;
 
 /// The widest block address `BlockId` can hold (a 256 bit hash).

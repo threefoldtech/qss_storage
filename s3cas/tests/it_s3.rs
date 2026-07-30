@@ -95,6 +95,7 @@ static CONFIG: Lazy<SdkConfig> = Lazy::new(|| {
         inlined_size,
         None,
         None,
+        false, // verify_on_read
     )
     .expect("can construct CasFS");
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
