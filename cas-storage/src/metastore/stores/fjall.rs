@@ -545,6 +545,18 @@ impl TransactionBackend for FjallTransaction {
             ))
         }
     }
+
+    fn remove(&mut self, tree_name: &str, key: &[u8]) -> Result<(), MetaError> {
+        let partition = self.store.get_partition(tree_name)?;
+        if let Some(ref mut tx) = self.tx {
+            tx.remove(&partition, key);
+            Ok(())
+        } else {
+            Err(MetaError::TransactionError(
+                "Transaction already rolled back".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

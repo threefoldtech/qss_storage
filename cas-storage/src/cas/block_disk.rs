@@ -280,9 +280,6 @@ impl AtomicBlockWriter {
 
     /// Unlinks the block file for `id` at `depth`. A file that is already
     /// gone is success -- unlink is the idempotent tail of DELETE.
-    // TODO(adr-0006): the allow dies when the delete path (component 6)
-    // unlinks through this.
-    #[allow(dead_code)]
     pub fn unlink_block(&self, ops: &dyn BlockDiskOps, id: &BlockId, depth: u8) -> io::Result<()> {
         ops.remove_file(&block_disk_path(id, depth, self.root.clone()))
     }

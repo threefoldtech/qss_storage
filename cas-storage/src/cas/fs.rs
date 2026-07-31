@@ -1099,6 +1099,54 @@ mod tests {
         }
     }
 
+    /// DELETE is idempotent: the second delete of one key finds no object
+    /// record (the atomic take-object pair removed it) and does nothing --
+    /// in particular it must NOT decrement any block a still-live object
+    /// holds.
+    #[tokio::test]
+    async fn test_double_delete_same_key_is_idempotent() {
+        let (fs, _dir) = setup_test_fs(StorageEngine::Fjall, Hasher::Blake3W32);
+        let bucket = "test-bucket";
+        fs.create_bucket(bucket).unwrap();
+
+        let data = b"double delete payload".repeat(50).to_vec();
+        let make_stream = |data: Vec<u8>| {
+            let len = data.len();
+            (
+                AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) })),
+                len,
+            )
+        };
+
+        // Two keys share the block: rc == 2.
+        let (stream, len) = make_stream(data.clone());
+        let obj = fs
+            .store_single_object_and_meta(bucket, "a", stream, len)
+            .await
+            .unwrap();
+        let (stream, len) = make_stream(data.clone());
+        fs.store_single_object_and_meta(bucket, "b", stream, len)
+            .await
+            .unwrap();
+        let id = obj.blocks()[0];
+        let block_tree = fs.shared.block_tree();
+        assert_eq!(
+            block_tree.get_block(id.as_slice()).unwrap().unwrap().rc(),
+            2
+        );
+
+        // Delete key "a" twice. The first decrements; the second is a no-op.
+        fs.delete_object(bucket, "a").await.unwrap();
+        fs.delete_object(bucket, "a").await.unwrap();
+
+        let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
+        assert_eq!(block.rc(), 1, "the double DELETE must not double-decrement");
+        assert!(
+            block.disk_path(&id, fs.fs_root().clone()).is_file(),
+            "the block key \"b\" references must survive"
+        );
+    }
+
     /// Payload spanning several blocks, with a partial last one. The period is
     /// coprime with the block size, so no two blocks come out identical and
     /// deduplication does not collapse them.

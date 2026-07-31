@@ -303,108 +303,6 @@ impl MetaStore {
         }
     }
 
-    /// Deletes an object from a bucket and manages its associated blocks.
-    ///
-    /// This method performs the following operations:
-    /// 1. Retrieves the object metadata from the bucket
-    /// 2. Removes the object from the bucket
-    /// 3. For each block in the object:
-    ///    - Decrements its reference count
-    ///    - If the reference count reaches zero, marks the block for deletion
-    /// 4. Returns the list of blocks that should be physically deleted from storage
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket containing the object
-    /// * `key` - The key of the object to delete
-    ///
-    /// # Returns
-    /// The `(BlockId, Block)` pairs that should be physically deleted -- the
-    /// id is returned alongside because the file path is derived from it
-    /// (see `block_disk_path`) -- or an error
-    ///
-    /// # Note
-    /// This method currently handles reference counting and block management directly.
-    /// In the future, these operations should be abstracted into a transaction system.
-    /// Delete an object from a bucket and decrement refcounts on its blocks.
-    ///
-    /// The bucket tree lives in this `MetaStore`; the block tree is passed
-    /// explicitly because in multi-namespace deployments it lives in a
-    /// separate `SharedBlockStore` (see `CasFS::new`). For single-namespace
-    /// use, pass `self.get_block_tree()?`.
-    pub fn delete_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        block_tree: &BlockTree,
-    ) -> Result<Vec<(BlockId, Block)>, MetaError> {
-        let bucket_tree = self.get_bucket_ext(bucket)?;
-
-        // Get the object metadata
-        let raw_object = match bucket_tree.get(key.as_bytes())? {
-            Some(o) => o,
-            None => return Ok(vec![]),
-        };
-
-        let obj = Object::try_from(&*raw_object)?;
-        let mut to_delete: Vec<(BlockId, Block)> = Vec::with_capacity(obj.blocks().len());
-
-        tracing::debug!(
-            bucket = bucket,
-            key = key,
-            block_count = obj.blocks().len(),
-            "Deleting object"
-        );
-
-        // Delete the object from the bucket
-        bucket_tree.remove(key.as_bytes())?;
-
-        // Process all blocks in the object
-        for block_id in obj.blocks() {
-            match block_tree.get(block_id.as_slice())? {
-                Some(block_data) => {
-                    let mut block = Block::try_from(&*block_data)?;
-
-                    // If this is the last reference to the block, delete it
-                    if block.rc() == 1 {
-                        tracing::debug!(
-                            block_hash = %block_id.to_hex(),
-                            rc = block.rc(),
-                            "Block rc==1: deleting block and marking for file deletion"
-                        );
-                        block_tree.remove(block_id.as_slice())?;
-                        to_delete.push((*block_id, block));
-                    } else {
-                        // Otherwise decrement the reference count
-                        let old_rc = block.rc();
-                        block.decrement_refcount();
-                        let new_rc = block.rc();
-                        tracing::debug!(
-                            block_hash = %block_id.to_hex(),
-                            old_rc = old_rc,
-                            new_rc = new_rc,
-                            "Block rc>1: decrementing refcount"
-                        );
-                        block_tree.insert(block_id.as_slice(), block.to_vec())?;
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        block_hash = %block_id.to_hex(),
-                        "Block not found in tree during deletion"
-                    );
-                    continue; // Block not found, skip it
-                }
-            }
-        }
-
-        tracing::debug!(
-            blocks_to_delete = to_delete.len(),
-            "Finished processing object deletion"
-        );
-
-        Ok(to_delete)
-    }
-
     /// Begins a new transaction for atomic operations.
     ///
     /// # Returns
@@ -500,40 +398,6 @@ impl BlockTree {
         self.len().map(|n| n == 0)
     }
 
-    /// Removes a block from the tree.
-    ///
-    /// # Arguments
-    /// * `key` - The key of the block to remove
-    ///
-    /// # Returns
-    /// Success or an error if the removal fails
-    pub fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
-        self.tree.remove(key)
-    }
-
-    /// Inserts a block into the tree.
-    ///
-    /// # Arguments
-    /// * `key` - The key to associate with the block
-    /// * `value` - The serialized block data
-    ///
-    /// # Returns
-    /// Success or an error if the insertion fails
-    fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), MetaError> {
-        self.tree.insert(key, value)
-    }
-
-    /// Retrieves the raw block data for the given key.
-    ///
-    /// # Arguments
-    /// * `key` - The key to look up
-    ///
-    /// # Returns
-    /// The raw block data if found, None if the key doesn't exist, or an error
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
-        self.tree.get(key)
-    }
-
     /// Returns an iterator over all blocks in the tree.
     ///
     /// # Returns
@@ -554,6 +418,22 @@ impl BlockTree {
             Err(e) => Err(e),
         }))
     }
+}
+
+/// How a striped block decrement resolved; see
+/// [`Transaction::decrement_block_rc`].
+#[derive(Debug)]
+pub enum BlockDecrement {
+    /// No record for the block existed. DELETE logs and moves on: the
+    /// reference the object held was already unaccounted.
+    Missing,
+    /// The reference count was above one and has been decremented; the
+    /// block (and its file) live on.
+    Decremented(Block),
+    /// This was the last reference: the record has been removed in this
+    /// transaction. After committing, the caller must unlink the file at
+    /// the block's recorded depth -- inside the same stripe hold.
+    Removed(Block),
 }
 
 /// Represents a database transaction that can be committed or rolled back.
@@ -627,6 +507,68 @@ impl Transaction {
         }
     }
 
+    /// The DELETE-side object step (ADR 0006): reads AND removes the object
+    /// record for `key` inside this transaction, so read+remove commit as
+    /// one atomic pair -- that is what defeats a concurrent double-DELETE
+    /// of one key double-decrementing block refcounts (verified defect 5's
+    /// sibling).
+    ///
+    /// Returns the removed object, or `None` (and no change) if the key was
+    /// absent -- DELETE is idempotent.
+    pub fn take_object(&mut self, bucket: &str, key: &str) -> Result<Option<Object>, MetaError> {
+        let Some(raw) = self.backend.get(bucket, key.as_bytes())? else {
+            return Ok(None);
+        };
+        let obj = Object::try_from(&*raw)?;
+        self.backend.remove(bucket, key.as_bytes())?;
+        Ok(Some(obj))
+    }
+
+    /// The DELETE-side block step (ADR 0006): re-checks the record and
+    /// applies one reference decrement inside this transaction.
+    ///
+    /// The re-check matters: between the object removal and this call,
+    /// other writers may have bumped or even removed-and-recreated the
+    /// record, so the caller's earlier knowledge is stale. Under the stripe
+    /// this read-modify-write is race-free (hard rules 1 and 2).
+    ///
+    /// On [`BlockDecrement::Removed`] the caller must commit FIRST and then
+    /// unlink the file at the returned block's depth, all inside the same
+    /// stripe hold and the same blocking closure (hard rule 4) -- a
+    /// cancellable await between decrement and unlink is how a detached
+    /// unlink once deleted a freshly rewritten block.
+    pub fn decrement_block_rc(&mut self, block_hash: BlockId) -> Result<BlockDecrement, MetaError> {
+        let Some(raw) = self
+            .backend
+            .get(DEFAULT_BLOCK_TREE, block_hash.as_slice())?
+        else {
+            return Ok(BlockDecrement::Missing);
+        };
+        let mut block = Block::try_from(&*raw)?;
+
+        if block.rc() == 1 {
+            tracing::debug!(
+                block_hash = %block_hash.to_hex(),
+                "Block rc==1: removing record; caller unlinks the file"
+            );
+            self.backend
+                .remove(DEFAULT_BLOCK_TREE, block_hash.as_slice())?;
+            return Ok(BlockDecrement::Removed(block));
+        }
+
+        let old_rc = block.rc();
+        block.decrement_refcount();
+        tracing::debug!(
+            block_hash = %block_hash.to_hex(),
+            old_rc = old_rc,
+            new_rc = block.rc(),
+            "Block rc>1: decrementing refcount"
+        );
+        self.backend
+            .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())?;
+        Ok(BlockDecrement::Decremented(block))
+    }
+
     /// The new-block half of the ADR 0006 write protocol: insert a fresh
     /// record (rc = 1) for `block_hash` at the given fanout depth.
     ///
@@ -691,6 +633,10 @@ pub(crate) trait TransactionBackend: Send + Sync {
     /// # Returns
     /// Success or an error if the insertion fails
     fn insert(&mut self, tree_name: &str, key: &[u8], data: Vec<u8>) -> Result<(), MetaError>;
+
+    /// Removes a key from the specified tree. Removing an absent key is not
+    /// an error; the transaction's atomicity is what callers rely on.
+    fn remove(&mut self, tree_name: &str, key: &[u8]) -> Result<(), MetaError>;
 }
 
 #[cfg(test)]
