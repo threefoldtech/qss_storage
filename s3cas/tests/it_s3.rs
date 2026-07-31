@@ -499,6 +499,10 @@ async fn do_test_list_objects_v2_startafter(engine: StorageEngine) -> Result<()>
         );
 
         assert!(response.next_continuation_token().is_some());
+        // The CLI paginator keys on IsTruncated, not on the token: a page
+        // with more behind it must say so, and key_count counts this page.
+        assert_eq!(response.is_truncated(), Some(true));
+        assert_eq!(response.key_count(), Some(1000));
 
         {
             // ------ next page using token
@@ -522,6 +526,8 @@ async fn do_test_list_objects_v2_startafter(engine: StorageEngine) -> Result<()>
 
             assert_eq!(response.continuation_token().unwrap(), token);
             assert!(response.next_continuation_token().is_none());
+            assert_eq!(response.is_truncated(), Some(false));
+            assert_eq!(response.key_count(), Some(100));
             assert!(response.start_after().is_none());
             assert_eq!(
                 "this/is/a/test/path/file1001.txt",
@@ -549,6 +555,7 @@ async fn do_test_list_objects_v2_startafter(engine: StorageEngine) -> Result<()>
 
             assert!(response.next_continuation_token().is_none());
             assert!(response.continuation_token().is_none());
+            assert_eq!(response.is_truncated(), Some(false));
             assert!(response.start_after().is_some());
             assert_eq!(
                 "this/is/a/test/path/file1001.txt",
@@ -556,6 +563,49 @@ async fn do_test_list_objects_v2_startafter(engine: StorageEngine) -> Result<()>
             );
         }
     }
+
+    Ok(())
+}
+
+/// Listing a bucket that does not exist must answer NoSuchBucket -- and
+/// must not create it. The list path used to open the bucket tree with
+/// create-if-missing semantics, minting a bucket that accepted PUTs yet
+/// never appeared in ListBuckets.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_of_absent_bucket_creates_nothing() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let ghost = format!("test-ghost-{}", Uuid::new_v4());
+
+    let err = c.list_objects_v2().bucket(&ghost).send().await.unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchBucket");
+
+    let err = c.list_objects().bucket(&ghost).send().await.unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchBucket");
+
+    // The refused lists must not have materialized anything: a PUT into
+    // the bucket still has nowhere to go.
+    let err = c
+        .put_object()
+        .bucket(&ghost)
+        .key("file.txt")
+        .body(ByteStream::from_static(b"hello"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchBucket");
+
+    let buckets = c.list_buckets().send().await?;
+    assert!(
+        buckets
+            .buckets()
+            .iter()
+            .filter_map(|b| b.name())
+            .all(|name| name != ghost),
+        "the ghost bucket must not appear in ListBuckets"
+    );
 
     Ok(())
 }

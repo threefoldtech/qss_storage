@@ -777,9 +777,14 @@ impl S3 for S3FS {
             ..
         } = req.input;
 
-        let key_count = max_keys
-            .map(|mk| if mk > MAX_KEYS { MAX_KEYS } else { mk })
-            .unwrap_or(MAX_KEYS);
+        let key_count = max_keys.unwrap_or(MAX_KEYS).clamp(0, MAX_KEYS);
+
+        // The existence check must come before get_bucket: the store opens
+        // trees with create-if-missing semantics, so listing an absent
+        // bucket would quietly will it into being instead of failing.
+        if !try_!(self.casfs.bucket_exists(&bucket)) {
+            return Err(s3_error!(NoSuchBucket, "Bucket does not exist"));
+        }
 
         let b = try_!(self.casfs.get_bucket(&bucket));
 
@@ -794,14 +799,21 @@ impl S3 for S3FS {
                 storage_class: None,
                 ..Default::default()
             })
-            .take((key_count + 1) as usize)
+            .take(key_count as usize + 1)
             .collect::<Vec<_>>();
 
-        let mut next_marker = None;
-        let truncated = objects.len() == key_count as usize + 1;
+        let truncated = objects.len() > key_count as usize;
         if truncated {
-            next_marker = Some(objects.pop().unwrap().key.unwrap())
+            // Drop the probe row and name the last key DELIVERED as the
+            // marker: range_filter resumes strictly after its marker, so
+            // handing out the probe key itself would skip that key.
+            objects.pop();
         }
+        let next_marker = if truncated {
+            objects.last().and_then(|o| o.key.clone())
+        } else {
+            None
+        };
 
         let output = ListObjectsOutput {
             contents: Some(objects),
@@ -841,16 +853,24 @@ impl S3 for S3FS {
             ..
         } = req.input;
 
+        // Same order as list_objects: existence first, because get_bucket
+        // creates what it cannot find.
+        if !try_!(self.casfs.bucket_exists(&bucket)) {
+            return Err(s3_error!(NoSuchBucket, "Bucket does not exist"));
+        }
+
         let b = try_!(self.casfs.get_bucket(&bucket));
 
         // max number of keys to return, default is MAX_KEYS(1000)
-        let requested_keys = max_keys.unwrap_or(MAX_KEYS);
-        let key_count = std::cmp::min(requested_keys, MAX_KEYS);
+        let key_count = max_keys.unwrap_or(MAX_KEYS).clamp(0, MAX_KEYS);
 
         // continuation token
         let decoded_continuation_token = decode_continuation_token(continuation_token.as_deref())?;
 
-        let objects: Vec<_> = b
+        // One probe row past the page decides is_truncated: a full page
+        // with nothing behind it must not claim truncation, or the client
+        // is sent on one more round trip for an empty page.
+        let mut objects: Vec<_> = b
             .range_filter(
                 start_after.clone(),
                 prefix.clone(),
@@ -865,24 +885,26 @@ impl S3 for S3FS {
                 storage_class: None,
                 ..Default::default()
             })
-            .take(key_count as usize)
+            .take(key_count as usize + 1)
             .collect();
 
-        let mut next_token = None;
-        let has_next = objects.len() == key_count as usize;
-        if has_next {
-            next_token = Some(hex_string(
-                objects[(key_count - 1) as usize]
-                    .key
-                    .as_ref()
-                    .unwrap()
-                    .as_bytes(),
-            ))
+        let truncated = objects.len() > key_count as usize;
+        if truncated {
+            objects.pop();
         }
+        // The token is the last key this page delivers: range_filter
+        // resumes strictly after it. The paginator itself never reads it --
+        // it keys on is_truncated, whose omission was the bug that made
+        // every listing stop at one page.
+        let next_token = match (truncated, objects.last()) {
+            (true, Some(last)) => last.key.as_ref().map(|key| hex_string(key.as_bytes())),
+            _ => None,
+        };
 
         let output = ListObjectsV2Output {
-            key_count: Some(key_count),
+            key_count: Some(objects.len() as i32),
             max_keys: Some(key_count),
+            is_truncated: Some(truncated),
             contents: Some(objects),
             continuation_token,
             delimiter,
