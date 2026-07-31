@@ -614,6 +614,51 @@ impl Transaction {
         Ok(Some(obj))
     }
 
+    /// The overwrite-side object step (ADR 0008): reads the object record
+    /// for `key` AND writes `raw_obj` over it inside this transaction,
+    /// returning what it displaced (`None` if the key was free).
+    ///
+    /// [`take_object`](Self::take_object)'s sibling, and for the same
+    /// reason: the read and the write must commit as one atomic pair. The
+    /// returned record is what THIS writer displaced, so it is this
+    /// writer's to release -- and no other writer's. Two concurrent
+    /// overwrites of one key serialize under the single-writer transaction:
+    /// the first displaces the original, the second displaces the first's
+    /// record, and every record is released exactly once by exactly the
+    /// writer that replaced it.
+    ///
+    /// Splitting the read from the write is the bug this shape exists to
+    /// prevent. Both writers would read the same displaced record and both
+    /// would release its blocks: a double decrement per occurrence, which
+    /// is the loss direction.
+    ///
+    /// # The caller releases AFTER the commit, never before
+    ///
+    /// The new record is durable before the old references are dropped. A
+    /// crash in between leaves the old blocks over-counted -- leakage, INFO,
+    /// collected by the next recount. The reverse order would drop
+    /// references while the old record is still the visible one, so a reader
+    /// resolving that record races an unlink with nothing holding the block:
+    /// loss. See `release_blocks` for the same argument on the delete side.
+    ///
+    /// A displaced record that will not decode fails the whole call and
+    /// nothing is written. Writing over a record whose block list could not
+    /// be read would strand every reference it names, with no holder left
+    /// that can ever name them again.
+    pub fn replace_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        raw_obj: Vec<u8>,
+    ) -> Result<Option<Object>, MetaError> {
+        let displaced = match self.backend.get(bucket, key.as_bytes())? {
+            Some(raw) => Some(Object::try_from(&*raw)?),
+            None => None,
+        };
+        self.backend.insert(bucket, key.as_bytes(), raw_obj)?;
+        Ok(displaced)
+    }
+
     /// The multipart claim (ADR 0003): reads AND removes the upload record
     /// at `key` in [`UPLOADS_TREE`] inside this transaction.
     ///
@@ -1093,6 +1138,151 @@ mod tests {
                 .iter()
                 .any(|name| name == "videos"),
             "the tree outlives its _BUCKETS row"
+        );
+    }
+
+    /// An object record naming `blocks`, at a hash derived from `tag` so two
+    /// fixtures are never mistaken for each other.
+    fn object(tag: u8, blocks: Vec<BlockId>) -> Object {
+        Object::new(
+            1024,
+            crate::metastore::ContentHash::from([tag; 16]),
+            crate::metastore::ObjectData::SinglePart { blocks },
+        )
+    }
+
+    fn stored_object(meta: &MetaStore, bucket: &str, key: &str) -> Option<Object> {
+        meta.get_meta(bucket, key).unwrap()
+    }
+
+    /// A replace onto a free key displaces nothing, and the record it wrote
+    /// is the one that reads back.
+    #[test]
+    fn replace_object_on_a_free_key_displaces_nothing() {
+        let (meta, _dir) = test_store();
+        let fresh = object(0x01, vec![BlockId::from([0x11u8; BLOCKID_SIZE])]);
+
+        let mut tx = meta.begin_transaction();
+        let displaced = tx.replace_object("photos", "a", fresh.to_vec()).unwrap();
+        tx.commit().unwrap();
+
+        assert!(displaced.is_none(), "nothing was there to displace");
+        assert_eq!(
+            stored_object(&meta, "photos", "a").unwrap().blocks(),
+            fresh.blocks()
+        );
+    }
+
+    /// The point of the primitive: the replace hands back the record it
+    /// overwrote, which is the list of references the caller must release.
+    #[test]
+    fn replace_object_returns_what_it_overwrote() {
+        let (meta, _dir) = test_store();
+        let old = object(0x01, vec![BlockId::from([0x11u8; BLOCKID_SIZE])]);
+        let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
+
+        let mut tx = meta.begin_transaction();
+        tx.replace_object("photos", "a", old.to_vec()).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = meta.begin_transaction();
+        let displaced = tx.replace_object("photos", "a", new.to_vec()).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            displaced.expect("the old record").blocks(),
+            old.blocks(),
+            "the displaced record is the caller's to release"
+        );
+        assert_eq!(
+            stored_object(&meta, "photos", "a").unwrap().blocks(),
+            new.blocks(),
+            "the new record is the visible one"
+        );
+    }
+
+    /// Sequential overwrites of one key each displace exactly the previous
+    /// record -- never the original twice, never one of them not at all.
+    /// This is what makes each writer's release exact under concurrency:
+    /// fjall's single-writer transaction turns any interleaving into this
+    /// sequence.
+    #[test]
+    fn sequential_replaces_each_displace_the_previous_record() {
+        let (meta, _dir) = test_store();
+
+        let mut previous: Option<Object> = None;
+        for tag in 1u8..=4 {
+            let next = object(tag, vec![BlockId::from([tag; BLOCKID_SIZE])]);
+            let mut tx = meta.begin_transaction();
+            let displaced = tx.replace_object("photos", "a", next.to_vec()).unwrap();
+            tx.commit().unwrap();
+
+            match (&previous, &displaced) {
+                (None, None) => {}
+                (Some(prev), Some(got)) => assert_eq!(
+                    got.blocks(),
+                    prev.blocks(),
+                    "each replace displaces exactly the previous record"
+                ),
+                other => panic!("displacement mismatch at tag {tag}: {other:?}"),
+            }
+            previous = Some(next);
+        }
+
+        assert_eq!(
+            stored_object(&meta, "photos", "a").unwrap().blocks(),
+            &[BlockId::from([4u8; BLOCKID_SIZE])],
+            "the last writer's record survives"
+        );
+    }
+
+    /// A rolled-back replace writes nothing: the read and the write are one
+    /// transaction, not a read followed by a blind insert.
+    #[test]
+    fn replace_object_rolls_back_with_the_transaction() {
+        let (meta, _dir) = test_store();
+        let old = object(0x01, vec![BlockId::from([0x11u8; BLOCKID_SIZE])]);
+        let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
+
+        let mut tx = meta.begin_transaction();
+        tx.replace_object("photos", "a", old.to_vec()).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = meta.begin_transaction();
+        tx.replace_object("photos", "a", new.to_vec()).unwrap();
+        tx.rollback();
+
+        assert_eq!(
+            stored_object(&meta, "photos", "a").unwrap().blocks(),
+            old.blocks(),
+            "a rolled-back replace leaves the original record"
+        );
+    }
+
+    /// A displaced record that will not decode fails the call and writes
+    /// nothing. Overwriting it would strand every reference it names, with
+    /// no holder left able to name them again.
+    #[test]
+    fn replace_object_refuses_to_overwrite_an_undecodable_record() {
+        let (meta, _dir) = test_store();
+        meta.get_bucket_ext("photos")
+            .unwrap()
+            .insert(b"a", vec![0xffu8; 3])
+            .unwrap();
+
+        let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
+        let mut tx = meta.begin_transaction();
+        assert!(tx.replace_object("photos", "a", new.to_vec()).is_err());
+        tx.rollback();
+
+        assert_eq!(
+            meta.get_bucket_ext("photos")
+                .unwrap()
+                .get(b"a")
+                .unwrap()
+                .unwrap(),
+            vec![0xffu8; 3],
+            "the unreadable record is left exactly as found"
         );
     }
 
