@@ -40,7 +40,8 @@ pub enum Severity {
 #[serde(rename_all = "snake_case")]
 pub enum FindingClass {
     /// The record's rc is higher than the walked holder count. The expected
-    /// direction: overwrite leak, cancellation residue.
+    /// direction: cancellation residue, or a crash between a record write
+    /// and the release that should have followed it.
     RefcountOverCount,
     /// The record's rc is lower than the walked holder count -- a premature
     /// free waiting to happen.

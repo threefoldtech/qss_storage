@@ -26,11 +26,15 @@ use super::{ScrubContext, holders};
 
 /// Pass 1: what the holders say versus what `_BLOCKS` says.
 ///
-/// Over-counts are the expected direction and cost only space: the
-/// same-key overwrite leak, cancellation residue. Under-counts are the
-/// dangerous direction -- a block will be freed while something still
-/// references it -- and a holder reference with no record at all means the
-/// data is already unreachable.
+/// Over-counts are the expected direction and cost only space: cancellation
+/// residue, and crashes between a record write and the release that should
+/// have followed it. Under-counts are the dangerous direction -- a block
+/// will be freed while something still references it -- and a holder
+/// reference with no record at all means the data is already unreachable.
+///
+/// Since ADR 0008 a successful overwrite is no longer among the producers:
+/// it releases what it displaced, so over-counts stopped being a routine
+/// finding on a healthy store and went back to meaning something happened.
 pub fn recount(expected: &ExpectedCounts, records: &RecordWalk) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -74,7 +78,8 @@ pub fn recount(expected: &ExpectedCounts, records: &RecordWalk) -> Vec<Finding> 
     }
 
     // A record no holder mentions is the other half of the over-count: a
-    // cancelled PUT, or an overwrite whose replaced object leaked.
+    // cancelled PUT, or an overwrite that crashed between committing the
+    // new record and releasing the old one's blocks.
     for (id, block) in &records.records {
         if !expected.contains_key(id) {
             findings.push(

@@ -93,10 +93,11 @@ fn set_rc(shared: &super::shared_block_store::SharedBlockStore, id: BlockId, rc:
 }
 
 /// Residue class 6: an inflated refcount -- the leak direction. Produced by
-/// the same-key overwrite (which bumps for the new object and decrements
-/// nothing for the replaced one) and by a DELETE that crashed after
-/// removing the object record. Costs space, never data; fsck's recount
-/// lowers it to the walked truth.
+/// a DELETE that crashed after removing the object record, and by an
+/// overwrite that crashed after committing the new record and before
+/// releasing the old one's blocks (ADR 0008 -- a SUCCESSFUL overwrite
+/// leaves nothing here, it releases what it displaced). Costs space, never
+/// data; fsck's recount lowers it to the walked truth.
 pub(crate) fn plant_inflated_rc(
     shared: &super::shared_block_store::SharedBlockStore,
     id: BlockId,
