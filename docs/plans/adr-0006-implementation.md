@@ -17,13 +17,15 @@ with no other context.
   data).
 - `key_has_block` skip: dropped. Every dedup hit bumps rc under the
   stripe.
-- `fjall_notx`: scoped out of the loss-never guarantee. No key-stripe.
+- `fjall_notx`: REMOVED outright (ADR 0007, Accepted 2026-07-31). The
+  removal lands before this plan executes, so no component carries a
+  notx arm; the config value is rejected with a migration message.
 - Temp mechanism: named temps in `blocks/.tmp/`, `O_CREAT|O_EXCL`,
   mandatory per-attempt nonce. O_TMPFILE rejected.
 - Orphan heal: rename-over unconditionally, never compare-and-skip.
 - Durability gating: `Buffer` skips all file/dir fsyncs; `Fsync`/
   `Fdatasync` sync files and directories (directories always via full
-  fsync). On notx, file fsyncs still follow the configured level.
+  fsync).
 - All review asks are resolved. Landing order: 0006 lands before 0005.
 
 **Hard rules carried from the review** (violating any of these
@@ -128,7 +130,7 @@ No migration: the record format change ships as-is. Check
 old store fails loudly at open instead of misreading records.
 
 Acceptance: `grep -r _PATHS cas-storage/ s3cas/` returns nothing;
-PUT/GET/DELETE round-trips green on both backends; a hand-planted
+PUT/GET/DELETE round-trips green; a hand-planted
 orphan file at depth 1 is healed in place by a retried PUT (record
 stores depth 1); GET resolves via the recorded depth only.
 
@@ -270,8 +272,7 @@ seam in the namespace store.
 delete_object(bucket, key):
     # step 1 -- namespace DB (separate fjall database from blocks)
     obj = namespace tx { read object record; remove it; commit }
-    #   atomic pair: defeats double-DELETE on the tx backend
-    #   (notx: best-effort get-then-remove; accepted, scoped out)
+    #   atomic pair: defeats double-DELETE
     if obj is None: return Ok      # idempotent
 
     # step 2 -- per block occurrence, one stripe at a time
@@ -304,24 +305,18 @@ Acceptance: delete tests green; double-DELETE same key on the tx
 backend: second call returns Ok having done nothing; unlink of a
 missing file does not error.
 
-## Component 7: notx contract scope + docs
+## Component 7: docs
 
-**Check ADR 0007 first**: it proposes removing the fjall_notx backend
-outright. If accepted before this component runs, component 7 becomes
-the removal (delete `fjall_notx.rs`, reject the config value with a
-migration message, drop the notx arms from components 5/6/9's work and
-tests) and the warning/docs updates below are moot.
+ADR 0007 was accepted 2026-07-31 (remove fjall_notx) and the removal
+landed before this plan's execution, so the notx warning/scope updates
+this component once carried are moot. What remains:
 
-- Update the startup warning (`shared_block_store.rs:62-69`): state
-  that the loss-never contract is guaranteed on the transactional
-  backend only; on `fjall_notx` concurrent DELETEs of one key are
-  unserializable and metadata is never durable (the Durability knob is
-  ignored for metadata; block-file fsyncs still follow it).
-- `docs/refcount.md`: add the same scope note.
+- `docs/refcount.md`: the loss-never contract holds unconditionally
+  (single backend); drop any per-backend asterisk.
 - After landing, update `docs/arch/deadlock-fix.md`'s "current state"
   framing and `docs/as-built/02-storage-model.md` to describe the
-  file-first protocol; flip ADR 0006 Status to Accepted with the
-  landing commit hash.
+  file-first protocol; record the landing commit hash in ADR 0006's
+  Status line (already Accepted 2026-07-31).
 
 ## Component 8: Observability
 
@@ -333,8 +328,7 @@ tests) and the warning/docs updates below are moot.
 
 ## Component 9: Tests and benchmark
 
-Race stress (multi-thread runtime; tx backend asserts exact rc, notx
-asserts no panic/no torn state only -- it is scoped out):
+Race stress (multi-thread runtime; assert exact rc):
 - N concurrent PUTs of one new block: exactly one file write, rc == N.
 - PUT storm vs DELETE-last-ref loop on one block: invariants -- never
   a record without a complete file, never an unlinked live block; at

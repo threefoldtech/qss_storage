@@ -1,6 +1,7 @@
 # The fjall_notx Backend: Contract Scope and Fate
 
-**Status**: Proposed
+**Status**: Accepted (2026-07-31, owner sign-off: remove the backend;
+removal lands before the ADR 0006 implementation)
 **Date**: 2026-07-31
 
 ---
@@ -72,7 +73,7 @@ backend invariants they may assume), `docs/refcount.md`.
 
 ## Decision
 
-Proposed, pending review: **remove the fjall_notx backend.**
+**Remove the fjall_notx backend.** (Accepted 2026-07-31.)
 
 The argument is that ADR 0006 dissolves its reason to exist:
 
@@ -185,12 +186,16 @@ The argument is that ADR 0006 dissolves its reason to exist:
 
 ---
 
-## Review asks
+## Review asks (all resolved 2026-07-31)
 
 1. Remove (recommended), keep-as-hardened-tier, or repair-to-parity?
+   **Decided: remove.**
 2. If removal: does anything in your deployment story select
    `fjall_notx` today? (In-repo, nothing does by default; the example
    config documents it but the default is `fjall`.)
+   **Owner confirmed: nothing selects it.** A config-rejection error
+   with the migration path is sufficient.
 3. Sequencing: removal is independent of ADR 0006's implementation
    order but simplifies it (plan components 5, 6, and 9 lose their
    notx arms) -- land the removal first?
+   **Decided: removal lands first.**
