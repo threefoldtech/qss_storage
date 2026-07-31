@@ -208,8 +208,14 @@ pub(super) async fn store_object(
 
         let shared = fs.shared.clone();
         let metrics = fs.metrics.clone();
+        // In-flight gauge: started at submission, finished as the closure's
+        // last act -- the closure always runs to completion, so the pair
+        // balances even when this future is cancelled at the await below.
+        fs.metrics.block_disk_op_started();
         let joined = tokio::task::spawn_blocking(move || {
-            write_one_block(shared, metrics, stripe_guard, block_hash, &bytes)
+            let result = write_one_block(shared, metrics.clone(), stripe_guard, block_hash, &bytes);
+            metrics.block_disk_op_finished();
+            result
         })
         .await;
 

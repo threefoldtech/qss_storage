@@ -84,6 +84,12 @@ impl cas_storage::MetricsCollector for CasMetricsAdapter {
     fn bytes_received(&self, amount: usize) {
         self.0.bytes_received(amount)
     }
+    fn block_disk_op_started(&self) {
+        self.0.block_disk_op_started()
+    }
+    fn block_disk_op_finished(&self) {
+        self.0.block_disk_op_finished()
+    }
 }
 
 impl SharedMetrics {
@@ -104,6 +110,7 @@ pub struct Metrics {
     data_blocks_pending_write: IntGauge,
     data_blocks_write_errors: IntCounter,
     data_blocks_dropped: IntCounter,
+    data_block_disk_ops_inflight: IntGauge,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
@@ -171,6 +178,12 @@ impl Metrics {
             "Amount of data blocks dropped due to client disconnects before the block was (fully) written to storage",
         ).expect("can register an int gauge in the default registry");
 
+        let data_block_disk_ops_inflight = register_int_gauge!(
+            "s3_data_block_disk_ops_inflight",
+            "Blocking block-disk operations (write- and delete-side) submitted and not yet completed; sustained growth against the completion rate signals blocking-pool queue depth",
+        )
+        .expect("can register an int gauge in the default registry");
+
         Self {
             method_calls,
             bucket_count,
@@ -182,7 +195,16 @@ impl Metrics {
             data_blocks_pending_write,
             data_blocks_write_errors,
             data_blocks_dropped,
+            data_block_disk_ops_inflight,
         }
+    }
+
+    pub fn block_disk_op_started(&self) {
+        self.data_block_disk_ops_inflight.inc()
+    }
+
+    pub fn block_disk_op_finished(&self) {
+        self.data_block_disk_ops_inflight.dec()
     }
 
     pub fn add_method_call(&self, call_name: &str) {

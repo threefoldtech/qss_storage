@@ -43,10 +43,10 @@ The four extension blocks, all added to serve `respd`:
 | `metastore/traits.rs:48-59` | `BaseMetaTree::len` / `is_empty` promoted out of `#[cfg(test)]` | respd `LENGTH`, `DBSIZE` |
 | `metastore/traits.rs:76-88` | `MetaTreeExt::iter_kv(start_after)` | respd `SCAN` cursor |
 | `metastore/stores/fjall.rs:275-335` | impl of the above, transactional backend | -- |
-| `metastore/stores/fjall_notx.rs:204-260` | impl of the above, non-transactional backend | -- |
+| `metastore/stores/fjall_notx.rs` (removed by ADR 0007) | impl of the above, non-transactional backend | -- |
 
 Plus two `promoted out of #[cfg(test)] for runtime use` markers at
-`fjall.rs:260` and `fjall_notx.rs:189`.
+`fjall.rs` (the `fjall_notx.rs` copy died with the backend, ADR 0007).
 
 `EXTENSIONS.md` states the goal as upstreaming these so the fork can dissolve,
 and sketches the PR. That has not happened.
@@ -140,9 +140,9 @@ metadata root. This is what makes deduplication work *across* users, and it is
 the mode that gives the MD5 collision finding its teeth -- see
 [04-code-health.md](./04-code-health.md#h4-md5-content-addressing-under-shared-block-storage----by-inspection).
 
-`shared_block_store.rs:49-56` emits a runtime warning when `fjall_notx` is
-selected in multi-user mode, noting weaker consistency guarantees, then
-proceeds.
+(A runtime warning for `fjall_notx` in multi-user mode used to live in
+`shared_block_store.rs`; the backend and the warning were removed by ADR
+0007 -- the config value now fails parse with a migration message.)
 
 ## Metrics
 
@@ -173,11 +173,12 @@ on `s3cas`, defaulting to `fjall`:
 
 | Engine | File | Lines | Transactions |
 |--------|------|-------|--------------|
-| `fjall` | `metastore/stores/fjall.rs` | 433 | yes, single-writer |
-| `fjall_notx` | `metastore/stores/fjall_notx.rs` | 358 | no |
+| `fjall` | `metastore/stores/fjall.rs` | ~600 | yes, single-writer |
 
-The two files share 235 identical lines. See
-[04-code-health.md](./04-code-health.md#b1-two-near-copy-store-backends).
+(`fjall_notx` was removed by ADR 0007; the interim `fjall_common.rs`
+flavor layer that had deduplicated the two backends was folded back into
+`fjall.rs` at the same time. Historical context:
+[04-code-health.md](./04-code-health.md#b1-two-near-copy-store-backends).)
 
 ## Build and CI
 

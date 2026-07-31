@@ -32,11 +32,10 @@ cas-storage/src/
     +-- block.rs              Block, BlockID
     +-- bucket_meta.rs        BucketMeta
     +-- errors.rs             MetaError, FsError
-    +-- codec.rs              record cursor + id-list helpers (format v1)
+    +-- codec.rs              record cursor + id-list helpers
     +-- stores/
-        +-- fjall.rs          transactional backend                   433 lines
-        +-- fjall_notx.rs     non-transactional backend               358 lines
-        +-- test_utils.rs     shared backend test battery
+        +-- fjall.rs          the (transactional) backend             ~600 lines
+        +-- test_utils.rs     backend test battery
 ```
 
 Note the mixed module style: `cas.rs` alongside `cas/` (the post-2018 form) but
@@ -48,7 +47,7 @@ crate -- finding H11.
 `lib.rs:70-107` re-exports deliberately, so consumers never name the module
 path. Three groups: metastore types (`MetaStore`, `Store`, `BaseMetaTree`,
 `Block`, `BlockID`, `BucketMeta`, `Object`, `ObjectData`, `ObjectType`,
-`Durability`, `MetaError`, `FjallStore`, `FjallStoreNotx`, `Transaction`,
+`Durability`, `MetaError`, `FjallStore`, `Transaction`,
 `MetaTreeExt`), CAS types (`CasFS`, `SharedBlockStore`, `StorageEngine`,
 `AsyncByteStream`, `BlockStream`, `MultiPart`, `MultiPartTree`,
 `RangeRequest`, `parse_range_request`), and metrics
@@ -164,10 +163,10 @@ Both are finding B2.
 Two criterion benchmarks at the workspace root, 591 lines. Not workspace
 members; they sit in `benches/` and are referenced by the workspace.
 
-- `fjall_benchmark.rs` (412 lines) -- benchmarks `FjallStore` against
-  `FjallStoreNotx` across `insert_bucket`, small/medium object insert,
-  `get_meta`, `list_buckets`, `transaction`, and a mixed workload. This is the
-  main reason both backends earn their keep: the comparison is the point.
+- `fjall_benchmark.rs` -- benchmarks `FjallStore` across `insert_bucket`,
+  small/medium object insert, `get_meta`, `list_buckets`, `transaction`,
+  and a mixed workload. (It was a two-backend comparison until ADR 0007
+  removed `FjallStoreNotx`.)
 - `casfs_benchmark.rs` (179 lines) -- `CasFS`-level benchmarks.
 
 Both are the heaviest users of `.unwrap()` outside tests (40 and 9 sites), which

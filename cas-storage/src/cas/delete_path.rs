@@ -87,11 +87,17 @@ pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result
     for block_id in obj.blocks() {
         let stripe_guard = fs.shared.stripes().for_hash(block_id).lock_owned().await;
         let shared = fs.shared.clone();
+        let metrics = fs.metrics.clone();
         let id = *block_id;
 
-        let joined =
-            tokio::task::spawn_blocking(move || decrement_one_block(shared, stripe_guard, id))
-                .await;
+        // Same in-flight gauge as the write side; see store_object.
+        fs.metrics.block_disk_op_started();
+        let joined = tokio::task::spawn_blocking(move || {
+            let result = decrement_one_block(shared, stripe_guard, id);
+            metrics.block_disk_op_finished();
+            result
+        })
+        .await;
 
         // Log and continue with the remaining blocks -- never abort the
         // loop, never panic. The failed occurrence leaks (over-count or

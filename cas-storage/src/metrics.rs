@@ -12,6 +12,18 @@ pub trait MetricsCollector: Send + Sync {
     fn blocks_dropped(&self, amount: u64);
     fn bytes_sent(&self, amount: usize);
     fn bytes_received(&self, amount: usize);
+
+    /// A blocking block-disk closure (write- or delete-side, ADR 0006) was
+    /// submitted to the blocking pool. Paired with
+    /// [`block_disk_op_finished`](Self::block_disk_op_finished); the gap
+    /// between the two is the in-flight gauge, and its growth against the
+    /// completion rate is the queue-depth signal the ADR requires.
+    ///
+    /// Default no-op so existing collectors keep compiling.
+    fn block_disk_op_started(&self) {}
+
+    /// The blocking closure completed (success or failure alike).
+    fn block_disk_op_finished(&self) {}
 }
 
 /// No-op metrics collector (default)
@@ -63,6 +75,14 @@ impl SharedMetrics {
 
     pub fn bytes_received(&self, amount: usize) {
         self.0.bytes_received(amount);
+    }
+
+    pub fn block_disk_op_started(&self) {
+        self.0.block_disk_op_started();
+    }
+
+    pub fn block_disk_op_finished(&self) {
+        self.0.block_disk_op_finished();
     }
 }
 

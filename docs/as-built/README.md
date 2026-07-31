@@ -29,10 +29,11 @@ layouts.** `main` still ships a separate `metastore` crate and an
 qss_storage is a three-crate Rust workspace: one shared content-addressed
 storage library (`cas-storage`, 4884 lines) and two independent protocol
 frontends over it -- `s3cas` (S3 API, 2368 lines) and `respd` (Redis/RESP
-subset, 4058 lines). Objects are chunked into 1 MiB blocks, addressed by MD5,
-deduplicated, and reference counted. Metadata lives in fjall 3.x, behind a
-`Store` trait with two implementations: transactional (`FjallStore`) and
-non-transactional (`FjallStoreNotx`).
+subset, 4058 lines). Objects are chunked into 1 MiB blocks, addressed by BLAKE3
+(ADR 0002; the S3 ETag stays MD5), deduplicated, and reference counted.
+Metadata lives in fjall 3.x, behind a `Store` trait with one
+implementation: the transactional `FjallStore` (the non-transactional
+`FjallStoreNotx` was removed by ADR 0007).
 
 Three things a reader should know before touching the code:
 

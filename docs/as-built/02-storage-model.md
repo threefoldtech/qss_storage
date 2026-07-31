@@ -56,7 +56,7 @@ under a single fixed key, written through `MetaStore::open_or_create`:
 
 ```
 [ magic: "QSST"           ]  4 bytes
-[ version: u16 LE         ]  2 bytes   currently 1
+[ version: u16 LE         ]  2 bytes   currently 2
 [ hash_algo: u8           ]  1 byte    blake3 = 1
 [ hash_width: u8          ]  1 byte    16 or 32
 [ created_at: u64 LE      ]  8 bytes   unix seconds
@@ -86,8 +86,12 @@ Semantics:
   field requires a version bump instead. This is where a salt or key id would
   go if the question reopens (ADR 0002 resolved it as not implemented).
 - Bucket names starting with `_` are refused at creation, so a bucket can
-  never collide with `_STORE_HEADER`, `_BLOCKS`, `_PATHS` or
-  `_MULTIPART_PARTS`.
+  never collide with `_STORE_HEADER`, `_BLOCKS` or `_MULTIPART_PARTS`.
+- Version history: v1 was ADR 0002 (BLAKE3 addressing, u64 fields, this
+  header). v2 is ADR 0006: block records store a fanout depth instead of
+  allocated path bytes and the `_PATHS` tree no longer exists. A v1 store
+  is refused at open; no migration exists (no deployed v1 store carried
+  data).
 
 `s3cas inspect header` prints magic, version, algo, width and created_at for
 every metadata database under a `--meta-root`.
@@ -123,13 +127,16 @@ first one.
 
 ## Keyspaces
 
-Three fjall trees, named at `cas-storage/src/metastore/meta_store.rs:22-24`:
+Two fjall trees, named at `cas-storage/src/metastore/meta_store.rs:22-23`:
 
 | Tree | Constant | Holds |
 |------|----------|-------|
 | `_BUCKETS` | `DEFAULT_BUCKET_TREE` | `BucketMeta` per bucket |
-| `_BLOCKS` | `DEFAULT_BLOCK_TREE` | `Block` records, keyed by `BlockId`, carrying the refcount |
-| `_PATHS` | `DEFAULT_PATH_TREE` | block path allocation |
+| `_BLOCKS` | `DEFAULT_BLOCK_TREE` | `Block` records, keyed by `BlockId`, carrying the refcount and fanout depth |
+
+(`_PATHS`, the block path allocator, died with ADR 0006: block file paths
+are derived from the id and the recorded depth, so there is nothing to
+allocate.)
 
 Two more reserved trees sit alongside them: `_MULTIPART_PARTS`, opened by
 `SharedBlockStore` for in-flight multipart uploads, and `_STORE_HEADER`, which
@@ -144,7 +151,7 @@ upload state lives in its own tree (`cas-storage/src/cas/multipart.rs`,
 In `SharedBlockStore` mode, `_BLOCKS` and the block files are shared across all
 namespaces while each namespace keeps its own bucket and object trees.
 
-## On-disk record formats (v1)
+## On-disk record formats (v2)
 
 Serialization is hand-rolled little-endian byte packing, not a serde format.
 Each type has a `to_vec` and a `TryFrom<&[u8]>`. All length and count fields
@@ -159,13 +166,17 @@ four records are pinned in the `mod tests` of each of the files below.
 
 ```
 [ size: u64 LE            ]  8 bytes
-[ path_len: u8            ]  1 byte
-[ path: bytes             ]  path_len bytes
+[ depth: u8               ]  1 byte
 [ rc: u64 LE              ]  8 bytes
 ```
 
-The path length stays a single byte: a path is a prefix of a block hash, so it
-is at most one full hash width (32) < 256 bytes.
+`depth` is the fanout depth the block file was placed at, `1..=width(id)`.
+The file path is derived, never stored: `block_disk_path(id, depth, root)`
+yields `blocks/<hex b0>/.../<hex b(depth-1)>/<full-hex id>` -- directory
+names are single hex bytes of the id's prefix, the filename is the full
+id, so a file's name identifies its block at any depth and the depth
+choice is pure placement (ADR 0006). Format v1 stored allocated path
+bytes here (`path_len u8 | path`).
 
 ### BucketMeta (`cas-storage/src/metastore/bucket_meta.rs`)
 
@@ -266,11 +277,12 @@ forbidden one carries a mandatory test.
 Refcount transitions, per `docs/refcount.md`:
 
 - new object storing a new block -> rc = 1
-- same key rewriting the same block -> rc unchanged
-- different key referencing an existing block -> rc + 1
-- object deleted -> rc - 1
-- rc reaches 0 -> block deleted
-- key updated to different blocks -> rc - 1 on blocks no longer referenced
+- ANY reuse of an existing block -> rc + 1 (same key or different key;
+  the same-key skip was removed by ADR 0006 -- its under-count was the
+  loss trace in `docs/arch/key-has-block-skip.md`, so overwrites now
+  over-count until reconciled)
+- object deleted -> rc - 1 per block occurrence
+- rc reaches 0 -> record removed and file unlinked under one stripe hold
 
 The write path lives in `cas-storage/src/cas/write_path.rs`, the delete path in
 `cas-storage/src/cas/delete_path.rs`. `write_path.rs` carries a
@@ -278,17 +290,18 @@ The write path lives in `cas-storage/src/cas/write_path.rs`, the delete path in
 dropped blocks to metrics when a write was left `Pending` -- an
 observability hook for the leak case the contract permits.
 
-Test coverage of the contract is real and reachable in the names surfaced by
-cmm: `do_test_store_object_refcount`,
-`do_test_store_and_delete_object_with_refcount_same_blocks_diffkey`.
+Test coverage of the contract is real and reachable:
+`do_test_store_object_refcount`,
+`do_test_store_and_delete_object_with_refcount_same_blocks_diffkey`,
+`test_double_delete_same_key_is_idempotent`.
 
 ## Inline data
 
 Small objects can be stored inside their metadata record rather than as
 separate block files, controlled by `inlined_metadata_size` (threaded through
 `FjallStore::new` and `CasFS::new`, and settable as `store.inline_metadata_size`
-in `qss_storage.toml`; default at
-`cas-storage/src/metastore/stores/fjall_common.rs:33`):
+in `qss_storage.toml`; default in
+`cas-storage/src/metastore/stores/fjall.rs`):
 
 ```rust
 const DEFAULT_INLINED_METADATA_SIZE: usize = 1; // setting very low will practically disable it by default
@@ -340,3 +353,45 @@ across an `.await`.
 (`stores/fjall.rs:81`). It used to be `unimplemented!()`, a reachable panic on
 the default `--metadata-db fjall` path of `s3cas inspect num-keys`; the panic
 message claiming fjall could not count was simply wrong. See finding H1.
+
+## Block write and delete protocol (ADR 0006, as built 2026-07-31)
+
+The write and delete paths were redesigned by ADR 0006; the full account
+(defects, decisions, rejected alternatives) is in
+`docs/adr/0006-block-write-protocol.md`. The shape as built:
+
+- **Disk layout.** `blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>` at an
+  adaptive depth d chosen per block at write time (shallowest fanout dir
+  under ~4096 entries, `cas-storage/src/cas/placement.rs`); temp files
+  live in `blocks/.tmp/<hex id>-<nonce>` and are purged once at store
+  open. The blocks root, stripe set, placement state, and atomic writer
+  all live on `SharedBlockStore` -- one per store, shared by every
+  namespace.
+- **Striped locking.** 1024 async mutexes by default, indexed by the
+  id's first two bytes (`cas-storage/src/cas/stripes.rs`). Every
+  `_BLOCKS` mutation -- insert, dedup bump, decrement, removal -- runs
+  under the block's stripe; `BlockTree` has no mutators.
+- **PUT** (`write_one_block`, `cas-storage/src/cas/write_path.rs`): take
+  the stripe, then inside ONE `spawn_blocking` closure that owns the
+  guard: a transactional dedup RMW (hit: bump rc, done); on miss, choose
+  the depth (orphan probe first: a file named `<id>` on the id's dir
+  chain is healed in place by the rename), write temp + fsync + rename +
+  fsync dirs (`cas-storage/src/cas/block_disk.rs`, gated by
+  `Durability`; `Buffer` skips all fsyncs), then a second transaction
+  inserts the record. The record commits only after the file is durable
+  at its final path, so a crash never leaves a record without a complete
+  file.
+- **DELETE** (`cas-storage/src/cas/delete_path.rs`): the object record
+  is read and removed in one namespace-DB transaction (idempotent,
+  defeats double-DELETE double-decrements), then each block occurrence
+  is decremented under its stripe in its own blocking closure; at rc==0
+  the record removal commits first and the unlink follows inside the
+  same stripe hold.
+- **Cancellation.** Guards move into the blocking closures, which run to
+  completion even when the awaiting request future is dropped; residue
+  is a completed bump or a record+file without an object -- leak class,
+  never a torn state.
+- **Observability.** `s3_data_block_disk_ops_inflight` gauges submitted
+  vs completed blocking closures (blocking-pool queue depth); the
+  `BlockWriteGuard` pending/written/error/dropped counters survive from
+  the previous design.

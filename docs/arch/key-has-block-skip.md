@@ -1,10 +1,12 @@
 # The key_has_block skip: mechanics, loss trace, and the decided fix
 
-**Status**: describes the code as of 2026-07-31 (pre-ADR-0006
-implementation). ADR 0006 decided on 2026-07-31 to remove the skip;
-once that lands, this document is the historical worked example behind
-the decision. See `docs/adr/0006-block-write-protocol.md` (section
-"key_has_block and same-key overwrite") and
+**Status**: HISTORICAL. The skip this document dissects was removed on
+2026-07-31 when ADR 0006's write protocol landed: every dedup hit now
+bumps the refcount inside a striped transactional RMW
+(`Transaction::bump_block_rc`), and the file:line references below
+point at code that no longer exists. Kept as the worked loss example
+behind the decision. See `docs/adr/0006-block-write-protocol.md`
+(section "key_has_block and same-key overwrite") and
 `docs/plans/adr-0006-implementation.md` (Component 5).
 
 ---

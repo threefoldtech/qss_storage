@@ -1,6 +1,17 @@
 # The fjall write-lock deadlock
 
-Status: written 2026-07-30 from primary sources. An earlier version of this
+Status: HISTORICAL. Written 2026-07-30 from primary sources; as of
+2026-07-31 the write path this document ends on (commit-before-I/O with a
+compensating delete) has itself been replaced by ADR 0006's file-first
+protocol: every block now runs its dedup RMW, disk write, and record
+insert inside one `spawn_blocking` closure that owns the block's stripe
+lock, the record commits only after the file is durable at its final
+path, and `cleanup_on_failure`, the sync `AsyncFileSystem` seam, and the
+commit `unwrap()`s described below are all gone. The deadlock analysis
+and the trade-off account remain accurate history and explain WHY the
+current design looks the way it does.
+
+An earlier version of this
 document was a reconstruction; it has been superseded by this one after the
 pre-fix code was found intact in the imported upstream history. The commit
 hash `c5f9cc9` that `async_fs.rs` used to cite remains unrecoverable (it
@@ -140,33 +151,34 @@ the fix moved a failure class from "impossible" to "counted and ignored".
   self-describing pending record fsck can treat distinctly. Costs a second
   transaction per block.
 
-## Residual costs in the shipped design
+## Residual costs in the shipped design (since resolved)
 
-- The disk write blocks a tokio worker for the duration of up to one
-  `BLOCK_SIZE` (1 MiB) `std::fs::write`. Under heavy PUT concurrency this
-  parks many workers in I/O -- a latency/starvation cost, not a deadlock.
-  The irony: because the lock is no longer held during I/O, making the
-  writes async (or `spawn_blocking`) is *safe again today*; the sync seam
-  is the fix's caution outliving the constraint that required it. Revisit
-  if PUT latency under concurrency becomes a complaint; measure first
-  (`benches/` measures the metastore, not this path).
-- `commit().unwrap()` in the write path turns a commit failure into a
-  panic inside a spawned stream task (flagged in
-  `docs/as-built/04-code-health.md`). Any future compensation logic must
-  replace these unwraps first.
+Both residual costs this section used to list were closed by ADR 0006's
+implementation:
+
+- The 1 MiB `std::fs::write` on a tokio worker: all block disk I/O now
+  runs in `spawn_blocking` closures, off the executor, with fjall commits
+  (and their journal fsyncs) alongside.
+- The `commit().unwrap()`s: replaced by error mapping into the write
+  path's error channel before the protocol change landed (plan
+  component 1).
 
 ## Pointers
 
 - Pre-fix code: `git show 7f20502:src/cas/fs.rs` (search
   `begin_transaction`).
-- Current code: `cas-storage/src/cas/write_path.rs` (the commit-before-I/O
-  comments), `cas-storage/src/cas/async_fs.rs` (the sync seam),
-  `cas-storage/src/metastore/stores/fjall.rs` (the writer-lock guard),
-  `cas-storage/src/metastore/stores/fjall_notx.rs` (the lock-free backend
-  whose rollback is compensation).
+- Current code: `cas-storage/src/cas/write_path.rs` (`write_one_block`,
+  the file-first protocol under the stripe),
+  `cas-storage/src/cas/block_disk.rs` (the atomic temp+fsync+rename
+  writer and its mockable ops seam -- the honest successor of the old
+  `async_fs.rs`), `cas-storage/src/cas/stripes.rs` (the per-block locks),
+  `cas-storage/src/metastore/stores/fjall.rs` (the writer-lock guard).
+  The non-transactional backend this document contrasts against was
+  removed outright by ADR 0007.
 - Consequences and reconciliation: `docs/refcount.md`,
   `docs/adr/0005-fsck-scrub-reconciliation.md`.
-- Successor design: `docs/adr/0006-block-write-protocol.md` proposes a
-  file-first, per-block-striped protocol that closes the dangling-record,
-  partial-read, and durability gaps this document describes, and retires
-  the "compensating delete" and "two-phase records" roads above.
+- Successor design: `docs/adr/0006-block-write-protocol.md` -- the
+  file-first, per-block-striped protocol that closed the dangling-record,
+  partial-read, and durability gaps this document describes, and retired
+  the "compensating delete" and "two-phase records" roads above. Landed
+  2026-07-31.
