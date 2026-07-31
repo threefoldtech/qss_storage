@@ -42,6 +42,36 @@ fn blocks_db(meta_root: &Path) -> PathBuf {
     meta_root.join("blocks").join("db")
 }
 
+/// Refuses a `--meta-root` that is not already a store.
+///
+/// For commands that open the store through `CasFS::single_namespace` rather
+/// than through [`open_existing`]. That constructor builds BOTH databases of
+/// the layout above, and `MetaStore::open_or_create` creates whichever is not
+/// there -- so a mistyped `--meta-root` gets a pair of fresh, empty, headered
+/// databases and the command then answers about them. `s3cas check` on a wrong
+/// path reported "Object not found", which reads as "the store is fine, your
+/// key is wrong" when neither is true.
+///
+/// Both paths are checked, not just the namespace DB: a meta root holding only
+/// one of the two is a half-built store, and letting the constructor fill in
+/// the missing half is the same silent creation on a smaller scale.
+///
+/// This is the check `qss-storage-fsck` makes for the same reason; it lives
+/// here because the layout it encodes is the one this module documents.
+///
+/// # Errors
+///
+/// If either database is missing, naming the path that is not there. Checked
+/// before anything is constructed, because constructing is what creates.
+pub fn refuse_unless_store_exists(meta_root: &Path) -> Result<()> {
+    for db in [namespace_db(meta_root), blocks_db(meta_root)] {
+        if classify_db_dir(&db)? == StoreInit::Create {
+            bail!("no store at {}", db.display());
+        }
+    }
+    Ok(())
+}
+
 /// Opens an existing store at `db_path` through the header-aware path, so the
 /// tools refuse a store this build may not read for the same reasons the
 /// server does.

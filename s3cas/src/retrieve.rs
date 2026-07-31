@@ -6,6 +6,7 @@ use clap::Parser;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::inspect::refuse_unless_store_exists;
 use crate::metrics::SharedMetrics;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
@@ -45,6 +46,10 @@ pub struct RetrieveConfig {
 /// [`StoreOptions`].
 #[tokio::main]
 pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
+    // Before the constructor, which is what creates: on a mistyped --meta-root
+    // this command used to build an empty store and report "Object not found".
+    refuse_unless_store_exists(&args.meta_root)?;
+
     let metrics = SharedMetrics::new();
     let casfs = CasFS::single_namespace(
         args.fs_root.clone(),
@@ -89,4 +94,61 @@ pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
     file.flush().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_storage::{Durability, Hasher};
+    use tempfile::TempDir;
+
+    fn options() -> StoreOptions {
+        StoreOptions {
+            metadata_db: StorageEngine::Fjall,
+            durability: Durability::Buffer,
+            inline_metadata_size: Some(1),
+            verify_on_read: false,
+            hasher: Hasher::Blake3W32,
+        }
+    }
+
+    /// A mistyped `--meta-root` is a refusal, not a store creation.
+    ///
+    /// Not a `#[tokio::test]`: `retrieve` carries `#[tokio::main]` and builds
+    /// its own runtime, which panics if one is already running.
+    #[test]
+    fn a_missing_store_is_refused_and_nothing_is_created() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("typo");
+        let dest = dir.path().join("out.bin");
+
+        let args = RetrieveConfig {
+            config: None,
+            meta_root: missing.clone(),
+            fs_root: missing.clone(),
+            metadata_db: None,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            dest: dest.display().to_string(),
+        };
+
+        let err = retrieve(args, options()).expect_err("a missing store must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("no store at"), "{msg}");
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "the message must name the path: {msg}"
+        );
+
+        // The point of the guard: the refusal happens before anything is
+        // constructed, so the mistyped path is still not a store.
+        assert!(
+            !missing.exists(),
+            "the guard must refuse before the constructor creates {}",
+            missing.display()
+        );
+        // And no half-written destination either: the refusal precedes the
+        // File::create as well.
+        assert!(!dest.exists(), "nothing must have been written to {dest:?}");
+    }
 }

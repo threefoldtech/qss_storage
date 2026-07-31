@@ -20,6 +20,7 @@ use clap::Parser;
 use futures::StreamExt;
 use md5::{Digest, Md5};
 
+use crate::inspect::refuse_unless_store_exists;
 use crate::metrics::SharedMetrics;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
@@ -132,6 +133,10 @@ fn verify_blocks(hasher: Hasher, obj_meta: &Object, paths: &[(PathBuf, usize)]) 
 /// [`StoreOptions`].
 #[tokio::main]
 pub async fn check_integrity(args: CheckConfig, store: StoreOptions) -> Result<()> {
+    // Before the constructor, which is what creates: on a mistyped --meta-root
+    // this command used to build an empty store and report "Object not found".
+    refuse_unless_store_exists(&args.meta_root)?;
+
     let metrics = SharedMetrics::new();
     let casfs = CasFS::single_namespace(
         args.fs_root.clone(),
@@ -317,6 +322,41 @@ mod tests {
         let faults = verify_blocks(casfs.hasher(), &obj_meta, &paths);
         assert_eq!(faults.len(), 1, "{faults:?}");
         assert!(matches!(faults[0], BlockFault::Unreadable { .. }));
+    }
+
+    /// A mistyped `--meta-root` is a refusal, not a store creation.
+    ///
+    /// Not a `#[tokio::test]`: `check_integrity` carries `#[tokio::main]` and
+    /// builds its own runtime, which panics if one is already running.
+    #[test]
+    fn a_missing_store_is_refused_and_nothing_is_created() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("typo");
+
+        let args = CheckConfig {
+            config: None,
+            meta_root: missing.clone(),
+            fs_root: missing.clone(),
+            metadata_db: None,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+        };
+
+        let err = check_integrity(args, options()).expect_err("a missing store must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("no store at"), "{msg}");
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "the message must name the path: {msg}"
+        );
+
+        // The point of the guard: the refusal happens before anything is
+        // constructed, so the mistyped path is still not a store.
+        assert!(
+            !missing.exists(),
+            "the guard must refuse before the constructor creates {}",
+            missing.display()
+        );
     }
 
     /// Verification uses the hash in the store's header, not a fixed one, so

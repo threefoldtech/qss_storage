@@ -100,9 +100,10 @@ fn store_databases(meta_root: &Path) -> [PathBuf; 2] {
 ///
 /// Checked before anything is constructed, because constructing is what
 /// creates: `MetaStore::open_or_create` would stamp a fresh header onto a
-/// mistyped path and then report it clean. `s3cas inspect` refuses the same
-/// way; `s3cas check` and `retrieve` still do not (a flagged follow-up, not
-/// this tool's to fix).
+/// mistyped path and then report it clean. Every other tool that opens a store
+/// refuses the same way -- `s3cas inspect` per database, `s3cas check` and
+/// `retrieve` through `s3cas::inspect::refuse_unless_store_exists`, which is
+/// this function for the crate next door.
 ///
 /// # Errors
 ///
