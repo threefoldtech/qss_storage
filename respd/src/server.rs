@@ -3,7 +3,7 @@ use bytes::BytesMut;
 use redis_protocol::resp2::types::OwnedFrame as Frame;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cmd::{Command, CommandHandler};
 use crate::conn::Conn;
@@ -180,7 +180,12 @@ impl Session {
                 }
                 Ok(None) => break, // Need more data
                 Err(e) => {
-                    error!("Error parsing frame: {}", e);
+                    // A client sending bytes that are not RESP is the
+                    // client's problem, connection-scoped and answered on
+                    // that connection. ERROR is reserved for the daemon
+                    // itself being in trouble -- it is what operators (and
+                    // the campaign's daemon-log gate) alert on.
+                    warn!("Error parsing frame: {}", e);
                     break;
                 }
             }
@@ -202,7 +207,10 @@ impl Session {
             Ok(Command::Auth { password }) => self.authenticate(password),
             Ok(cmd) => self.handler.execute(cmd),
             Err(e) => {
-                error!("Error parsing command: {}", e);
+                // Unknown command or wrong arity: the client's mistake,
+                // reported to the client. Not an ERROR -- see the frame
+                // parser above.
+                warn!("Error parsing command: {}", e);
                 Frame::Error(format!("Error: {}", e))
             }
         }

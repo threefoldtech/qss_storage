@@ -233,6 +233,16 @@ qssrt_scratch() {
 
 # --- json --------------------------------------------------------------
 
+# In-flight multipart uploads in a bucket, as a count. aws-cli's text
+# output prints the literal line "None" for an empty query result, which
+# is not an upload -- counted naively it graded every clean bucket as
+# holding one phantom upload.
+s3_uploads_in_flight() {
+    s3api list-multipart-uploads --bucket "$1" \
+        --query 'Uploads[].UploadId' --output text 2>/dev/null |
+        tr '\t' '\n' | grep -vx 'None' | grep -c . || true
+}
+
 # jq when it is there. The campaign refuses at preflight when it is not, so
 # this is a convenience rather than a fallback -- the fsck report has a
 # documented text rendering and that is what lib/fsck.sh falls back to.

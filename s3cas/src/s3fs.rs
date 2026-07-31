@@ -649,6 +649,8 @@ impl S3 for S3FS {
             content_length: Some(obj_meta.size() as i64),
             //content_type: Some(content_type),
             last_modified: Some(obj_meta.last_modified().into()),
+            e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
+            accept_ranges: Some("bytes".to_string()),
             //metadata: object_metadata,
             ..Default::default()
         };

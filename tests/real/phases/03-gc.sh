@@ -77,8 +77,7 @@ rm -f "$(qssrt_scratch)/gc-part"
 after_blocks=$(qssrt_block_file_count "$QSSRT_S3_STORE")
 record "block-files-held-by-abandoned-uploads" $((after_blocks - before_blocks))
 
-in_flight=$(s3api list-multipart-uploads --bucket "$BUCKET" \
-    --query 'Uploads[].UploadId' --output text 2>/dev/null | tr '\t' '\n' | grep -c .)
+in_flight=$(s3_uploads_in_flight "$BUCKET")
 if [ "$in_flight" -ge 3 ]; then
     check_pass "abandoned uploads stay visible until something reaps them" \
         "$in_flight in flight"
@@ -134,8 +133,7 @@ else
         check_fail "the sweep reaps an upload past its TTL" \
             "s3_multipart_uploads_reaped did not move"
     fi
-    left=$(s3api list-multipart-uploads --bucket "$BUCKET" \
-        --query 'Uploads[].UploadId' --output text 2>/dev/null | tr '\t' '\n' | grep -c .)
+    left=$(s3_uploads_in_flight "$BUCKET")
     assert_eq "nothing is left in flight after the sweep" 0 "$left"
 fi
 

@@ -150,7 +150,12 @@ qssrt_block_bytes() {
 # A random integer in [lo, hi]. Used for crash timing, which the ADR wants
 # randomized so a crash window is not always the same window.
 qssrt_rand_between() {
-    local lo=$1 hi=$2 span=$((hi - lo + 1))
+    local lo=$1 hi=$2
+    # span gets its own statement: in `local a=$1 b=$((a...))` the
+    # arithmetic expands BEFORE local assigns a, which under set -u killed
+    # the whole line -- every caller got "", and every crash cycle's
+    # kill -9 landed at +0s instead of somewhere in the window.
+    local span=$((hi - lo + 1))
     [ "$span" -gt 0 ] || span=1
     printf '%s' "$((lo + RANDOM % span))"
 }

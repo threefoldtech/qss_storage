@@ -210,8 +210,7 @@ for n in 1 2 3; do
     ids+=("$(s3api create-multipart-upload --bucket "$BUCKET" \
         --key "concurrent/$n" --query UploadId --output text)")
 done
-listed=$(s3api list-multipart-uploads --bucket "$BUCKET" \
-    --query 'Uploads[].UploadId' --output text 2>/dev/null | tr '\t' '\n' | grep -c .)
+listed=$(s3_uploads_in_flight "$BUCKET")
 if [ "$listed" -ge 3 ]; then
     check_pass "list-multipart-uploads sees concurrent uploads" "$listed in flight"
 else

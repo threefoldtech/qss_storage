@@ -166,7 +166,22 @@ range_check() {
 range_check sizes/1B 1 0 0
 range_check sizes/block "$BLOCK" 0 4095
 range_check sizes/block "$BLOCK" 4096 8191
-range_check sizes/hundred "$hundred" 1048576 2097151
+# The second MiB of the object -- one whole block, boundary to boundary --
+# when the scaled size has one. A scaled-down object smaller than 2 MiB
+# gets its second half instead, so the window stays inside the object at
+# every scale: the old fixed 1048576-2097151 started AT the end of a
+# deep-scaled object, and the server's 416 (correct) graded as a failure.
+if [ "$hundred" -ge 2097152 ]; then
+    range_check sizes/hundred "$hundred" 1048576 2097151
+else
+    range_check sizes/hundred "$hundred" $((hundred / 2)) $((hundred - 1))
+fi
+
+# A range that starts at or past the end of the object is unsatisfiable,
+# and the answer is 416 -- not the whole object with confident headers.
+assert_err "a range past the end of the object is InvalidRange" InvalidRange \
+    s3api get-object --bucket "$BUCKET" --key sizes/hundred \
+    --range "bytes=$hundred-$((hundred + 1048575))" /dev/null
 
 download="$(qssrt_scratch)/downloaded"
 rm -f "$download"

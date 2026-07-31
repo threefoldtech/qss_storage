@@ -55,9 +55,7 @@ for bucket in $buckets; do
     done < <(s3api list-multipart-uploads --bucket "$bucket" \
         --query 'Uploads[].[Key,UploadId]' --output text 2>/dev/null)
 
-    left=$(s3api list-multipart-uploads --bucket "$bucket" \
-        --query 'Uploads[].UploadId' --output text 2>/dev/null |
-        tr '\t' '\n' | grep -c . || true)
+    left=$(s3_uploads_in_flight "$bucket")
     assert_eq "no upload is left in flight in $bucket" 0 "${left:-0}"
 
     assert_ok "every object in $bucket deletes through the client" \

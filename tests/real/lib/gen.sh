@@ -35,9 +35,13 @@ gen_stream() {
     local key="$1" size="$2" k iv
     k=$(_gen_key_hex "$key")
     iv=$(_gen_iv_hex "$key")
-    # head -c closes the pipe, which openssl reports as a write error; that
-    # is expected and not interesting, hence the redirect.
-    openssl enc -aes-256-ctr -K "$k" -iv "$iv" -nosalt -in /dev/zero 2>/dev/null |
+    # head -c closes the pipe, which openssl reports as a write error. The
+    # stderr redirect hides the message, but under pipefail the exit
+    # status would still fail the whole pipeline -- and with it every
+    # caller that checks, which is how the stress phase counted 14k
+    # phantom PUT failures without one byte going wrong. The generator's
+    # status is head's alone.
+    { openssl enc -aes-256-ctr -K "$k" -iv "$iv" -nosalt -in /dev/zero 2>/dev/null || true; } |
         head -c "$size"
 }
 

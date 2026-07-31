@@ -270,13 +270,43 @@ else
     check_find "TIME answers with a clock" "$(qssrt_oneline "$time_reply")"
 fi
 
-# --- FLUSH, last, because it empties the namespace ----------------------
+# --- FLUSH, last -- in a namespace where it is allowed ------------------
 
 assert_ok "DEL removes a key" vk DEL qssrt:small
 assert_eq "the deleted key is gone" 0 "$(vk EXISTS qssrt:small 2>/dev/null)"
 
-assert_ok "FLUSH empties the namespace" vk FLUSH
-after_flush=$(vk DBSIZE 2>/dev/null)
+# FLUSH is only honoured on a private, password-protected namespace; on
+# the default namespace it answers -ERR. valkey-cli exits 0 either way,
+# so the reply TEXT is what gets graded -- an assert_ok here once passed
+# a refusal and then blamed DBSIZE for the keys that never went away.
+flush_default=$(vk FLUSH 2>&1)
+case "$flush_default" in
+*ERR*) check_pass "FLUSH on the default namespace is refused" \
+    "$(qssrt_oneline "$flush_default")" ;;
+*) check_fail "FLUSH on the default namespace is refused" \
+    "got: $(qssrt_oneline "$flush_default")" ;;
+esac
+
+# So FLUSH gets a namespace of its own, shaped the way it demands. The
+# namespace binding is per-connection state: SELECT and everything after
+# it go down one connection.
+flush_ns="qssrt-flush"
+flush_pw="qssrt-flush-pw"
+vk NSNEW "$flush_ns" >/dev/null 2>&1
+assert_ok "NSSET arms the flush namespace's password" \
+    vk NSSET "$flush_ns" password "$flush_pw"
+assert_ok "NSSET makes the flush namespace private" \
+    vk NSSET "$flush_ns" public 0
+
+flush_out=$(printf 'SELECT %s %s\nSET fl:a 1\nSET fl:b 2\nFLUSH\nDBSIZE\n' \
+    "$flush_ns" "$flush_pw" | vk 2>&1)
+flush_reply=$(printf '%s\n' "$flush_out" | tail -n 2 | head -n 1)
+after_flush=$(printf '%s\n' "$flush_out" | tail -n 1)
+case "$flush_reply" in
+*ERR*) check_fail "FLUSH is honoured in its own namespace" \
+    "$(qssrt_oneline "$flush_reply")" ;;
+*) check_pass "FLUSH is honoured in its own namespace" ;;
+esac
 assert_eq "DBSIZE is zero after FLUSH" 0 "${after_flush:-x}"
 
 phase_end
