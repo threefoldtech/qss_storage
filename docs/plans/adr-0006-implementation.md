@@ -1,5 +1,10 @@
 # ADR 0006 Implementation Plan
 
+**Status**: EXECUTED 2026-07-31. All nine components landed on
+`development` as `4b0eaca..8893cf5`, one commit per component, each
+gate-green (fmt, clippy -D warnings, full test suite). Kept as the
+record of what was built and why in this order.
+
 **Implements**: `docs/adr/0006-block-write-protocol.md` as decided
 2026-07-31 (file-first block writes, per-block striped locking,
 full-id adaptive-depth paths). The ADR is the authority on *why*; this

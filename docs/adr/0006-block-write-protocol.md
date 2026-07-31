@@ -1,7 +1,10 @@
 # Block Write Protocol: File-First, Per-Block Striped Locking
 
-**Status**: Accepted (2026-07-31, owner sign-off; landing commit hash
-to be recorded when the implementation lands. History: revised
+**Status**: Accepted and IMPLEMENTED (2026-07-31, owner sign-off).
+Landed on `development` as the commit series `4b0eaca..8893cf5`
+(components 1-9 of `docs/plans/adr-0006-implementation.md`, one commit
+per component; ADR 0007's fjall_notx removal landed first in
+`af42256` + `4610bde`). (History: revised
 2026-07-30 after adversarial code review;
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
