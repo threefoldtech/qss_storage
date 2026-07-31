@@ -75,6 +75,7 @@ pub mod config;
 pub mod hasher;
 pub mod metastore;
 pub mod metrics;
+pub mod scrub;
 pub mod store_options;
 
 // Re-export the block hasher (used by both the cas and metastore layers)

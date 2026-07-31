@@ -31,7 +31,14 @@ use crate::metastore::{BlockId, Durability, block_disk_path};
 /// Name of the temp directory under the blocks root. Crash residue in here
 /// is garbage by definition and is purged once at store open -- never by a
 /// runtime sweeper, which could race an in-flight write.
-pub(super) const TMP_DIR_NAME: &str = ".tmp";
+pub(crate) const TMP_DIR_NAME: &str = ".tmp";
+
+/// Name of the quarantine directory under the blocks root: where fsck moves
+/// corrupt block files and foreign files instead of deleting them (ADR
+/// 0005). Nothing in the write or read path ever looks in here; it exists so
+/// the scrub walkers know to skip it and so repair has one agreed
+/// destination.
+pub(crate) const QUARANTINE_DIR_NAME: &str = ".quarantine";
 
 /// Process-wide temp-name nonce. Uniqueness per ATTEMPT is load-bearing: a
 /// cancelled attempt's detached writer must never share a temp inode with a

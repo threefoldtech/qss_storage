@@ -217,6 +217,20 @@ impl CasFS {
         self.shared.blocks_root()
     }
 
+    /// This namespace's own metadata store: the DB holding its bucket trees.
+    ///
+    /// Distinct from the shared block store's metadata (`_BLOCKS`,
+    /// `_MULTIPART_PARTS`), which lives in a different database. Tools that
+    /// walk the namespace's holders -- fsck (ADR 0005) -- start here.
+    pub fn namespace_meta_store(&self) -> &MetaStore {
+        &self.namespace
+    }
+
+    /// The block store this namespace shares with its siblings.
+    pub fn shared_block_store(&self) -> &Arc<SharedBlockStore> {
+        &self.shared
+    }
+
     pub fn max_inlined_data_length(&self) -> usize {
         self.namespace.max_inlined_data_length()
     }

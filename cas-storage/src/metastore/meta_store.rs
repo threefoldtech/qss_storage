@@ -20,7 +20,13 @@ pub struct MetaStore {
 /// Default tree names used by the MetaStore
 /// These constants define the names of the special trees used internally
 const DEFAULT_BUCKET_TREE: &str = "_BUCKETS";
-const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
+
+/// Tree holding the block records, in the shared blocks DB.
+///
+/// Public for the same reason as [`MULTIPART_PARTS_TREE`]: ADR 0005's
+/// walkers and repairs address this tree by name, so the name is part of
+/// the store's contract.
+pub const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
 
 /// Tree holding the in-flight multipart part records, in the shared blocks
 /// DB next to `_BLOCKS`.
@@ -183,6 +189,25 @@ impl MetaStore {
     /// A tree instance or an error
     pub fn get_tree(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         self.store.tree_open(name)
+    }
+
+    /// Returns a tree with the given name and the extended surface, which is
+    /// what `iter_all` lives on.
+    ///
+    /// [`Self::get_bucket_ext`] is the same call under a name that says
+    /// "bucket"; this one is for the trees that are not buckets, such as
+    /// [`MULTIPART_PARTS_TREE`].
+    ///
+    /// # Arguments
+    /// * `name` - The name of the tree to open
+    ///
+    /// # Returns
+    /// A tree with extended functionality or an error
+    pub fn get_tree_ext(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError> {
+        self.store.tree_ext_open(name)
     }
 
     /// Returns the name of every tree in the store, reserved `_`-prefixed
@@ -420,6 +445,19 @@ impl BlockTree {
     #[cfg(test)]
     pub fn is_empty(&self) -> Result<bool, MetaError> {
         self.len().map(|n| n == 0)
+    }
+
+    /// Returns an iterator over the tree's raw, undecoded records.
+    ///
+    /// fsck's record walker needs this rather than [`Self::iter_all`]: that
+    /// one folds a decode failure into an error which no longer names the
+    /// record it came from, and a finding that cannot name the damaged
+    /// record is not actionable (ADR 0005).
+    ///
+    /// # Returns
+    /// An iterator yielding raw (key, value) pairs
+    pub fn iter_raw(&self) -> crate::metastore::KeyValuePairs {
+        self.tree.iter_all()
     }
 
     /// Returns an iterator over all blocks in the tree.

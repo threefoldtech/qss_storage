@@ -41,6 +41,26 @@ impl MultiPart {
         &self.blocks
     }
 
+    /// Bucket of the object this part belongs to.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Key of the object this part belongs to.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Upload this part belongs to.
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    /// Position of this part within its upload.
+    pub fn part_number(&self) -> i64 {
+        self.part_number
+    }
+
     /// MD5 digest of this part's content -- the part's ETag, and one input to
     /// the completed object's multipart ETag.
     pub fn hash(&self) -> ContentHash {
