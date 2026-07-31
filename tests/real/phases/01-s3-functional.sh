@@ -131,6 +131,56 @@ else
         "measured $boundary with inline_metadata_size set in the campaign config"
 fi
 
+# --- ranges, and the download path a client actually uses --------------
+
+# Ranged GET is not decoration: aws-cli's own high-level download pages any
+# object above multipart_threshold in with ranged requests, so a broken
+# range makes large objects unreadable through `aws s3 cp` even though the
+# bytes are all there.
+range_check() {
+    local key="$1" size="$2" from="$3" to="$4" want got out
+    out="$(qssrt_scratch)/range-out"
+    rm -f "$out"
+    if ! s3api get-object --bucket "$BUCKET" --key "$key" \
+        --range "bytes=$from-$to" "$out" >/dev/null 2>"$out.err"; then
+        check_fail "ranged GET of $key bytes=$from-$to" \
+            "$(tail -c 200 "$out.err")"
+        return 1
+    fi
+    want=$((to - from + 1))
+    got=$(stat -c %s "$out" 2>/dev/null)
+    if [ "$want" != "$got" ]; then
+        check_fail "ranged GET of $key bytes=$from-$to returns exactly the range" \
+            "asked for $want bytes, got ${got:-0}"
+        return 1
+    fi
+    if cmp -s "$out" <(gen_stream "$key" $((to + 1)) | tail -c "$want"); then
+        check_pass "ranged GET of $key bytes=$from-$to returns exactly the range"
+    else
+        check_fail "ranged GET of $key bytes=$from-$to returns exactly the range" \
+            "$want bytes, but not the right ones"
+    fi
+    rm -f "$out" "$out.err"
+}
+
+range_check sizes/1B 1 0 0
+range_check sizes/block "$BLOCK" 0 4095
+range_check sizes/block "$BLOCK" 4096 8191
+range_check sizes/hundred "$hundred" 1048576 2097151
+
+download="$(qssrt_scratch)/downloaded"
+rm -f "$download"
+if s3_download_file "$BUCKET" sizes/hundred "$download" 2>"$download.err"; then
+    assert_eq "aws s3 cp downloads a large object whole" "$hundred" \
+        "$(stat -c %s "$download" 2>/dev/null)"
+    assert_same "aws s3 cp downloads a large object intact" "$download" \
+        <(gen_stream sizes/hundred "$hundred")
+else
+    check_fail "aws s3 cp downloads a large object" \
+        "$(tail -c 300 "$download.err")"
+fi
+rm -f "$download" "$download.err"
+
 # --- listings ----------------------------------------------------------
 
 keys=$(qssrt_scaled "$QSSRT_LIST_KEYS" "$QSSRT_LIST_KEYS_FLOOR")

@@ -79,11 +79,43 @@ s3_put_generated() {
     return $status
 }
 
-# The object's bytes on stdout, streamed. `s3api get-object` cannot do this
-# -- it writes its JSON summary to stdout too -- so the high-level `cp` to
-# "-" is the streaming reader.
+# The object's bytes on stdout, streamed through a FIFO.
+#
+# The obvious spellings are both wrong. `s3api get-object <outfile>` writes
+# its JSON summary to stdout as well as the body to the file, so "outfile =
+# /dev/stdout" corrupts the stream. And the high-level `aws s3 cp s3://... -`
+# switches to RANGED downloads above multipart_threshold -- which this
+# server does not implement correctly, so every large object would come back
+# empty and every byte-comparison in the campaign would fail for a reason
+# that has nothing to do with what it is testing.
+#
+# So: one unranged GET, body into a FIFO, JSON to /dev/null. The ranged
+# download path is not swept under the carpet -- it gets its own explicit
+# checks in phase 1, which is where a finding about it belongs.
 s3_get_stream() {
-    s3cmd cp "s3://$1/$2" - --quiet
+    local bucket="$1" key="$2" fifo status
+    fifo="$(qssrt_scratch)/get-$$-${QSSRT_GET_SEQ:-0}"
+    QSSRT_GET_SEQ=$((${QSSRT_GET_SEQ:-0} + 1))
+    rm -f "$fifo"
+    mkfifo "$fifo" || return 1
+    (
+        # On failure, open and close the FIFO so the reader sees EOF instead
+        # of hanging forever on a GET that never started.
+        s3api get-object --bucket "$bucket" --key "$key" "$fifo" >/dev/null 2>&1 ||
+            : >"$fifo"
+    ) &
+    timeout "${QSSRT_GET_TIMEOUT:-3600}" cat "$fifo"
+    status=$?
+    wait
+    rm -f "$fifo"
+    return $status
+}
+
+# The object's bytes, fetched the way a client actually fetches a big one:
+# the high-level command, which pages the object in with ranged GETs above
+# the configured threshold.
+s3_download_file() {
+    s3cmd cp --quiet "s3://$1/$2" "$3"
 }
 
 # The object's ETag, unquoted, or the empty string when there is none.
