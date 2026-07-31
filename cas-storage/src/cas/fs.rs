@@ -8,7 +8,7 @@ use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
     BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore, HeaderSpec, MetaError,
-    MetaStore, MetaTreeExt, Object, ObjectData,
+    MetaStore, MetaTreeExt, Object, ObjectData, UploadRecord,
 };
 
 use super::byte_stream::AsyncByteStream;
@@ -293,6 +293,37 @@ impl CasFS {
     // TODO: this is very much not optimal
     pub async fn bucket_delete(&self, bucket_name: &str) -> Result<(), MetaError> {
         super::delete_path::bucket_delete(self, bucket_name).await
+    }
+
+    /// Record a new in-flight multipart upload (ADR 0003). Written by
+    /// `CreateMultipartUpload` once the bucket check passes.
+    pub fn create_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), MetaError> {
+        super::uploads::create_upload(self, bucket, key, upload_id)
+    }
+
+    /// Read an upload record without claiming it: the non-atomic existence
+    /// check `UploadPart` makes before it streams any block. See
+    /// [`uploads::get_upload`](super::uploads::get_upload) for what this
+    /// deliberately does not guarantee.
+    pub fn get_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadRecord>, MetaError> {
+        super::uploads::get_upload(self, bucket, key, upload_id)
+    }
+
+    /// Claim an upload: the atomic read+remove that decides complete versus
+    /// abort. `None` means another caller already won, and the caller answers
+    /// `NoSuchUpload`.
+    pub fn claim_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadRecord>, MetaError> {
+        super::uploads::claim_upload(self, bucket, key, upload_id)
     }
 
     #[allow(clippy::too_many_arguments)]

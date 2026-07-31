@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::store_header::{self, HeaderSpec, StoreHeader, StoreHeaderError, StoreInit};
-use super::{BaseMetaTree, Block, BlockId, BucketMeta, MetaError, MetaTreeExt, Object, Store};
+use super::{
+    BaseMetaTree, Block, BlockId, BucketMeta, MetaError, MetaTreeExt, Object, Store, UploadRecord,
+};
 
 /// `MetaStore` is a struct that provides methods to interact with the metadata store.
 ///
@@ -36,6 +38,15 @@ pub const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
 /// blocks until the upload completes), so the name is part of the store's
 /// contract rather than a literal each caller spells for itself.
 pub const MULTIPART_PARTS_TREE: &str = "_MULTIPART_PARTS";
+
+/// Tree holding the in-flight multipart UPLOAD records, in the shared blocks
+/// DB next to `_MULTIPART_PARTS`.
+///
+/// Public because its records are the lifecycle authority ADR 0003 gives
+/// multipart: an upload exists iff its record does, complete and abort race
+/// for it through [`Transaction::take_upload`], and both the stale-upload GC
+/// and fsck address the tree by name.
+pub const UPLOADS_TREE: &str = "_UPLOADS";
 
 impl MetaStore {
     /// Creates a new MetaStore instance with the given store implementation.
@@ -270,7 +281,7 @@ impl MetaStore {
     /// [`MetaError::ReservedBucketName`] for a name starting with `_`. A
     /// bucket becomes a tree of its own name, so such a bucket would collide
     /// with the store's internal trees (`_STORE_HEADER`, `_BUCKETS`,
-    /// `_BLOCKS`, `_MULTIPART_PARTS`) and hand a client the store's
+    /// `_BLOCKS`, `_MULTIPART_PARTS`, `_UPLOADS`) and hand a client the store's
     /// own bookkeeping. S3 bucket naming forbids these names anyway; this is
     /// the store enforcing it for every caller, respd included.
     pub fn insert_bucket(&self, bucket_name: &str, raw_bucket: Vec<u8>) -> Result<(), MetaError> {
@@ -597,6 +608,32 @@ impl Transaction {
         let obj = Object::try_from(&*raw)?;
         self.backend.remove(bucket, key.as_bytes())?;
         Ok(Some(obj))
+    }
+
+    /// The multipart claim (ADR 0003): reads AND removes the upload record
+    /// at `key` in [`UPLOADS_TREE`] inside this transaction.
+    ///
+    /// This is THE linearization point between complete and abort. Neither
+    /// operation holds a lock -- none exists -- so both begin here, and the
+    /// atomic read+remove is what makes exactly one of them the winner: the
+    /// loser gets `None` and answers `NoSuchUpload`. Double-complete,
+    /// double-abort, complete-versus-abort and the GC's own abort all
+    /// collapse into this one rule, so nothing downstream of a won claim
+    /// needs to re-check that the upload is still live.
+    ///
+    /// `None` (and no change) if the record was absent -- claiming an upload
+    /// that is already gone changes nothing.
+    ///
+    /// Same shape as [`take_object`](Self::take_object), for the same
+    /// reason: splitting the read from the remove would let two callers both
+    /// read the record and both proceed.
+    pub fn take_upload(&mut self, key: &[u8]) -> Result<Option<UploadRecord>, MetaError> {
+        let Some(raw) = self.backend.get(UPLOADS_TREE, key)? else {
+            return Ok(None);
+        };
+        let record = UploadRecord::try_from(&*raw)?;
+        self.backend.remove(UPLOADS_TREE, key)?;
+        Ok(Some(record))
     }
 
     /// The DELETE-side block step (ADR 0006): re-checks the record and
@@ -951,6 +988,7 @@ mod tests {
             store_header::STORE_HEADER_TREE,
             DEFAULT_BLOCK_TREE,
             MULTIPART_PARTS_TREE,
+            UPLOADS_TREE,
             "_",
         ] {
             let raw = BucketMeta::new(name.to_string()).to_vec();
@@ -993,6 +1031,7 @@ mod tests {
         // The shared trees exist from the moment they are opened.
         meta.get_block_tree().unwrap();
         meta.get_tree(MULTIPART_PARTS_TREE).unwrap();
+        meta.get_tree(UPLOADS_TREE).unwrap();
 
         let trees = meta.list_trees().unwrap();
         for expected in [
@@ -1002,6 +1041,7 @@ mod tests {
             DEFAULT_BUCKET_TREE,
             DEFAULT_BLOCK_TREE,
             MULTIPART_PARTS_TREE,
+            UPLOADS_TREE,
         ] {
             assert!(
                 trees.iter().any(|name| name == expected),

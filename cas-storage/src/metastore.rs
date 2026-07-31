@@ -8,6 +8,7 @@ mod object;
 pub mod store_header;
 mod stores;
 mod traits;
+mod upload_record;
 
 pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE, block_disk_path};
 pub use bucket_meta::BucketMeta;
@@ -18,3 +19,4 @@ pub use object::{Object, ObjectData, ObjectType};
 pub use store_header::{HeaderSpec, StoreHeader, StoreHeaderError, StoreInit};
 pub use stores::FjallStore;
 pub use traits::*;
+pub use upload_record::UploadRecord;

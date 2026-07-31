@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::hasher::Hasher;
 use crate::metastore::{
     BlockTree, Durability, FjallStore, HeaderSpec, MULTIPART_PARTS_TREE, MetaError, MetaStore,
-    StoreHeader,
+    MetaTreeExt, StoreHeader, UPLOADS_TREE,
 };
 
 use super::block_disk::{AtomicBlockWriter, BlockDiskOps, RealDiskOps};
@@ -13,9 +13,9 @@ use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
 use super::{StorageEngine, multipart::MultiPartTree};
 
 /// SharedBlockStore manages everything block-scoped that must be one per
-/// store, not one per namespace: the shared block metadata (the _BLOCKS and
-/// _MULTIPART_PARTS trees), the blocks file root on disk, the per-block
-/// stripe set, and the depth placement state.
+/// store, not one per namespace: the shared block metadata (the _BLOCKS,
+/// _MULTIPART_PARTS and _UPLOADS trees), the blocks file root on disk, the
+/// per-block stripe set, and the depth placement state.
 ///
 /// This is created once at startup and shared across all CasFS instances.
 /// The blocks root living HERE is load-bearing (ADR 0006): block records are
@@ -26,6 +26,8 @@ pub struct SharedBlockStore {
     meta_store: Arc<MetaStore>,
     block_tree: Arc<BlockTree>,
     multipart_tree: Arc<MultiPartTree>,
+    /// The in-flight upload records; the ext handle because they are scanned.
+    uploads_tree: Arc<dyn MetaTreeExt + Send + Sync>,
     header: StoreHeader,
     hasher: Hasher,
     /// Root directory of the block data files.
@@ -101,11 +103,13 @@ impl SharedBlockStore {
         let block_tree = meta_store.get_block_tree()?;
         let multipart_tree_base = meta_store.get_tree(MULTIPART_PARTS_TREE)?;
         let multipart_tree = MultiPartTree::new(multipart_tree_base);
+        let uploads_tree = meta_store.get_tree_ext(UPLOADS_TREE)?;
 
         Ok(Self {
             meta_store: Arc::new(meta_store),
             block_tree: Arc::new(block_tree),
             multipart_tree: Arc::new(multipart_tree),
+            uploads_tree,
             header,
             hasher: header.hasher(),
             placement: BlockPlacement::new(blocks_root.clone()),
@@ -167,6 +171,17 @@ impl SharedBlockStore {
     /// Get a reference to the shared multipart tree
     pub fn multipart_tree(&self) -> Arc<MultiPartTree> {
         Arc::clone(&self.multipart_tree)
+    }
+
+    /// Get a reference to the shared upload records (`_UPLOADS`).
+    ///
+    /// The extended handle rather than the base one: both consumers of this
+    /// tree scan it -- `ListMultipartUploads` and the stale-upload GC sweep
+    /// (ADR 0003) -- and iteration lives on [`MetaTreeExt`]. Point reads
+    /// reconstruct their key, so the scans decode record VALUES and never
+    /// parse a key.
+    pub fn uploads_tree(&self) -> Arc<dyn MetaTreeExt + Send + Sync> {
+        Arc::clone(&self.uploads_tree)
     }
 
     /// Get a reference to the shared meta store

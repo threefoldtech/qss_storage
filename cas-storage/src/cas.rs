@@ -14,6 +14,7 @@ pub mod fs;
 mod placement;
 mod read_path;
 mod stripes;
+mod uploads;
 mod write_path;
 
 #[cfg(test)]
