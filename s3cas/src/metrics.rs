@@ -9,6 +9,7 @@ use s3s::{S3Request, S3Response, S3Result};
 use std::{ops::Deref, sync::Arc};
 
 const S3_API_METHODS: &[&str] = &[
+    "abort_multipart_upload",
     "complete_multipart_upload",
     "copy_object",
     "create_multipart_upload",
@@ -21,8 +22,10 @@ const S3_API_METHODS: &[&str] = &[
     "head_bucket",
     "head_object",
     "list_buckets",
+    "list_multipart_uploads",
     "list_objects",
     "list_objects_v2",
+    "list_parts",
     "put_object",
     "upload_part",
 ];
@@ -282,6 +285,14 @@ impl<T> S3 for MetricFs<T>
 where
     T: S3 + Sync + Send,
 {
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.metrics.add_method_call("abort_multipart_upload");
+        self.storage.abort_multipart_upload(req).await
+    }
+
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -378,6 +389,14 @@ where
         self.storage.list_buckets(req).await
     }
 
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        self.metrics.add_method_call("list_multipart_uploads");
+        self.storage.list_multipart_uploads(req).await
+    }
+
     async fn list_objects(
         &self,
         req: S3Request<ListObjectsInput>,
@@ -392,6 +411,14 @@ where
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         self.metrics.add_method_call("list_objects_v2");
         self.storage.list_objects_v2(req).await
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        self.metrics.add_method_call("list_parts");
+        self.storage.list_parts(req).await
     }
 
     async fn put_object(

@@ -14,6 +14,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 
 use aws_sdk_s3::types::BucketLocationConstraint;
@@ -655,6 +656,599 @@ async fn do_test_multipart(engine: StorageEngine) -> Result<()> {
         delete_bucket(&c, bucket).await?;
     }
 
+    Ok(())
+}
+
+/// The store's block files are named by the hex of their content hash, so a
+/// payload nothing else in the suite writes can be looked for by name --
+/// which is how these tests see whether a block survived an abort without
+/// reaching into the store the running service holds open.
+///
+/// The walk skips `db`, the metadata database, which this test layout nests
+/// inside the blocks root; nothing in it could match a 64 hex digit name
+/// anyway. Temp residue is named `<hex>-<nonce>`, so it never matches either.
+fn block_file_exists(data: &[u8]) -> bool {
+    fn walk(dir: &std::path::Path, name: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() == "db" {
+                continue;
+            }
+            if entry.path().is_dir() {
+                if walk(&entry.path(), name) {
+                    return true;
+                }
+            } else if entry.file_name() == *name {
+                return true;
+            }
+        }
+        false
+    }
+
+    let hex = s3cas::cas::Hasher::Blake3W32.hash(data).to_hex();
+    walk(&std::path::Path::new(FS_ROOT).join("blocks"), &hex)
+}
+
+/// The error code S3 answered with, e.g. `NoSuchUpload`.
+fn error_code<E: ProvideErrorMetadata, R>(err: &SdkError<E, R>) -> String {
+    err.code().unwrap_or("<no code>").to_string()
+}
+
+/// Content unique to one test run, so its blocks are its own: a shared block
+/// would keep a refcount (and its file) alive for reasons the test did not
+/// arrange.
+fn unique_content(tag: &str) -> String {
+    format!("{tag} {}\n", Uuid::new_v4()).repeat(64)
+}
+
+async fn start_upload(c: &Client, bucket: &str, key: &str) -> Result<String> {
+    let ans = c
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?;
+    Ok(ans.upload_id.expect("create returns an upload id"))
+}
+
+async fn upload_one_part(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    content: &str,
+) -> Result<CompletedPart> {
+    let ans = c
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .body(ByteStream::from(content.as_bytes().to_vec()))
+        .send()
+        .await?;
+    Ok(CompletedPart::builder()
+        .e_tag(ans.e_tag.unwrap_or_default())
+        .part_number(part_number)
+        .build())
+}
+
+async fn complete_upload(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: Vec<CompletedPart>,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts))
+        .build();
+    let ans = c
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await?;
+    Ok(ans)
+}
+
+/// The S3 error code a complete that must fail failed with.
+async fn complete_upload_error(
+    c: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: Vec<CompletedPart>,
+) -> String {
+    let upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts))
+        .build();
+    let err = c
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(upload)
+        .send()
+        .await
+        .expect_err("this complete must fail");
+    error_code(&err)
+}
+
+/// Abort reaps the upload: its parts stop being listable, and the blocks
+/// only they referenced lose their files (ADR 0003). Everything that comes
+/// after an abort -- a second abort, a listing, another part, a complete --
+/// is told `NoSuchUpload`, because the claim took the record away.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_multipart_abort() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-abort-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    let key = "aborted.txt";
+    let content = unique_content("abort me");
+    let upload_id = start_upload(&c, bucket, key).await?;
+    let part = upload_one_part(&c, bucket, key, &upload_id, 1, &content).await?;
+    assert!(
+        block_file_exists(content.as_bytes()),
+        "the uploaded part's block must be on disk"
+    );
+
+    // The part is listable while the upload lives.
+    let listed = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+    assert_eq!(listed.parts().len(), 1);
+    assert_eq!(listed.parts()[0].part_number(), Some(1));
+    assert_eq!(
+        listed.parts()[0].size(),
+        Some(content.len().try_into().unwrap())
+    );
+    assert_eq!(
+        unquote_e_tag(listed.parts()[0].e_tag().unwrap()),
+        unquote_e_tag(part.e_tag().unwrap()),
+        "ListParts must echo the ETag UploadPart answered"
+    );
+
+    c.abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+
+    assert!(
+        !block_file_exists(content.as_bytes()),
+        "abort must drop the part's last reference and unlink its file"
+    );
+
+    // Everything after the claim is NoSuchUpload.
+    let err = c
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchUpload", "the second abort lost");
+
+    let err = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchUpload");
+
+    assert_eq!(
+        complete_upload_error(&c, bucket, key, &upload_id, vec![part]).await,
+        "NoSuchUpload",
+        "complete after abort finds no record"
+    );
+
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// Complete and abort race for one record and exactly one of them wins,
+/// whichever order they arrive in: the loser is told `NoSuchUpload` both
+/// ways.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_multipart_complete_and_abort_are_exclusive() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-claim-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    // Complete first: the abort that follows finds nothing to claim.
+    let key = "completed.txt";
+    let content = unique_content("complete then abort");
+    let upload_id = start_upload(&c, bucket, key).await?;
+    let part = upload_one_part(&c, bucket, key, &upload_id, 1, &content).await?;
+    complete_upload(&c, bucket, key, &upload_id, vec![part]).await?;
+
+    let err = c
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&err), "NoSuchUpload");
+    // The completed object is untouched by the losing abort.
+    let ans = c.get_object().bucket(bucket).key(key).send().await?;
+    assert_eq!(
+        ans.body.collect().await?.into_bytes().as_ref(),
+        content.as_bytes()
+    );
+
+    // Abort first: the complete that follows loses the same way.
+    let key = "raced.txt";
+    let content = unique_content("abort then complete");
+    let upload_id = start_upload(&c, bucket, key).await?;
+    let part = upload_one_part(&c, bucket, key, &upload_id, 1, &content).await?;
+    c.abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+
+    assert_eq!(
+        complete_upload_error(&c, bucket, key, &upload_id, vec![part]).await,
+        "NoSuchUpload"
+    );
+    assert!(
+        c.get_object().bucket(bucket).key(key).send().await.is_err(),
+        "the losing complete must not have minted an object"
+    );
+
+    delete_object(&c, bucket, "completed.txt").await?;
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// An unknown upload id is refused before a single block is written -- the
+/// check that makes abort semantics coherent (ADR 0003 decision 3).
+#[tokio::test]
+#[tracing::instrument]
+async fn test_upload_part_to_unknown_upload() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-unknown-upload-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    let content = unique_content("never stored");
+    let err = c
+        .upload_part()
+        .bucket(bucket)
+        .key("ghost.txt")
+        .upload_id(Uuid::new_v4().to_string())
+        .part_number(1)
+        .body(ByteStream::from(content.as_bytes().to_vec()))
+        .send()
+        .await
+        .unwrap_err();
+
+    assert_eq!(error_code(&err), "NoSuchUpload");
+    assert!(
+        !block_file_exists(content.as_bytes()),
+        "the refused part must not have written any block"
+    );
+
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// A complete with no parts used to mint an empty object; it is now a
+/// malformed request.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_complete_with_no_parts_is_rejected() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-empty-complete-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    let key = "nothing.txt";
+    let upload_id = start_upload(&c, bucket, key).await?;
+
+    assert_eq!(
+        complete_upload_error(&c, bucket, key, &upload_id, vec![]).await,
+        "InvalidRequest"
+    );
+
+    assert!(
+        c.get_object().bucket(bucket).key(key).send().await.is_err(),
+        "no object may have been minted"
+    );
+    // The rejected complete claimed nothing: the upload is still there.
+    c.abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// A complete naming a part that was never uploaded is refused WITHOUT
+/// consuming the upload: validation runs before the claim, so the client can
+/// send a corrected complete and have it succeed.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_complete_with_a_missing_part_leaves_the_upload_intact() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-missing-part-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    let key = "retried.txt";
+    let content = unique_content("only part one");
+    let upload_id = start_upload(&c, bucket, key).await?;
+    let part = upload_one_part(&c, bucket, key, &upload_id, 1, &content).await?;
+
+    // Part 2 was never uploaded.
+    let ghost = CompletedPart::builder()
+        .e_tag("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        .part_number(2)
+        .build();
+    assert_eq!(
+        complete_upload_error(
+            &c,
+            bucket,
+            key,
+            &upload_id,
+            vec![part.clone(), ghost.clone()],
+        )
+        .await,
+        "InvalidArgument"
+    );
+
+    // The upload survived the rejection, parts and all.
+    let listed = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+    assert_eq!(listed.parts().len(), 1, "the uploaded part is still there");
+
+    // ...and the corrected complete succeeds.
+    let ans = complete_upload(&c, bucket, key, &upload_id, vec![part]).await?;
+    assert_multipart_e_tag(ans.e_tag().expect("complete returns an ETag"), 1);
+    let got = c.get_object().bucket(bucket).key(key).send().await?;
+    assert_eq!(
+        got.body.collect().await?.into_bytes().as_ref(),
+        content.as_bytes()
+    );
+
+    delete_object(&c, bucket, key).await?;
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// `ListParts` pages in part_number order, honoring the marker and the
+/// maximum, and says so in `is_truncated` / `next_part_number_marker`.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_parts_order_and_pagination() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-list-parts-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    let key = "paged.txt";
+    let upload_id = start_upload(&c, bucket, key).await?;
+    // Uploaded out of order: the listing order comes from the sort, not from
+    // the order the parts arrived in.
+    for part_number in [3, 1, 5, 2, 4] {
+        let content = unique_content(&format!("part {part_number}"));
+        upload_one_part(&c, bucket, key, &upload_id, part_number, &content).await?;
+    }
+
+    let numbers = |ans: &aws_sdk_s3::operation::list_parts::ListPartsOutput| -> Vec<i32> {
+        ans.parts().iter().filter_map(|p| p.part_number()).collect()
+    };
+
+    let all = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+    assert_eq!(numbers(&all), [1, 2, 3, 4, 5]);
+    assert_eq!(all.is_truncated(), Some(false));
+    assert!(all.next_part_number_marker().is_none());
+    assert_eq!(all.max_parts(), Some(1000));
+
+    let first = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .max_parts(2)
+        .send()
+        .await?;
+    assert_eq!(numbers(&first), [1, 2]);
+    assert_eq!(first.is_truncated(), Some(true));
+    assert_eq!(first.next_part_number_marker(), Some("2"));
+
+    let second = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .max_parts(2)
+        .part_number_marker(first.next_part_number_marker().unwrap())
+        .send()
+        .await?;
+    assert_eq!(numbers(&second), [3, 4]);
+    assert_eq!(second.is_truncated(), Some(true));
+    assert_eq!(second.part_number_marker(), Some("2"));
+
+    let last = c
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .max_parts(2)
+        .part_number_marker(second.next_part_number_marker().unwrap())
+        .send()
+        .await?;
+    assert_eq!(numbers(&last), [5]);
+    assert_eq!(last.is_truncated(), Some(false));
+    assert!(last.next_part_number_marker().is_none());
+
+    c.abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await?;
+    delete_bucket(&c, bucket).await?;
+    Ok(())
+}
+
+/// `ListMultipartUploads` reports one bucket's in-flight uploads in S3 order
+/// -- key, then upload id -- filtered by prefix and paged by the two markers.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_multipart_uploads() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-list-uploads-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    create_bucket(&c, bucket).await?;
+
+    // Two uploads of one key (S3 allows any number) plus two other keys,
+    // started in an order that is not the listing order.
+    let mut started: Vec<(String, String)> = Vec::new();
+    for key in ["b/second.txt", "a/first.txt", "a/first.txt", "c/third.txt"] {
+        let upload_id = start_upload(&c, bucket, key).await?;
+        started.push((key.to_string(), upload_id));
+    }
+    let mut expected: Vec<(String, String)> = started.clone();
+    expected.sort();
+
+    let pairs = |ans: &aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput| -> Vec<(String, String)> {
+        ans.uploads()
+            .iter()
+            .map(|u| {
+                (
+                    u.key().unwrap().to_string(),
+                    u.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let all = c.list_multipart_uploads().bucket(bucket).send().await?;
+    assert_eq!(pairs(&all), expected, "key order, then upload id order");
+    assert_eq!(all.is_truncated(), Some(false));
+    assert!(
+        all.uploads().iter().all(|u| u.initiated().is_some()),
+        "every upload reports when it was initiated"
+    );
+
+    let prefixed = c
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .prefix("a/")
+        .send()
+        .await?;
+    assert_eq!(
+        pairs(&prefixed),
+        expected
+            .iter()
+            .filter(|(key, _)| key.starts_with("a/"))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(prefixed.prefix(), Some("a/"));
+
+    // Page one upload at a time through the two markers.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut key_marker: Option<String> = None;
+    let mut upload_id_marker: Option<String> = None;
+    loop {
+        let page = c
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .max_uploads(1)
+            .set_key_marker(key_marker.clone())
+            .set_upload_id_marker(upload_id_marker.clone())
+            .send()
+            .await?;
+        seen.extend(pairs(&page));
+        if page.is_truncated() != Some(true) {
+            break;
+        }
+        key_marker = page.next_key_marker().map(str::to_string);
+        upload_id_marker = page.next_upload_id_marker().map(str::to_string);
+        assert!(key_marker.is_some() && upload_id_marker.is_some());
+    }
+    assert_eq!(seen, expected, "paging one at a time sees each upload once");
+
+    // A bucket of its own: the listing is per bucket, not store-wide.
+    let other = format!("test-list-uploads-empty-{}", Uuid::new_v4());
+    create_bucket(&c, &other).await?;
+    let empty = c.list_multipart_uploads().bucket(&other).send().await?;
+    assert!(empty.uploads().is_empty());
+    delete_bucket(&c, &other).await?;
+
+    for (key, upload_id) in started {
+        c.abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await?;
+    }
+    assert!(
+        c.list_multipart_uploads()
+            .bucket(bucket)
+            .send()
+            .await?
+            .uploads()
+            .is_empty(),
+        "aborting every upload empties the listing"
+    );
+
+    delete_bucket(&c, bucket).await?;
     Ok(())
 }
 

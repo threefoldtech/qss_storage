@@ -15,23 +15,30 @@ use s3s::S3Result;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
 use s3s::dto::{
-    Bucket, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
-    CopyObjectOutput, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput,
-    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
-    GetBucketLocationInput, GetBucketLocationOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, PutObjectInput, PutObjectOutput, UploadPartInput, UploadPartOutput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+    DeleteObjectsOutput, DeletedObject, ETag, GetBucketLocationInput, GetBucketLocationOutput,
+    GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput,
+    ListMultipartUploadsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, ListPartsInput, ListPartsOutput, MultipartUpload, Part, PutObjectInput,
+    PutObjectOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 
 use crate::metrics::SharedMetrics;
+use cas_storage::metastore::UploadRecord;
 use cas_storage::{BlockId, ContentHash, MultiPart, ObjectData};
 use cas_storage::{BlockStream, CasFS, parse_range_request};
 
 const MAX_KEYS: i32 = 1000;
+/// S3's ceiling on one `ListParts` page, and its default.
+const MAX_PARTS: i32 = 1000;
+/// S3's ceiling on one `ListMultipartUploads` page, and its default.
+const MAX_UPLOADS: i32 = 1000;
 
 pub struct S3FS {
     casfs: CasFS,
@@ -99,8 +106,79 @@ fn bad_digest() -> s3s::S3Error {
     )
 }
 
+/// The answer to every operation that could not find (or could not claim) an
+/// upload record: an unknown id, and the loser of a complete-versus-abort
+/// race alike (ADR 0003 -- the record is the only linearization point, so
+/// "somebody else got there first" and "it never existed" are one outcome).
+fn no_such_upload() -> s3s::S3Error {
+    s3_error!(
+        NoSuchUpload,
+        "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."
+    )
+}
+
+/// Unix seconds as stored in an upload record, as a wire timestamp. Pre-epoch
+/// values are impossible in a record this side of a broken clock, and clamp to
+/// the epoch rather than panicking.
+fn timestamp_from_secs(secs: i64) -> Timestamp {
+    let secs = u64::try_from(secs).unwrap_or(0);
+    Timestamp::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+/// One part record as the `ListParts` wire shape.
+///
+/// The ETag is the part's MD5 in hex -- byte for byte what `upload_part`
+/// answered, which is what clients echo back in `CompleteMultipartUpload`.
+/// `last_modified` is `None`: part records carry no timestamp of their own,
+/// and inventing one would be worse than omitting an optional field.
+fn part_to_dto(part: &MultiPart) -> Part {
+    Part {
+        part_number: Some(part.part_number() as i32),
+        size: Some(part.size() as i64),
+        e_tag: Some(ETag::Strong(part.hash().to_hex())),
+        last_modified: None,
+        ..Default::default()
+    }
+}
+
+/// One upload record as the `ListMultipartUploads` wire shape.
+fn upload_to_dto(record: &UploadRecord) -> MultipartUpload {
+    MultipartUpload {
+        key: Some(record.key().to_string()),
+        upload_id: Some(record.upload_id().to_string()),
+        initiated: Some(timestamp_from_secs(record.created_at())),
+        ..Default::default()
+    }
+}
+
 #[async_trait::async_trait]
 impl S3 for S3FS {
+    /// Claims the upload and reaps every part it holds; the loser of the
+    /// claim -- and an id that never existed -- gets `NoSuchUpload` (ADR 0003
+    /// decision, owner sign-off). The reaping itself (record first, blocks
+    /// second: hard rule 2) lives in `CasFS::abort_upload`, which the
+    /// stale-upload GC calls too.
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let AbortMultipartUploadInput {
+            bucket,
+            key,
+            upload_id,
+            ..
+        } = req.input;
+
+        let Some(parts) = try_!(self.casfs.abort_upload(&bucket, &key, &upload_id).await) else {
+            return Err(no_such_upload());
+        };
+
+        info!(
+            "ABORT MULTIPART UPLOAD: bucket={bucket} key={key} upload_id={upload_id} parts={parts}"
+        );
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
+    }
+
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -120,6 +198,28 @@ impl S3 for S3FS {
             return Err(err);
         };
 
+        // An empty parts list used to sail through and mint an empty object
+        // (ADR 0003 decision 3, owner sign-off): a complete with no parts is
+        // a malformed request, not a zero-byte upload.
+        if multipart_upload.parts.iter().flatten().next().is_none() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "You must specify at least one part"
+            ));
+        }
+
+        // Existence at entry, the point read (ADR 0003 decision 3 names both
+        // this and the claim below). Without it, a complete arriving after
+        // the upload was aborted would fail the part validation instead --
+        // InvalidPart for an upload that is simply gone. The claim remains
+        // the authoritative answer; this only keeps the common case honest.
+        if try_!(self.casfs.get_upload(&bucket, &key, &upload_id)).is_none() {
+            return Err(no_such_upload());
+        }
+
+        // Validation runs against the still-unclaimed upload, so a request
+        // this rejects leaves the upload intact and the client can retry a
+        // corrected complete -- what S3 does on an InvalidPart.
         let mut parts = vec![];
         let mut cnt: i32 = 0;
         for part in multipart_upload.parts.iter().flatten() {
@@ -154,6 +254,30 @@ impl S3 for S3FS {
                 }
             };
             parts.push(mp);
+        }
+
+        // The claim: an atomic read+remove of the upload record, and the only
+        // thing serializing this against a concurrent abort or a second
+        // complete. Whoever takes the record proceeds; everyone else answers
+        // NoSuchUpload -- here, an abort that won the race between the
+        // validation above and this line, which is the correct outcome.
+        //
+        // Validating first is safe because while the upload record exists,
+        // part records are removed only by complete and abort, and both must
+        // win this claim before they touch one: no part validated above can
+        // vanish before the claim resolves. What a concurrent caller CAN do is
+        // re-upload a part between the two, in which case the object is built
+        // from the values read above and the cleanup below removes the newer
+        // record -- its blocks stay over-counted until the next recount, the
+        // leak direction (ADR 0005), never loss.
+        //
+        // The claim still happens BEFORE the object is created, so a crash in
+        // between leaves part records with no upload record to own them --
+        // orphan parts, which the GC reaps within one sweep. Bounded leakage;
+        // claiming after the object existed would instead let a second
+        // complete mint the object twice over.
+        if try_!(self.casfs.claim_upload(&bucket, &key, &upload_id)).is_none() {
+            return Err(no_such_upload());
         }
 
         let (content_hash, size) = calculate_multipart_hash(&parts);
@@ -227,8 +351,12 @@ impl S3 for S3FS {
         Ok(S3Response::new(output))
     }
 
-    // create_multipart_upload doesn't do any bookkeeping, it just do some checking
-    // and returns an upload id
+    /// Mints an upload id and records the upload.
+    ///
+    /// Writing that record is what brings the upload into existence (ADR
+    /// 0003): before it lands `upload_part` refuses the id, and once it is
+    /// claimed away the upload is over. It also stamps the creation time the
+    /// stale-upload GC ages against, so an id is never handed out without one.
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -240,6 +368,7 @@ impl S3 for S3FS {
         }
 
         let upload_id = Uuid::new_v4().to_string();
+        try_!(self.casfs.create_upload(&bucket, &key, &upload_id));
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -492,6 +621,92 @@ impl S3 for S3FS {
         Ok(S3Response::new(output))
     }
 
+    /// The in-flight uploads of one bucket, in S3 order (key, then upload id).
+    ///
+    /// The whole `_UPLOADS` tree is decoded and then filtered, sorted and
+    /// paginated in memory. That is the ADR 0003 trade: the set is bounded by
+    /// the GC's TTL, and sorting here is what lets the tree key for point
+    /// reads instead of for collation.
+    ///
+    /// `delimiter` is accepted and echoed but never groups: common-prefix
+    /// grouping is deferred until a client needs it (ADR 0003 open question),
+    /// and an empty `common_prefixes` is the conformant answer meanwhile.
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let ListMultipartUploadsInput {
+            bucket,
+            delimiter,
+            encoding_type,
+            key_marker,
+            max_uploads,
+            prefix,
+            upload_id_marker,
+            ..
+        } = req.input;
+
+        if !try_!(self.casfs.bucket_exists(&bucket)) {
+            return Err(s3_error!(NoSuchBucket, "Bucket does not exist"));
+        }
+
+        let mut uploads = try_!(self.casfs.list_uploads());
+        uploads.retain(|record| {
+            record.bucket() == bucket
+                && prefix
+                    .as_ref()
+                    .is_none_or(|prefix| record.key().starts_with(prefix.as_str()))
+        });
+        uploads.sort_unstable_by(|a, b| {
+            a.key()
+                .cmp(b.key())
+                .then_with(|| a.upload_id().cmp(b.upload_id()))
+        });
+
+        // Markers name the upload the previous page ended on, so listing
+        // resumes strictly after it. An upload_id_marker alone is meaningless
+        // (it only disambiguates within one key) and S3 ignores it; without
+        // one, the whole marked key is behind us.
+        if let Some(key_marker) = key_marker.as_deref() {
+            let upload_id_marker = upload_id_marker.as_deref();
+            uploads.retain(|record| match record.key().cmp(key_marker) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => {
+                    upload_id_marker.is_some_and(|marker| record.upload_id() > marker)
+                }
+            });
+        }
+
+        let max_uploads = max_uploads.unwrap_or(MAX_UPLOADS).clamp(0, MAX_UPLOADS);
+        // One past the page: its presence IS the truncation flag.
+        let truncated = uploads.len() > max_uploads as usize;
+        uploads.truncate(max_uploads as usize);
+        let (next_key_marker, next_upload_id_marker) = match uploads.last() {
+            Some(last) if truncated => (
+                Some(last.key().to_string()),
+                Some(last.upload_id().to_string()),
+            ),
+            _ => (None, None),
+        };
+
+        let output = ListMultipartUploadsOutput {
+            bucket: Some(bucket),
+            uploads: Some(uploads.iter().map(upload_to_dto).collect()),
+            delimiter,
+            encoding_type,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            next_key_marker,
+            next_upload_id_marker,
+            max_uploads: Some(max_uploads),
+            is_truncated: Some(truncated),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
     async fn list_objects(
         &self,
         req: S3Request<ListObjectsInput>,
@@ -625,6 +840,63 @@ impl S3 for S3FS {
         Ok(S3Response::new(output))
     }
 
+    /// The parts of one upload, ascending by part number.
+    ///
+    /// Read-only, and bounded by S3's 10k parts per upload, so the prefix scan
+    /// is decoded and paginated in memory (ADR 0003 decision 7). An upload
+    /// with no record answers `NoSuchUpload`; an upload with no parts yet
+    /// answers an empty list, which is a different thing.
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let ListPartsInput {
+            bucket,
+            key,
+            max_parts,
+            part_number_marker,
+            upload_id,
+            ..
+        } = req.input;
+
+        if try_!(self.casfs.get_upload(&bucket, &key, &upload_id)).is_none() {
+            return Err(no_such_upload());
+        }
+
+        let mut parts = try_!(self.casfs.upload_parts(&bucket, &key, &upload_id));
+        // The scan already yields part_number order, but the sort is what the
+        // ADR promises the client: ordering comes from here, not from the
+        // store's key layout.
+        parts.sort_unstable_by_key(cas_storage::MultiPart::part_number);
+
+        // The marker names the last part of the previous page; listing
+        // resumes strictly after it.
+        if let Some(marker) = part_number_marker {
+            parts.retain(|part| part.part_number() > i64::from(marker));
+        }
+
+        let max_parts = max_parts.unwrap_or(MAX_PARTS).clamp(0, MAX_PARTS);
+        let truncated = parts.len() > max_parts as usize;
+        parts.truncate(max_parts as usize);
+        let next_part_number_marker = match parts.last() {
+            Some(last) if truncated => Some(last.part_number() as i32),
+            _ => None,
+        };
+
+        let output = ListPartsOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            parts: Some(parts.iter().map(part_to_dto).collect()),
+            part_number_marker,
+            next_part_number_marker,
+            max_parts: Some(max_parts),
+            is_truncated: Some(truncated),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -736,6 +1008,19 @@ impl S3 for S3FS {
             upload_id,
             ..
         } = req.input;
+
+        // At entry, before a single block is streamed: an unknown upload id
+        // used to be accepted, writing part records and refcounts for an
+        // upload nothing would ever complete or abort (ADR 0003 decision 3).
+        //
+        // Deliberately a plain read, not a claim: this must not exclude the
+        // complete or abort of the upload it is checking. A part that passes
+        // here and lands after another caller claimed the record becomes an
+        // orphan part -- refcounted blocks with no upload -- which the GC
+        // reaps. Bounded leakage, no loss.
+        if try_!(self.casfs.get_upload(&bucket, &key, &upload_id)).is_none() {
+            return Err(no_such_upload());
+        }
 
         let expected_md5 = content_md5.as_deref().map(parse_content_md5).transpose()?;
 

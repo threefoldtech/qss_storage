@@ -321,6 +321,40 @@ impl CasFS {
         super::uploads::claim_upload(self, bucket, key, upload_id)
     }
 
+    /// Abort an upload: claim it, then remove each part record and drop the
+    /// block references it held (ADR 0003).
+    ///
+    /// `Some(parts reaped)` when this caller won the claim, `None` when it
+    /// lost -- the `NoSuchUpload` case, whether the upload was completed,
+    /// aborted a moment earlier, or never existed. `AbortMultipartUpload` and
+    /// the stale-upload GC are both callers; the GC is just another client of
+    /// the claim.
+    pub async fn abort_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Option<usize>, MetaError> {
+        super::uploads::abort_upload(self, bucket, key, upload_id).await
+    }
+
+    /// Every in-flight upload record in the store, decoded, unsorted and
+    /// unfiltered: `ListMultipartUploads` and the GC's TTL sweep each apply
+    /// their own (in-memory) selection.
+    pub fn list_uploads(&self) -> Result<Vec<UploadRecord>, MetaError> {
+        super::uploads::list_uploads(self)
+    }
+
+    /// Every part record of one upload, ascending by part number.
+    pub fn upload_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<MultiPart>, MetaError> {
+        super::uploads::upload_parts(self, bucket, key, upload_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_multipart_part(
         &self,
