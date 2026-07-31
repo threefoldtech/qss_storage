@@ -114,6 +114,8 @@ pub struct Metrics {
     data_blocks_write_errors: IntCounter,
     data_blocks_dropped: IntCounter,
     data_block_disk_ops_inflight: IntGauge,
+    multipart_uploads_reaped: IntCounter,
+    multipart_orphan_parts_reaped: IntCounter,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
@@ -187,6 +189,18 @@ impl Metrics {
         )
         .expect("can register an int gauge in the default registry");
 
+        let multipart_uploads_reaped = register_int_counter!(
+            "s3_multipart_uploads_reaped",
+            "Multipart uploads aborted by the stale-upload GC because they outlived the configured TTL",
+        )
+        .expect("can register an int counter in the default registry");
+
+        let multipart_orphan_parts_reaped = register_int_counter!(
+            "s3_multipart_orphan_parts_reaped",
+            "Part records removed by the stale-upload GC because no upload record owned them; sustained growth points at uploads dying between the claim and the reap",
+        )
+        .expect("can register an int counter in the default registry");
+
         Self {
             method_calls,
             bucket_count,
@@ -199,7 +213,19 @@ impl Metrics {
             data_blocks_write_errors,
             data_blocks_dropped,
             data_block_disk_ops_inflight,
+            multipart_uploads_reaped,
+            multipart_orphan_parts_reaped,
         }
+    }
+
+    /// Stale uploads aborted by one GC sweep (ADR 0003).
+    pub fn uploads_reaped(&self, amount: u64) {
+        self.multipart_uploads_reaped.inc_by(amount)
+    }
+
+    /// Orphan part records removed by one GC sweep.
+    pub fn orphan_parts_reaped(&self, amount: u64) {
+        self.multipart_orphan_parts_reaped.inc_by(amount)
     }
 
     pub fn block_disk_op_started(&self) {

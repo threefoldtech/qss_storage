@@ -15,6 +15,14 @@ use super::byte_stream::AsyncByteStream;
 
 pub const BLOCK_SIZE: usize = 1 << 20; // Supposedly 1 MiB
 
+/// One namespace's view of a store: its own metadata DB, plus the block store
+/// it shares with every sibling namespace.
+///
+/// A clone shares the same `SharedBlockStore` `Arc` -- one stripe set, one
+/// blocks DB, one blocks root -- so ADR 0006's one-store-one-instance rule
+/// survives cloning; that is what lets the stale-upload GC hold its own handle
+/// beside the S3 service (ADR 0003).
+#[derive(Clone)]
 pub struct CasFS {
     pub(super) namespace: MetaStore,
     pub(super) shared: Arc<SharedBlockStore>,

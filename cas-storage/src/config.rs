@@ -98,6 +98,12 @@ pub const DEFAULT_RESP_DATA_DIR: &str = "./data";
 /// everything that fits", which is how respd has always run.
 pub const DEFAULT_RESP_INLINE_METADATA_SIZE: usize = 1;
 
+/// Days an unfinished multipart upload survives before the stale-upload GC
+/// aborts it (ADR 0003). Seven days is the conventional S3 lifecycle value and
+/// is long enough that no legitimate transfer, however slow or often retried,
+/// is reaped underneath a client. `0` disables the sweep.
+pub const DEFAULT_MULTIPART_STALE_TTL_DAYS: u64 = 7;
+
 /// A parsed `qss_storage.toml`.
 ///
 /// Both service sections are optional: an s3cas-only deployment has no
@@ -111,8 +117,23 @@ pub struct QssStorageConfig {
     pub store: StoreConfig,
     /// s3cas-only settings.
     pub s3: Option<S3Config>,
+    /// Multipart upload lifecycle settings. s3cas-only, but its own table
+    /// rather than a sub-table of `[s3]`: what it configures is a property of
+    /// the STORE (how long abandoned uploads keep their blocks), and fsck
+    /// reports against the same ages.
+    pub multipart: Option<MultipartConfig>,
     /// respd-only settings.
     pub resp: Option<RespConfig>,
+}
+
+/// The `[multipart]` table: the stale-upload garbage collector (ADR 0003).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MultipartConfig {
+    /// Age at which an unfinished multipart upload is aborted and its blocks
+    /// released, in days. `0` disables the sweep entirely, which leaves every
+    /// abandoned upload holding its blocks until an operator runs fsck.
+    pub stale_ttl_days: Option<u64>,
 }
 
 /// The `[store]` table: how a store is created and opened.
@@ -388,6 +409,9 @@ secret_key = "SK"
 host = "127.0.0.1"
 port = 9101
 
+[multipart]
+stale_ttl_days = 14
+
 [resp]
 host = "0.0.0.0"
 port = 6380
@@ -420,6 +444,9 @@ admin_password = "hunter2"
         assert_eq!(metrics.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(metrics.port, Some(9101));
 
+        let multipart = config.multipart.expect("[multipart] must parse");
+        assert_eq!(multipart.stale_ttl_days, Some(14));
+
         let resp = config.resp.expect("[resp] must parse");
         assert_eq!(resp.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(resp.port, Some(6380));
@@ -449,6 +476,12 @@ admin_password = "hunter2"
         let metrics = s3.metrics.expect("the example must show [s3.metrics]");
         assert_eq!(metrics.host.as_deref(), Some(DEFAULT_METRICS_HOST));
         assert_eq!(metrics.port, Some(DEFAULT_METRICS_PORT));
+
+        let multipart = config.multipart.expect("the example must show [multipart]");
+        assert_eq!(
+            multipart.stale_ttl_days,
+            Some(DEFAULT_MULTIPART_STALE_TTL_DAYS)
+        );
 
         let resp = config.resp.expect("the example must show [resp]");
         assert_eq!(resp.host.as_deref(), Some(DEFAULT_RESP_HOST));
@@ -486,6 +519,7 @@ admin_password = "hunter2"
         assert_eq!(config.resp.as_ref().unwrap().host, None);
         assert_eq!(config.resp.as_ref().unwrap().data_dir, None);
         assert!(config.s3.is_none());
+        assert!(config.multipart.is_none());
     }
 
     #[test]
@@ -512,6 +546,24 @@ admin_password = "hunter2"
             err.to_string().contains("bind"),
             "message must name the key: {err}"
         );
+
+        let err = parse_str("[multipart]\nstale_ttl = 7\n").unwrap_err();
+        assert!(
+            err.to_string().contains("stale_ttl"),
+            "message must name the key: {err}"
+        );
+    }
+
+    /// Zero is a legal value, not a missing one: it is how an operator turns
+    /// the sweep off, and it must be distinguishable from an absent key (which
+    /// takes the 7 day default).
+    #[test]
+    fn a_zero_multipart_ttl_parses_as_a_value() {
+        let config = parse_str("[multipart]\nstale_ttl_days = 0\n").unwrap();
+        assert_eq!(config.multipart.unwrap().stale_ttl_days, Some(0));
+
+        let config = parse_str("[multipart]\n").unwrap();
+        assert_eq!(config.multipart.unwrap().stale_ttl_days, None);
     }
 
     #[test]

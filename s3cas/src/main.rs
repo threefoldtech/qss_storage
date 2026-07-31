@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -10,8 +11,8 @@ use tracing_subscriber::FmtSubscriber;
 
 use cas_storage::StoreOptions;
 use cas_storage::config::{
-    self, DEFAULT_METRICS_HOST, DEFAULT_METRICS_PORT, DEFAULT_S3_HOST, DEFAULT_S3_PORT,
-    QssStorageConfig,
+    self, DEFAULT_METRICS_HOST, DEFAULT_METRICS_PORT, DEFAULT_MULTIPART_STALE_TTL_DAYS,
+    DEFAULT_S3_HOST, DEFAULT_S3_PORT, QssStorageConfig,
 };
 use s3cas::cas::{CasFS, StorageEngine};
 use s3cas::check::{CheckConfig, check_integrity};
@@ -80,6 +81,12 @@ pub struct ServerConfig {
         help = "Durability level (buffer, fsync, fdatasync); default fsync, which is strongest"
     )]
     durability: Option<Durability>,
+
+    #[arg(
+        long,
+        help = "Days before an unfinished multipart upload is aborted by the GC; 0 disables it (default 7)"
+    )]
+    multipart_stale_ttl_days: Option<u64>,
 }
 
 /// A [`ServerConfig`] merged with the config file and the built-in defaults:
@@ -95,6 +102,9 @@ struct ResolvedServerConfig {
     access_key: String,
     secret_key: String,
     store: StoreOptions,
+    /// Age at which the GC aborts an unfinished multipart upload, in days.
+    /// Zero means the sweep is not spawned at all (ADR 0003).
+    multipart_stale_ttl_days: u64,
 }
 
 /// Merges the server flags over the config file over the built-in defaults.
@@ -108,6 +118,7 @@ struct ResolvedServerConfig {
 fn resolve_server(flags: ServerConfig, config: &QssStorageConfig) -> Result<ResolvedServerConfig> {
     let s3 = config.s3.clone().unwrap_or_default();
     let metrics = s3.metrics.clone().unwrap_or_default();
+    let multipart = config.multipart.clone().unwrap_or_default();
 
     let store = StoreOptions::resolve(
         flags.metadata_db,
@@ -145,6 +156,10 @@ fn resolve_server(flags: ServerConfig, config: &QssStorageConfig) -> Result<Reso
         access_key,
         secret_key,
         store,
+        multipart_stale_ttl_days: flags
+            .multipart_stale_ttl_days
+            .or(multipart.stale_ttl_days)
+            .unwrap_or(DEFAULT_MULTIPART_STALE_TTL_DAYS),
     })
 }
 
@@ -268,6 +283,72 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::service::S3ServiceBuilder;
 
+/// Seconds in a day: the TTL is configured in days and consumed as a
+/// [`Duration`].
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The shortest sweep interval, and the floor under `ttl/20`: a one-hour
+/// period keeps a short TTL from turning the GC into a busy loop over the
+/// parts tree (ADR 0003 decision 8 fixes both numbers).
+const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+/// Spawns the stale-upload sweeper (ADR 0003 decision 8), or nothing when the
+/// TTL is zero.
+///
+/// `casfs` is a clone of the one the S3 service holds: same namespace DB, same
+/// `SharedBlockStore`, so the sweep's decrements serialize against live
+/// traffic on the same stripes (ADR 0006). `shutdown` fires where the accept
+/// loop breaks on ctrl-c, so the task ends with the server rather than being
+/// dropped mid-sweep.
+fn spawn_stale_upload_gc(
+    casfs: CasFS,
+    metrics: s3cas::metrics::SharedMetrics,
+    ttl_days: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if ttl_days == 0 {
+        info!("stale multipart upload GC disabled (multipart.stale_ttl_days = 0)");
+        return None;
+    }
+
+    let ttl = Duration::from_secs(ttl_days.saturating_mul(SECONDS_PER_DAY));
+    let period = std::cmp::max(ttl / 20, MIN_SWEEP_PERIOD);
+    info!(
+        "stale multipart upload GC: TTL {ttl_days} days, sweeping every {} minutes",
+        period.as_secs() / 60
+    );
+
+    Some(tokio::spawn(async move {
+        // The first tick lands one full period from now, not at startup. A
+        // store that has just booted has nothing that became stale while it
+        // was down that will not still be stale in an hour, operators expect
+        // a quiet startup (a sweep is disk work, and boot is when a store is
+        // busiest), and waiting costs nothing: the residue this collects has
+        // already been sitting there for days.
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        // A sweep that overruns its period must not then fire back to back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let stats = s3cas::cas::sweep_stale_uploads(&casfs, ttl).await;
+                    metrics.uploads_reaped(stats.uploads_reaped);
+                    metrics.orphan_parts_reaped(stats.orphan_parts_reaped);
+                    if stats != Default::default() {
+                        info!(
+                            "stale-upload sweep: {} uploads and {} orphan parts reaped, {} errors",
+                            stats.uploads_reaped, stats.orphan_parts_reaped, stats.errors
+                        );
+                    }
+                }
+                _ = shutdown.changed() => break,
+            }
+        }
+        tracing::debug!("stale multipart upload GC stopped");
+    }))
+}
+
 #[tokio::main]
 async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
     // provider
@@ -299,8 +380,21 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
         opened, args.store.durability, args.store.metadata_db, args.store.verify_on_read
     );
 
+    // The GC's handle, taken before the service consumes the original. A
+    // clone shares the SharedBlockStore Arc rather than opening the store
+    // twice, which is what ADR 0006's one-store-one-instance rule requires.
+    let gc_casfs = casfs.clone();
+
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
     let s3fs = s3cas::metrics::MetricFs::new(s3fs, metrics.clone());
+
+    let (gc_shutdown, gc_shutdown_rx) = tokio::sync::watch::channel(false);
+    let gc_task = spawn_stale_upload_gc(
+        gc_casfs,
+        metrics.clone(),
+        args.multipart_stale_ttl_days,
+        gc_shutdown_rx,
+    );
 
     // Setup S3 service
     let service = {
@@ -407,6 +501,22 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
         };
     }
 
+    // The same signal that ends the accept loop ends the sweeper.
+    let _ = gc_shutdown.send(true);
+    if let Some(task) = gc_task {
+        tokio::select! {
+            _ = task => tracing::debug!("stale-upload GC stopped"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                // A sweep in flight only reaches the signal between records,
+                // and a large store's sweep can outlast any shutdown budget.
+                // Leaving it is safe: each step is crash-safe on its own
+                // (record first, blocks second), so an abandoned sweep is
+                // exactly the crash case that ordering was chosen for.
+                tracing::debug!("stale-upload GC still sweeping; not waiting for it");
+            }
+        }
+    }
+
     tokio::select! {
         () = graceful.shutdown() => {
              tracing::debug!("Gracefully shutdown!");
@@ -452,6 +562,48 @@ mod tests {
         assert_eq!(resolved.store.metadata_db, StorageEngine::Fjall);
         assert_eq!(resolved.store.hasher, Hasher::Blake3W32);
         assert!(!resolved.store.verify_on_read);
+        assert_eq!(
+            resolved.multipart_stale_ttl_days,
+            DEFAULT_MULTIPART_STALE_TTL_DAYS
+        );
+    }
+
+    /// The GC's TTL follows the same flag-over-file-over-default rule as every
+    /// other setting, and 0 is a value like any other -- it is how the sweep
+    /// is turned off, so it must survive the merge instead of reading as
+    /// "unset" and collecting the 7 day default.
+    #[test]
+    fn the_multipart_ttl_merges_like_every_other_setting() {
+        let file = config("[multipart]\nstale_ttl_days = 30\n");
+        assert_eq!(
+            resolve_server(flags_with_credentials(), &file)
+                .unwrap()
+                .multipart_stale_ttl_days,
+            30
+        );
+
+        let flags = ServerConfig {
+            multipart_stale_ttl_days: Some(3),
+            ..flags_with_credentials()
+        };
+        assert_eq!(
+            resolve_server(flags, &file)
+                .unwrap()
+                .multipart_stale_ttl_days,
+            3
+        );
+
+        let flags = ServerConfig {
+            multipart_stale_ttl_days: Some(0),
+            ..flags_with_credentials()
+        };
+        assert_eq!(
+            resolve_server(flags, &file)
+                .unwrap()
+                .multipart_stale_ttl_days,
+            0,
+            "0 disables the sweep; it must not fall through to the default"
+        );
     }
 
     #[test]

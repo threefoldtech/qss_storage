@@ -99,6 +99,24 @@ host = "localhost"
 port = 9100
 
 # ---------------------------------------------------------------------------
+# [multipart] -- the multipart upload lifecycle. respd ignores this table.
+#
+# A multipart upload that is never completed or aborted keeps its uploaded
+# parts, and every block those parts reference, forever. s3cas sweeps them:
+# uploads past the age below are aborted the same way a client's
+# AbortMultipartUpload aborts them, and part records left with no upload
+# (a crash, or an interrupted abort) are removed with their references.
+# ---------------------------------------------------------------------------
+[multipart]
+
+# Age at which an unfinished upload is aborted, in days. The sweep runs every
+# max(ttl/20, 1 hour), and the first one is a full period after startup rather
+# than at boot. Set to 0 to disable it -- then nothing reclaims an abandoned
+# upload until an operator runs a repair pass.
+# Default: 7
+stale_ttl_days = 7
+
+# ---------------------------------------------------------------------------
 # [resp] -- the respd server. s3cas ignores this table.
 # ---------------------------------------------------------------------------
 [resp]

@@ -83,7 +83,8 @@ pub use hasher::{Hasher, HasherError};
 
 // Re-export the config file types (the binaries merge these with their flags)
 pub use config::{
-    ConfigError, HashConfig, MetricsConfig, QssStorageConfig, RespConfig, S3Config, StoreConfig,
+    ConfigError, HashConfig, MetricsConfig, MultipartConfig, QssStorageConfig, RespConfig,
+    S3Config, StoreConfig,
 };
 
 // Re-export the resolved store settings every binary opens its store with
@@ -123,11 +124,15 @@ pub use cas::{
     CasFS,
     SharedBlockStore,
     StorageEngine,
+    // Stale-upload GC (ADR 0003): what one sweep did, and the sweep itself
+    // (the s3cas daemon task's only entry point into it)
+    SweepStats,
     // Streaming and utilities
     block_stream::{BlockCorruption, BlockStream},
     // Multipart support
     multipart::{MultiPart, MultiPartTree},
     range_request::{RangeRequest, parse_range_request},
+    sweep_stale_uploads,
 };
 
 // Re-export metrics types
