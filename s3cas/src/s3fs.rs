@@ -33,7 +33,7 @@ use crate::metrics::SharedMetrics;
 use cas_storage::cas::UploadClaim;
 use cas_storage::metastore::UploadRecord;
 use cas_storage::{BlockId, ContentHash, MultiPart, ObjectData};
-use cas_storage::{BlockStream, CasFS, parse_range_request};
+use cas_storage::{BlockStream, CasFS};
 
 const MAX_KEYS: i32 = 1000;
 /// S3's ceiling on one `ListParts` page, and its default.
@@ -525,18 +525,41 @@ impl S3 for S3FS {
             }
         };
 
+        // The advertised headers and the returned body must come from the
+        // same arithmetic, so the range is resolved against the object size
+        // before anything is built from it. `check` clamps the end, handles
+        // suffix ranges, and turns an unsatisfiable range into a 416 --
+        // before a body exists. s3s answers 206 exactly when content_range
+        // is set, so it is only set for an actual ranged request.
+
         // if the object is inlined, we return it directly
         if let Some(data) = obj_meta.inlined() {
-            let bytes = bytes::Bytes::from(data.clone());
+            let full_size = data.len() as u64;
+            let (bytes, content_range) = match range {
+                Some(ref range) => {
+                    let resolved = range.check(full_size)?;
+                    (
+                        bytes::Bytes::from(data.clone())
+                            .slice(resolved.start as usize..resolved.end as usize),
+                        Some(fmt_content_range(
+                            resolved.start,
+                            resolved.end - 1,
+                            full_size,
+                        )),
+                    )
+                }
+                None => (bytes::Bytes::from(data.clone()), None),
+            };
 
+            let content_length = bytes.len() as i64;
             let body = s3s::Body::from(bytes);
             let stream = StreamingBlob::from(body);
 
-            let stream_size = data.len() as u64;
             let output = GetObjectOutput {
                 body: Some(stream),
-                content_length: Some(stream_size as i64),
-                content_range: Some(fmt_content_range(0, stream_size - 1, stream_size)),
+                content_length: Some(content_length),
+                content_range,
+                accept_ranges: Some("bytes".to_string()),
                 last_modified: Some(Timestamp::from(obj_meta.last_modified())),
                 e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),
                 ..Default::default()
@@ -544,22 +567,30 @@ impl S3 for S3FS {
             return Ok(S3Response::new(output));
         }
 
-        let stream_size = obj_meta.size();
-        let range = match range {
-            Some(range) => {
-                let header_string = Some(range.to_header_string());
-                parse_range_request(&header_string)
-            }
-            None => RangeRequest::All,
+        let full_size = obj_meta.size();
+        let resolved = match range {
+            Some(ref range) => Some(range.check(full_size)?),
+            None => None,
+        };
+        let (range_request, stream_size, content_range) = match resolved {
+            Some(r) => (
+                RangeRequest::new_range(r.start, r.end - 1),
+                r.end - r.start,
+                Some(fmt_content_range(r.start, r.end - 1, full_size)),
+            ),
+            None => (RangeRequest::All, full_size, None),
         };
 
         let block_size: usize = paths.iter().map(|(_, size)| size).sum();
 
         debug_assert!(obj_meta.size() == block_size as u64);
-        let mut block_stream = BlockStream::new(paths, block_size, range, self.metrics.to_cas());
-        if self.casfs.verify_on_read() {
-            // A no-op for a ranged read: a partial block cannot be checked
-            // against a whole-block address.
+        let whole_object = matches!(range_request, RangeRequest::All);
+        let mut block_stream =
+            BlockStream::new(paths, block_size, range_request, self.metrics.to_cas());
+        if self.casfs.verify_on_read() && whole_object {
+            // Whole reads only: a partial block cannot be checked against a
+            // whole-block address, and the verifying reader buffers and
+            // yields entire blocks, which would widen a ranged body.
             block_stream = block_stream.verified(self.casfs.hasher(), obj_meta.blocks().to_vec());
         }
         let stream = StreamingBlob::wrap(block_stream);
@@ -567,7 +598,8 @@ impl S3 for S3FS {
         let output = GetObjectOutput {
             body: Some(stream),
             content_length: Some(stream_size as i64),
-            content_range: Some(fmt_content_range(0, stream_size - 1, stream_size)),
+            content_range,
+            accept_ranges: Some("bytes".to_string()),
             last_modified: Some(Timestamp::from(obj_meta.last_modified())),
             //metadata: object_metadata,
             e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),

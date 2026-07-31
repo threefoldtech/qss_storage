@@ -174,6 +174,20 @@ impl BlockStream {
         self.metrics.bytes_sent(bytes.len());
         Poll::Ready(Some(Ok(bytes.into())))
     }
+
+    /// The requested window as `start..end` with an EXCLUSIVE end, in one
+    /// place: every consumer in `poll_next` used to redo this conversion
+    /// and they disagreed on whether `Range`'s end was inclusive, which
+    /// truncated the last byte of a range landing on a block boundary.
+    /// The end is saturated rather than trusted: it is client-controlled.
+    fn bounds(&self) -> (u64, u64) {
+        match self.range {
+            RangeRequest::All => (0, self.size as u64),
+            RangeRequest::Range(start, end) => (start, end.saturating_add(1)),
+            RangeRequest::ToBytes(end) => (0, end.saturating_add(1)),
+            RangeRequest::FromBytes(start) => (start, u64::MAX),
+        }
+    }
 }
 // ---- tfstor-extension: BEGIN ----
 // `unsafe impl Sync for BlockStream {}` was here and has been DELETED. It came
@@ -199,12 +213,7 @@ impl Stream for BlockStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let (start, end) = match self.range {
-            RangeRequest::Range(start, end) => (start, end),
-            RangeRequest::ToBytes(end) => (0, end),
-            RangeRequest::FromBytes(start) => (start, self.size as u64 + start),
-            RangeRequest::All => (0, self.size as u64),
-        };
+        let (start, end) = self.bounds();
         let processed = self.processed as u64;
 
         if processed >= end {
@@ -267,10 +276,9 @@ impl Stream for BlockStream {
 
         // if we have an open file, try to read it
         if let Some(ref mut file) = self.file {
-            // `end` is client-controlled and unclamped: saturate so
-            // `end == u64::MAX` cannot overflow, and the min bounds the
-            // narrowing cast.
-            let cap = (end - processed).saturating_add(1).min(4096);
+            // `end` is exclusive and `processed < end` here, so this is the
+            // exact remainder; the min bounds the narrowing cast.
+            let cap = (end - processed).min(4096);
             let mut buf = vec![0; cap as usize];
             return match Pin::new(file).poll_read(cx, &mut buf) {
                 Poll::Pending => Poll::Pending,
@@ -294,52 +302,27 @@ impl Stream for BlockStream {
         // calculation of a range request, if the new file is so small that it would be skipped.
         if self.open_fut.is_none() {
             loop {
-                // TODO: Fix this crap
                 let processed = self.processed as u64;
-                match self.range {
-                    RangeRequest::Range(start, end) => {
-                        if processed > end {
-                            return Poll::Ready(None);
-                        } else if processed < start {
-                            if processed + (self.paths[self.fp].1 as u64) < start {
-                                // skip file entirely
-                                self.processed += self.paths[self.fp].1;
-                                self.fp += 1;
-                                if self.fp > self.paths.len() {
-                                    return Poll::Ready(None);
-                                }
-                                continue;
-                            }
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                    RangeRequest::ToBytes(end) => {
-                        if processed > end {
-                            return Poll::Ready(None);
-                        }
-                        break;
-                    }
-                    RangeRequest::FromBytes(start) => {
-                        if processed < start && processed + (self.paths[self.fp].1 as u64) < start {
-                            // skip file entirely
-                            self.processed += self.paths[self.fp].1;
-                            self.fp += 1;
-                            if self.fp > self.paths.len() {
-                                return Poll::Ready(None);
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                    RangeRequest::All => break,
+                if processed >= end {
+                    return Poll::Ready(None);
                 }
+                // skip whole files that end before the window starts
+                if processed < start && processed + (self.paths[self.fp].1 as u64) <= start {
+                    self.processed += self.paths[self.fp].1;
+                    self.fp += 1;
+                    if self.fp >= self.paths.len() {
+                        return Poll::Ready(None);
+                    }
+                    continue;
+                }
+                break;
             }
         }
 
-        // we don't have an open file, check if we have any more left
-        if self.fp > self.paths.len() {
+        // No open file and none arriving: check if any are left. `fp` is
+        // already past a file whose open is still in flight, so this must
+        // not fire while `open_fut` is pending.
+        if self.open_fut.is_none() && self.fp >= self.paths.len() {
             return Poll::Ready(None);
         }
 
@@ -380,6 +363,10 @@ impl Stream for BlockStream {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.size, Some(self.size))
+        // The ranged length, not the object's: this must agree with the
+        // Content-Length the handler advertises.
+        let (start, end) = self.bounds();
+        let len = end.min(self.size as u64).saturating_sub(start) as usize;
+        (len, Some(len))
     }
 }

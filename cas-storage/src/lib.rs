@@ -134,7 +134,7 @@ pub use cas::{
     block_stream::{BlockCorruption, BlockStream},
     // Multipart support
     multipart::{MultiPart, MultiPartTree},
-    range_request::{RangeRequest, parse_range_request},
+    range_request::RangeRequest,
     sweep_stale_uploads,
 };
 
