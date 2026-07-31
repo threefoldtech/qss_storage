@@ -680,6 +680,10 @@ Review asks:
 ## Open Questions
 
 **Behavior definers**
+- [ ] Disk layout shape under the deterministic decision: the two-level
+      fanout with full-hex filenames is specified above but the owner
+      has a pending reservation (2026-07-31) -- confirm the shape (or an
+      alternative pure function of the BlockId) before implementation.
 - [ ] Should the stripe also serialize verify-on-read's re-hash against
       concurrent writes, or is read-side locking still rejected? (Review
       note: rename-over installs byte-identical content, so a heal race

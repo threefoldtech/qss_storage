@@ -9,7 +9,11 @@ with no other context.
 **Decisions already made -- do not reopen** (rationale in the ADR):
 - Path scheme: hash-derived deterministic paths. No migration exists or
   is needed (no deployed store carries data). `_PATHS` is removed
-  wholesale.
+  wholesale. **OWNER RESERVATION PENDING (2026-07-31)**: the concrete
+  disk layout shape (two-level fanout, full-hex filenames) is under
+  review by the owner -- re-confirm before starting Component 2. The
+  protocol requires only that the path be a pure function of the
+  BlockId; the fanout shape is negotiable.
 - `key_has_block` skip: dropped. Every dedup hit bumps rc under the
   stripe.
 - `fjall_notx`: scoped out of the loss-never guarantee. No key-stripe.
