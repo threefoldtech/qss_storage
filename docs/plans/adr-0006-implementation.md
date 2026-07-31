@@ -10,10 +10,11 @@ with no other context.
 **Decisions already made -- do not reopen** (rationale in the ADR):
 - Path scheme (owner's, confirmed 2026-07-31): full-id filenames at
   adaptive fanout depth -- `blocks/<b0>/../<b(d-1)>/<full-hex id>`,
-  `d` in 1..=3 chosen by placement policy at write time; the record
-  stores `d`. A file's name identifies its block, so any depth is
-  correct. `_PATHS` and the allocator are removed. No migration exists
-  or is needed (no deployed store carries data).
+  any depth (bounded only by the id width) chosen by placement policy
+  at write time; the record stores `d`. A file's name identifies its
+  block, so any depth is correct. `_PATHS` and the allocator are
+  removed. No migration exists or is needed (no deployed store carries
+  data).
 - `key_has_block` skip: dropped. Every dedup hit bumps rc under the
   stripe.
 - `fjall_notx`: scoped out of the loss-never guarantee. No key-stripe.
@@ -23,7 +24,7 @@ with no other context.
 - Durability gating: `Buffer` skips all file/dir fsyncs; `Fsync`/
   `Fdatasync` sync files and directories (directories always via full
   fsync). On notx, file fsyncs still follow the configured level.
-- Open ask (landing order vs ADR 0005) does NOT gate this work.
+- All review asks are resolved. Landing order: 0006 lands before 0005.
 
 **Hard rules carried from the review** (violating any of these
 reintroduces a verified loss bug):
@@ -79,7 +80,7 @@ any commit path in `write_path.rs`.
 ## Component 2: Block path layout (full-id names, adaptive depth)
 
 ```text
-blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=3
+blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=width(id)
 ```
 
 Directory names are single hex bytes of the id (2 chars each, taken
@@ -102,12 +103,17 @@ placement only.
 - **Placement policy** (performance-only): choose the shallowest depth
   whose target directory's approximate occupancy is below a threshold
   (default 4096 entries). In-memory lazy counters; approximation is
-  harmless because placement carries no correctness. `d <= 3` supports
-  multi-billion-block stores at a few thousand entries per directory.
-- **Insert-time probe**: before writing the temp file, stat the
-  candidate paths for depths 1..=3; if a file named `<id>` exists at
-  some depth d0, choose d0 (the rename then heals the orphan in place,
-  complete or corrupt alike). Otherwise use the policy depth.
+  harmless because placement carries no correctness. Depth is bounded
+  only by the id width, so the fanout deepens for as long as the store
+  grows.
+- **Insert-time probe**: walk the id's directory chain from the blocks
+  root -- at each existing level, stat `<id>` in that directory; stop
+  at the first missing child directory (any candidate file must lie on
+  the existing chain, so this bounds the probe to the chain's actual
+  depth, worst case width(id)). If a file named `<id>` is found at
+  depth d0, choose d0 (the rename then heals the orphan in place,
+  complete or corrupt alike). Otherwise use the policy depth. Cost: a
+  handful of stats along an existing dir chain, new-block path only.
 
 Remove:
 - the `_PATHS` tree and everything that touches it: the
@@ -215,7 +221,7 @@ spawn_blocking(move ||  {          # closure owns `guard`
         tx.commit()?               # dedup hit: no file I/O
         return Bumped
     drop(tx)
-    d = probe depths 1..=3 for a file named h,        # component 2:
+    d = probe h's dir chain for a file named h,       # component 2:
         else placement-policy depth                   # heal-in-place
     write temp; fsync; fsync dirs;
     rename to disk_path(h, d); fsync parent           # component 4

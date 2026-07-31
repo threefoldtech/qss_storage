@@ -4,7 +4,8 @@
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
 refutation; decided 2026-07-31: full-id adaptive-depth paths,
-key_has_block skip dropped, fjall_notx scoped out of loss-never)
+key_has_block skip dropped, fjall_notx scoped out of loss-never, lands
+before ADR 0005 -- all review asks resolved)
 **Date**: 2026-07-30
 
 ---
@@ -124,7 +125,7 @@ A block file is named by its full id and placed under a fanout depth
 chosen at write time:
 
 ```text
-blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=3
+blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=width(id)
 ```
 
 Directory names are single hex bytes of the id (2 chars); the filename
@@ -151,8 +152,8 @@ The adaptive depth preserves the current design's virtue -- small
 stores stay shallow and directory sizes stay bounded for the VFS --
 without its defect (names that only a `_PATHS` lookup could attribute
 to a block). Placement default: shallowest depth whose target directory
-is below an occupancy threshold; `d <= 3` supports multi-billion-block
-stores at a few thousand entries per directory.
+is below an occupancy threshold; depth is bounded only by the id width,
+so the fanout can deepen for as long as the store grows.
 
 **No upgrade path is needed**: no deployed store carries data, so this
 layout simply *is* the layout -- no format bump, no migration
@@ -487,7 +488,8 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
 - **Why superseded**: the adaptive-depth scheme keeps small stores
   shallow and directory sizes adaptively bounded (the current design's
   VFS virtue) at the cost of a one-byte depth field in the record and a
-  bounded (<= 3 stats) probe on insert. Both are sound; the owner chose
+  bounded probe on insert (at most id-width stats; in practice the
+  depth of the existing dir chain). Both are sound; the owner chose
   adaptive.
 
 ### O_TMPFILE + linkat (moved here from the open decisions: rejected)
@@ -641,6 +643,11 @@ survives for test injection only; its implementation moves to
   decrement races; the double-DELETE-same-key window and the absent
   metadata durability are accepted and must be named in the startup
   warning and docs.
+- **Landing order**: ADR 0006 lands before ADR 0005, decided
+  2026-07-31. Fsck cannot detect the rc undercounts defects 1 and 5
+  produce (an undercount looks internally consistent), so
+  reconciliation cannot substitute for this fix; 0005 then reconciles
+  the strictly smaller post-0006 failure zoo.
 - **Stripe placement on `SharedBlockStore`**: confirmed (review ask 1 of
   the previous revision), with the two new preconditions in component 1
   (no double-open via `single_namespace`; blocks root bound to the shared
@@ -698,11 +705,8 @@ tests must account for the pre-existing key-overwrite leak (or land the
 overwrite-decrement follow-up first); an end-to-end concurrent-PUT
 benchmark to quantify the executor win and measure `(K-1)/N` in practice.
 
-Review asks:
-1. Land before ADR 0005? The review strengthens "before": two of today's
-   loss races (defects 1 and 5) are states fsck cannot even detect (an rc
-   undercount looks consistent), so reconciliation cannot substitute for
-   this fix.
+Review asks: none -- all resolved (path scheme, key_has_block, notx
+scope, landing order; see Decisions locked above).
 
 ---
 
