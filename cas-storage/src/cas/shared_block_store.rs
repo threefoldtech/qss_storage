@@ -6,6 +6,7 @@ use crate::metastore::{
     BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
 };
 
+use super::block_disk::{AtomicBlockWriter, BlockDiskOps, RealDiskOps};
 use super::placement::BlockPlacement;
 use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
 use super::{StorageEngine, multipart::MultiPartTree};
@@ -35,6 +36,15 @@ pub struct SharedBlockStore {
     // starts taking stripes.
     #[allow(dead_code)]
     stripes: Stripes,
+    /// The atomic temp+fsync+rename writer (open duties already run).
+    // TODO(adr-0006): the allow dies when the write path (component 5)
+    // starts writing through this.
+    #[allow(dead_code)]
+    disk_writer: AtomicBlockWriter,
+    /// The low-level disk ops the writer drives; swapped by tests.
+    // TODO(adr-0006): the allow dies with component 5.
+    #[allow(dead_code)]
+    disk_ops: Arc<dyn BlockDiskOps>,
 }
 
 impl SharedBlockStore {
@@ -75,6 +85,17 @@ impl SharedBlockStore {
         std::fs::create_dir_all(&blocks_root).ok();
         blocks_root = blocks_root.canonicalize().unwrap_or(blocks_root);
 
+        // Store-open duties for the block file tree: create blocks/ and
+        // blocks/.tmp, purge temp residue, refuse a temp dir on another
+        // filesystem, fsync per durability (ADR 0006 component 4).
+        let disk_ops: Arc<dyn BlockDiskOps> = Arc::new(RealDiskOps);
+        let disk_writer = AtomicBlockWriter::open(
+            &*disk_ops,
+            blocks_root.clone(),
+            durability.unwrap_or(Durability::Fsync),
+        )
+        .map_err(|e| MetaError::OtherDBError(format!("opening the blocks root: {e}")))?;
+
         let spec = spec.unwrap_or_default();
         let (meta_store, header) = match storage_engine {
             StorageEngine::Fjall => {
@@ -97,6 +118,8 @@ impl SharedBlockStore {
             placement: BlockPlacement::new(blocks_root.clone()),
             blocks_root,
             stripes: Stripes::new(stripe_count.unwrap_or(DEFAULT_STRIPE_COUNT)),
+            disk_writer,
+            disk_ops,
         })
     }
 
