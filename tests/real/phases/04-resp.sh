@@ -242,6 +242,11 @@ fi
 # Four clients at once, each down its own connection with its work batched:
 # the point is concurrent connections, not how many processes a shell can
 # spawn per second.
+#
+# The wait below names the client pids. A bare wait would also wait for
+# respd, which this same shell started as a background job -- and respd
+# does not exit, so the phase would hang here forever.
+conc_pids=()
 for w in 1 2 3 4; do
     (
         j=0
@@ -251,8 +256,9 @@ for w in 1 2 3 4; do
             j=$((j + 1))
         done
     ) | vk >/dev/null 2>&1 &
+    conc_pids+=("$!")
 done
-wait
+for pid in "${conc_pids[@]}"; do wait "$pid" 2>/dev/null; done
 assert_eq "concurrent clients do not lose writes" "v24" \
     "$(vk GET qssrt:conc:4:24 2>/dev/null)"
 
