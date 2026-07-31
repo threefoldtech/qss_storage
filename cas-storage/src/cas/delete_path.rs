@@ -9,7 +9,9 @@
 //!    time: re-check + decrement/remove + unlink share one stripe hold
 //!    inside one `spawn_blocking` closure (hard rule 4 -- a cancellable
 //!    await between decrement and unlink is how a detached unlink once
-//!    deleted a freshly rewritten block).
+//!    deleted a freshly rewritten block). That loop is [`release_blocks`],
+//!    which multipart abort and the stale-upload GC (ADR 0003) call with
+//!    the blocks of a part record they have just removed.
 //!
 //! Ordering object-removal-then-decrements means a crash between the two
 //! steps leaves rc over-counts: leakage for ADR 0005 to reconcile, never
@@ -22,6 +24,7 @@ use std::sync::Arc;
 use super::fs::CasFS;
 use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{BlockDecrement, BlockId, MetaError};
+use crate::metrics::SharedMetrics;
 
 /// One block-occurrence decrement under the stripe, on a blocking thread.
 ///
@@ -59,42 +62,49 @@ fn decrement_one_block(
     }
 }
 
-#[tracing::instrument(skip(fs), fields(bucket = %bucket, key = %key, blocks_deleted))]
-pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result<(), MetaError> {
-    // Step 1: atomically take the object record out of the namespace DB.
-    // An absent key deletes nothing and is not an error (idempotent).
-    let mut tx = fs.namespace.begin_transaction();
-    let obj = match tx.take_object(bucket, key) {
-        Ok(obj) => {
-            tx.commit()?;
-            obj
-        }
-        Err(e) => {
-            tx.rollback();
-            return Err(e);
-        }
-    };
-    let Some(obj) = obj else {
-        tracing::Span::current().record("blocks_deleted", 0);
-        return Ok(());
-    };
-
-    tracing::Span::current().record("blocks_deleted", obj.blocks().len());
-
-    // Step 2: per block OCCURRENCE (a multipart object may list one block
-    // several times, and each occurrence holds one reference), one stripe
-    // at a time.
-    for block_id in obj.blocks() {
-        let stripe_guard = fs.shared.stripes().for_hash(block_id).lock_owned().await;
-        let shared = fs.shared.clone();
-        let metrics = fs.metrics.clone();
+/// Drops one reference per entry of `blocks`: ADR 0006's delete-side
+/// primitive, with a name.
+///
+/// Object delete releases the blocks of an object it has taken; from ADR
+/// 0003 on, multipart abort and the stale-upload GC release the blocks of a
+/// part record they have removed. All three are the same operation over an
+/// explicit list, which is why this is a factoring of `delete_object`'s loop
+/// rather than a second implementation -- there is exactly one place where
+/// references are dropped.
+///
+/// # The caller must have removed the owning record FIRST
+///
+/// Record first, release second -- never the reverse (hard rule 2). A crash
+/// between the two then leaves a block whose rc exceeds its walked holders:
+/// an over-count, which fsck reports INFO and the next recount collects. The
+/// reverse order leaves a record still claiming references that were already
+/// dropped, so fsck's recount sees holders exceeding rc -- a loss-shaped
+/// under-count it must call CRITICAL, and one that `--repair` would "fix" by
+/// raising the rc back, leaking those blocks permanently. The ordering keeps
+/// the accounting wrong in the only direction that is recoverable.
+///
+/// Per OCCURRENCE: a list may name one block several times (a multipart
+/// object commonly does), and each occurrence holds its own reference.
+///
+/// Never aborts the loop. A failed decrement or unlink strands at most one
+/// block (leak class); giving up would strand every remaining one. Failures
+/// are logged, not returned -- there is no caller-level recovery for them.
+pub(crate) async fn release_blocks(
+    shared: &Arc<SharedBlockStore>,
+    metrics: &SharedMetrics,
+    blocks: &[BlockId],
+) {
+    for block_id in blocks {
+        let stripe_guard = shared.stripes().for_hash(block_id).lock_owned().await;
+        let shared = shared.clone();
+        let metrics_for_task = metrics.clone();
         let id = *block_id;
 
         // Same in-flight gauge as the write side; see store_object.
-        fs.metrics.block_disk_op_started();
+        metrics.block_disk_op_started();
         let joined = tokio::task::spawn_blocking(move || {
             let result = decrement_one_block(shared, stripe_guard, id);
-            metrics.block_disk_op_finished();
+            metrics_for_task.block_disk_op_finished();
             result
         })
         .await;
@@ -120,6 +130,33 @@ pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result
             }
         }
     }
+}
+
+#[tracing::instrument(skip(fs), fields(bucket = %bucket, key = %key, blocks_deleted))]
+pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result<(), MetaError> {
+    // Step 1: atomically take the object record out of the namespace DB.
+    // An absent key deletes nothing and is not an error (idempotent).
+    let mut tx = fs.namespace.begin_transaction();
+    let obj = match tx.take_object(bucket, key) {
+        Ok(obj) => {
+            tx.commit()?;
+            obj
+        }
+        Err(e) => {
+            tx.rollback();
+            return Err(e);
+        }
+    };
+    let Some(obj) = obj else {
+        tracing::Span::current().record("blocks_deleted", 0);
+        return Ok(());
+    };
+
+    tracing::Span::current().record("blocks_deleted", obj.blocks().len());
+
+    // Step 2: the object record is gone, so its references may be dropped --
+    // record first, release second (see release_blocks).
+    release_blocks(&fs.shared, &fs.metrics, obj.blocks()).await;
 
     Ok(())
 }

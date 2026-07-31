@@ -16,9 +16,10 @@ use tempfile::tempdir;
 
 use super::block_disk::{BlockDiskOps, RealDiskOps};
 use super::byte_stream::AsyncByteStream;
+use super::delete_path::release_blocks;
 use super::fs::CasFS;
 use super::shared_block_store::SharedBlockStore;
-use crate::metastore::Durability;
+use crate::metastore::{BlockId, Durability};
 use crate::metrics::SharedMetrics;
 
 const STORM_ITERATIONS: usize = 60;
@@ -76,6 +77,149 @@ async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) {
     fs.store_single_object_and_meta(bucket, key, stream, len)
         .await
         .unwrap();
+}
+
+/// The invariant every release leg below shares: the record carries exactly
+/// the expected count, and the block file exists IFF something still
+/// references it. Anything else is a torn rc -- a leaked file under a dead
+/// record, or a live record whose bytes were unlinked out from under it.
+fn assert_block_state(
+    shared: &SharedBlockStore,
+    id: BlockId,
+    expected_rc: usize,
+    root: &std::path::Path,
+) {
+    match shared.block_tree().get_block(id.as_slice()).unwrap() {
+        Some(block) => {
+            assert_eq!(block.rc(), expected_rc, "exact rc at quiesce");
+            assert!(expected_rc > 0, "a live record must carry a reference");
+            let path = block.disk_path(&id, root.to_path_buf());
+            let bytes = std::fs::read(&path).expect("a referenced block must keep its file");
+            assert_eq!(
+                shared.hasher().hash(&bytes),
+                id,
+                "the file is the block it is named after"
+            );
+        }
+        None => {
+            assert_eq!(
+                expected_rc, 0,
+                "the record vanished with references outstanding"
+            );
+            assert!(
+                !crate::metastore::block_disk_path(&id, 1, root.to_path_buf()).exists(),
+                "the last release must unlink the file"
+            );
+        }
+    }
+}
+
+/// One release racing K concurrent PUTs of the same content. The release's
+/// striped decrement and each PUT's striped bump serialize on the one
+/// stripe, so the arithmetic is exact whatever the interleaving: one seed
+/// reference, plus K, minus the one released, is K.
+///
+/// The extreme interleaving is the interesting one: if the release lands
+/// first it takes the LAST reference, removing the record and unlinking the
+/// file inside its stripe hold -- and the PUTs that follow must then rebuild
+/// the block from rc 1 rather than resurrecting a half-dead record.
+///
+/// (The seed PUT stands in for whichever record held that reference; a real
+/// caller -- abort, from component 4 -- removes its part record before
+/// calling. This arm pins the rc protocol, not the caller's ordering.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_blocks_vs_concurrent_puts_keeps_exact_rc() {
+    /// Concurrent writers of the same content, one per namespace.
+    const K: usize = 8;
+
+    let dir = tempdir().unwrap();
+    let (shared, namespaces) = store_with_namespaces(dir.path(), None, K);
+    let metrics = SharedMetrics::default();
+    for fs in &namespaces {
+        fs.create_bucket("b").unwrap();
+    }
+
+    for iteration in 0..STORM_ITERATIONS {
+        // Fresh content per iteration: each one is a fresh race.
+        let data = format!("release race {iteration} ").repeat(64).into_bytes();
+        let id = shared.hasher().hash(&data);
+
+        // Seed the reference the release will drop.
+        put(
+            &namespaces[0],
+            "b",
+            &format!("seed-{iteration}"),
+            data.clone(),
+        )
+        .await;
+
+        let mut tasks = Vec::new();
+        {
+            let shared = shared.clone();
+            let metrics = metrics.clone();
+            tasks.push(tokio::spawn(async move {
+                release_blocks(&shared, &metrics, &[id]).await;
+            }));
+        }
+        for (i, fs) in namespaces.iter().enumerate() {
+            let fs = fs.clone();
+            let data = data.clone();
+            tasks.push(tokio::spawn(async move {
+                put(&fs, "b", &format!("k-{iteration}-{i}"), data).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        assert_block_state(&shared, id, K, namespaces[0].fs_root());
+    }
+}
+
+/// The same arithmetic in both orders, run sequentially so the interleaving
+/// is not left to the scheduler: release-then-PUTs and PUTs-then-release
+/// must land on the identical final state. The first order also pins the
+/// rc-zero side of the invariant -- releasing the last reference removes the
+/// record AND unlinks the file, before the PUTs rebuild it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_blocks_lands_the_same_state_in_either_order() {
+    const K: usize = 4;
+
+    let dir = tempdir().unwrap();
+    let (shared, namespaces) = store_with_namespaces(dir.path(), None, K);
+    let metrics = SharedMetrics::default();
+    for fs in &namespaces {
+        fs.create_bucket("b").unwrap();
+    }
+
+    for release_first in [true, false] {
+        let leg = if release_first {
+            "release-first"
+        } else {
+            "puts-first"
+        };
+        let data = format!("order {leg} ").repeat(64).into_bytes();
+        let id = shared.hasher().hash(&data);
+
+        put(&namespaces[0], "b", &format!("seed-{leg}"), data.clone()).await;
+        assert_block_state(&shared, id, 1, namespaces[0].fs_root());
+
+        if release_first {
+            release_blocks(&shared, &metrics, &[id]).await;
+            // That was the last reference: nothing left, file included.
+            assert_block_state(&shared, id, 0, namespaces[0].fs_root());
+        }
+
+        for (i, fs) in namespaces.iter().enumerate() {
+            put(fs, "b", &format!("k-{leg}-{i}"), data.clone()).await;
+        }
+
+        if !release_first {
+            release_blocks(&shared, &metrics, &[id]).await;
+        }
+
+        assert_block_state(&shared, id, K, namespaces[0].fs_root());
+    }
 }
 
 /// Counts exclusive-create file writes; everything else is real.
