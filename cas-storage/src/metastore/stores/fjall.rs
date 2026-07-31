@@ -287,10 +287,18 @@ impl BaseMetaTree for FjallTree {
             .map_err(|e| MetaError::OtherDBError(e.to_string()))
     }
 
-    fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
+    fn remove(&self, key: &[u8]) -> Result<bool, MetaError> {
+        // fjall's remove does not say whether the key was there, so the
+        // existence is probed first; the two ops are not one transaction,
+        // which is the "best-effort" in the trait contract.
+        let existed = self
+            .partition
+            .contains_key(key)
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
         self.partition
             .remove(key)
-            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+        Ok(existed)
     }
 
     fn contains_key(&self, key: &[u8]) -> Result<bool, MetaError> {

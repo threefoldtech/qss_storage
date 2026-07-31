@@ -230,6 +230,42 @@ mod test_config {
         assert!(!exists_after);
     }
 
+    /// DEL replies with the number of keys that actually existed -- 0 for
+    /// an absent key, and the summed count for a variadic call. The absent
+    /// case used to answer a hardcoded 1.
+    #[test]
+    fn test_del_counts_what_existed() {
+        let server = TestServer::new();
+        let mut conn = server.connect();
+
+        let deleted: i64 = redis::cmd("DEL")
+            .arg("never_written")
+            .query(&mut conn)
+            .expect("DEL of an absent key must not error");
+        assert_eq!(deleted, 0, "DEL of an absent key counts nothing");
+
+        for key in ["del_a", "del_b"] {
+            let _: () = redis::cmd("SET")
+                .arg(key)
+                .arg("value")
+                .query(&mut conn)
+                .expect("Failed to set key");
+        }
+        let deleted: i64 = redis::cmd("DEL")
+            .arg("del_a")
+            .arg("still_absent")
+            .arg("del_b")
+            .query(&mut conn)
+            .expect("variadic DEL must not error");
+        assert_eq!(deleted, 2, "only the keys that existed are counted");
+
+        let deleted_again: i64 = redis::cmd("DEL")
+            .arg("del_a")
+            .query(&mut conn)
+            .expect("repeat DEL must not error");
+        assert_eq!(deleted_again, 0, "a deleted key no longer counts");
+    }
+
     #[test]
     fn test_ping() {
         let server = TestServer::new();

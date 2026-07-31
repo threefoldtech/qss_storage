@@ -272,7 +272,8 @@ impl Namespace {
         }
     }
 
-    pub fn del(&self, key: &[u8]) -> Result<()> {
+    /// Deletes a key, answering whether it existed -- the unit DEL counts.
+    pub fn del(&self, key: &[u8]) -> Result<bool> {
         // Read namespace properties
         let props = self.properties.read().unwrap();
 
@@ -293,8 +294,8 @@ impl Namespace {
         // Note: Authentication check is now handled by the CommandHandler
 
         // Proceed with deleting the key
-        self.tree.read().unwrap().remove(key)?;
-        Ok(())
+        let existed = self.tree.read().unwrap().remove(key)?;
+        Ok(existed)
     }
 
     pub fn exists(&self, key: &[u8]) -> Result<bool, MetaError> {

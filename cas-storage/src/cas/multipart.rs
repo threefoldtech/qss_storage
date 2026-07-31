@@ -232,7 +232,7 @@ impl MultiPartTree {
     }
 
     pub fn remove(&self, key: &[u8]) -> Result<(), MetaError> {
-        self.tree.remove(key)
+        self.tree.remove(key).map(|_existed| ())
     }
 
     pub fn get_multipart_part(&self, key: &[u8]) -> Result<Option<MultiPart>, MetaError> {

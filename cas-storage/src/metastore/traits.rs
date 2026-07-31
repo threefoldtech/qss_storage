@@ -24,8 +24,10 @@ pub trait BaseMetaTree: Send + Sync {
     /// * `key` - The key to remove as a byte slice
     ///
     /// # Returns
-    /// * `Result<(), MetaError>` - Success or an error if the removal fails
-    fn remove(&self, key: &[u8]) -> Result<(), MetaError>;
+    /// * `Result<bool, MetaError>` - Whether the key existed (best-effort
+    ///   under concurrent writers), or an error if the removal fails. The
+    ///   answer is what Redis DEL semantics count.
+    fn remove(&self, key: &[u8]) -> Result<bool, MetaError>;
 
     /// Checks if a key exists in the tree.
     ///

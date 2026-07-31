@@ -40,7 +40,7 @@ pub enum Command {
         message: Option<String>,
     },
     Del {
-        key: String,
+        keys: Vec<String>,
     },
     Exists {
         key: String,
@@ -229,12 +229,26 @@ where
 
 /// `MGET key [key ...]`
 fn parse_mget(args: &Args) -> Result<Command, CommandError> {
+    Ok(Command::MGet {
+        keys: parse_keys(args)?,
+    })
+}
+
+/// `DEL key [key ...]` -- variadic like Redis, replying the summed count.
+fn parse_del(args: &Args) -> Result<Command, CommandError> {
+    Ok(Command::Del {
+        keys: parse_keys(args)?,
+    })
+}
+
+/// Every argument after the command name as a key, at least one.
+fn parse_keys(args: &Args) -> Result<Vec<String>, CommandError> {
     args.arity_min(2)?;
     let mut keys = Vec::with_capacity(args.len() - 1);
     for idx in 1..args.len() {
         keys.push(args.string_at(idx, "key")?);
     }
-    Ok(Command::MGet { keys })
+    Ok(keys)
 }
 
 /// `SET key value` (trailing arguments are accepted and ignored)
@@ -284,7 +298,7 @@ impl Command {
             "AUTH" => parse_one_arg(&args, "password", |password| Command::Auth { password }),
             "CHECK" => parse_one_arg(&args, "key", |key| Command::Check { key }),
             "DBSIZE" => parse_no_args(&args, Command::DBSize),
-            "DEL" => parse_one_arg(&args, "key", |key| Command::Del { key }),
+            "DEL" => parse_del(&args),
             "EXISTS" => parse_one_arg(&args, "key", |key| Command::Exists { key }),
             "FLUSH" => parse_no_args(&args, Command::Flush),
             "GET" => parse_one_arg(&args, "key", |key| Command::Get { key }),
@@ -361,7 +375,7 @@ impl CommandHandler {
             Command::MGet { keys } => self.handle_mget(keys),
             Command::Set { key, value } => self.handle_set(key, value),
             Command::Ping { message } => Self::handle_ping(message),
-            Command::Del { key } => self.handle_del(key),
+            Command::Del { keys } => self.handle_del(keys),
             Command::Exists { key } => self.handle_exists(key),
             Command::Check { key } => self.handle_check(key),
             Command::Length { key } => self.handle_length(key),
@@ -469,21 +483,28 @@ impl CommandHandler {
     }
 
     /// Handle DEL command
-    fn handle_del(&self, key: String) -> Frame {
-        debug!("Handling DEL command for key: {}", key);
+    fn handle_del(&self, keys: Vec<String>) -> Frame {
+        debug!("Handling DEL command for keys: {:?}", keys);
 
         // Check if the connection is authenticated for this namespace
         if !self.namespace_authenticated {
             return Frame::Error("ERR: Authentication required for write operations".into());
         }
 
-        match self.namespace.del(key.as_bytes()) {
-            Ok(()) => Frame::Integer(1), // Successfully deleted 1 key
-            Err(e) => {
-                error!("Error deleting key {}: {}", key, e);
-                Frame::Error(format!("ERR {}", e))
+        // Redis semantics: the reply counts the keys that existed and were
+        // removed, not the keys that were named.
+        let mut removed: i64 = 0;
+        for key in &keys {
+            match self.namespace.del(key.as_bytes()) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    error!("Error deleting key {}: {}", key, e);
+                    return Frame::Error(format!("ERR {}", e));
+                }
             }
         }
+        Frame::Integer(removed)
     }
 
     /// Handle EXISTS command
