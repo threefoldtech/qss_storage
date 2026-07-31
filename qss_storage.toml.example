@@ -48,6 +48,23 @@ metadata_db = "fjall"
 # Default: false
 verify_on_read = false
 
+# Number of per-block lock stripes (ADR 0006). Every block-record mutation runs
+# under the stripe of the block's hash, so writers of the same block serialize
+# and writers of different blocks do not -- except when two unrelated blocks
+# land on the same stripe. With K concurrent block writers and N stripes that
+# false sharing happens with probability about (K-1)/N, so size N to roughly
+# 16x the peak concurrent block writers: the default 1024 keeps it under ~6% at
+# K=64.
+#
+# Purely a concurrency knob -- nothing about it is written to disk, so it can
+# change between restarts, and two processes may open the same store with
+# different counts. Must be between 1 and 65536: 0 would put every block writer
+# on a single lock, and the stripe index is taken from two bytes of the block
+# hash, so stripes past 65536 are allocated and never used.
+# respd ignores this key: it stores no blocks.
+# Default: 1024
+stripe_count = 1024
+
 # ---------------------------------------------------------------------------
 # [store.hash] -- how blocks are addressed.
 #

@@ -291,6 +291,7 @@ mod tests {
             Some(Durability::Buffer),
             None,
             false,
+            None,
         )
         .unwrap();
         fs.create_bucket(BUCKET).unwrap();

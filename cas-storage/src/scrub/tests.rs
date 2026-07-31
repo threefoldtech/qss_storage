@@ -491,6 +491,7 @@ fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
         Some(Durability::Buffer),
         None,
         false,
+        None,
     )
     .unwrap();
     let blocks_db = root.join("blocks").join("db");

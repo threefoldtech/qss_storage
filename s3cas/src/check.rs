@@ -150,6 +150,7 @@ pub async fn check_integrity(args: CheckConfig, store: StoreOptions) -> Result<(
         // checks the blocks itself and reports every one that failed, which a
         // read-path corruption error would pre-empt at the first bad block.
         false,
+        store.stripe_count,
     )?;
 
     let Some((obj_meta, paths)) = casfs.get_object_paths(&args.bucket, &args.key)? else {
@@ -236,6 +237,7 @@ mod tests {
             inline_metadata_size: Some(1),
             verify_on_read: false,
             hasher: Hasher::Blake3W32,
+            stripe_count: None,
         }
     }
 
@@ -249,6 +251,7 @@ mod tests {
             Some(opts.durability),
             Some(opts.header_spec()),
             false,
+            opts.stripe_count,
         )
         .unwrap()
     }

@@ -435,6 +435,7 @@ mod tests {
             Some(Durability::Buffer),
             None,
             false,
+            None,
         )
         .unwrap();
         (fs, dir)

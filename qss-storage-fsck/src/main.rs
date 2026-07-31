@@ -165,10 +165,14 @@ async fn run(cli: Cli) -> Result<u8> {
         // reports on a store nobody expected; stderr, so --json stays clean.
         let _ = writeln!(io::stderr(), "configuration loaded from {}", path.display());
     }
+    // No --stripe-count flag here: the stripe count is a write-concurrency
+    // knob and fsck's repair path deletes serially. The config file's value is
+    // still honoured so this opens the store the same way the daemon does.
     let store = StoreOptions::resolve(
         cli.metadata_db,
         cli.durability,
         cli.inline_metadata_size,
+        None,
         &file.store,
     )?;
 
@@ -190,6 +194,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Some(store.durability),
         Some(store.header_spec()),
         false,
+        store.stripe_count,
     )?;
 
     let options = if cli.scrub {

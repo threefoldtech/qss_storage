@@ -67,6 +67,7 @@ fn open(dir: &Path) -> CasFS {
         Some(Durability::Buffer),
         None,
         false,
+        None,
     )
     .expect("the store must open")
 }

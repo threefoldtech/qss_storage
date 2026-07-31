@@ -29,6 +29,7 @@
 //!     Some(Durability::Fsync),
 //!     None,                // header spec (defaults to blake3/32)
 //!     false,               // verify_on_read
+//!     None,                // stripe count (defaults to 1024)
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())

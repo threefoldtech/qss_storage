@@ -153,7 +153,9 @@ impl CasFS {
     /// only to DBs that are created now; `None` takes
     /// [`HeaderSpec::default`].
     ///
-    /// `verify_on_read` is passed straight to [`CasFS::new`].
+    /// `verify_on_read` is passed straight to [`CasFS::new`], and
+    /// `stripe_count` straight to [`SharedBlockStore::new`] (`None` takes the
+    /// built-in default; `config::DEFAULT_STRIPE_COUNT` names it).
     ///
     /// # One process, one store
     ///
@@ -174,6 +176,7 @@ impl CasFS {
         durability: Option<Durability>,
         spec: Option<HeaderSpec>,
         verify_on_read: bool,
+        stripe_count: Option<usize>,
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
@@ -182,7 +185,7 @@ impl CasFS {
             inlined_metadata_size,
             durability,
             spec,
-            None,
+            stripe_count,
         )?);
         Self::new(
             meta_path,
@@ -591,6 +594,7 @@ mod tests {
             Some(Durability::Buffer),
             Some(HeaderSpec::from(hasher)),
             verify_on_read,
+            None,
         )
         .unwrap();
         assert_eq!(fs.hasher(), hasher, "store must open with the asked hasher");
@@ -766,6 +770,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored_block.rc(), 2);
+    }
+
+    /// The configured stripe count reaches the stripes.
+    ///
+    /// Pins the plumbing the config knob added: `stripe_count` travels from
+    /// `single_namespace` into `SharedBlockStore::new` and on into `Stripes`.
+    /// Observed through behaviour rather than a length accessor -- with one
+    /// stripe every block must resolve to the same lock, and with many, two
+    /// ids two apart must not. A knob that was accepted and dropped on the
+    /// floor would pass every config test and fail this one.
+    #[test]
+    fn the_configured_stripe_count_reaches_the_stripes() {
+        let one = tempdir().unwrap();
+        let fs = CasFS::single_namespace(
+            one.path().to_path_buf(),
+            one.path().to_path_buf(),
+            METRICS.clone(),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            None,
+            false,
+            Some(1),
+        )
+        .unwrap();
+
+        let id = |b0: u8, b1: u8| {
+            let mut bytes = [0u8; crate::metastore::BLOCKID_SIZE];
+            bytes[0] = b0;
+            bytes[1] = b1;
+            crate::metastore::BlockId::from(bytes)
+        };
+
+        // One stripe: everything collides, by construction.
+        assert!(Arc::ptr_eq(
+            &fs.shared.stripes().for_hash(&id(0x00, 0x01)),
+            &fs.shared.stripes().for_hash(&id(0xff, 0xfe))
+        ));
+        drop(fs);
+
+        // The default is not 1, so the same two ids must now part ways --
+        // otherwise the assertion above would hold for any count and prove
+        // nothing.
+        let many = tempdir().unwrap();
+        let fs = CasFS::single_namespace(
+            many.path().to_path_buf(),
+            many.path().to_path_buf(),
+            METRICS.clone(),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            &fs.shared.stripes().for_hash(&id(0x00, 0x01)),
+            &fs.shared.stripes().for_hash(&id(0xff, 0xfe))
+        ));
     }
 
     /// ADR 0006: two namespaces over one `SharedBlockStore` resolve one

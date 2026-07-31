@@ -87,6 +87,12 @@ pub struct ServerConfig {
         help = "Days before an unfinished multipart upload is aborted by the GC; 0 disables it (default 7)"
     )]
     multipart_stale_ttl_days: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Per-block lock stripes; size to ~16x peak concurrent block writers (default 1024)"
+    )]
+    stripe_count: Option<usize>,
 }
 
 /// A [`ServerConfig`] merged with the config file and the built-in defaults:
@@ -124,6 +130,7 @@ fn resolve_server(flags: ServerConfig, config: &QssStorageConfig) -> Result<Reso
         flags.metadata_db,
         flags.durability,
         flags.inline_metadata_size,
+        flags.stripe_count,
         &config.store,
     )?;
 
@@ -235,7 +242,7 @@ fn main() -> Result<()> {
             metadata_db,
         } => {
             let file = load_config(config.as_deref())?;
-            let store = StoreOptions::resolve(metadata_db, None, None, &file.store)?;
+            let store = StoreOptions::resolve(metadata_db, None, None, None, &file.store)?;
             match command {
                 InspectCommand::NumKeys { bucket_name } => {
                     let num_keys = num_keys(meta_root, &store, &bucket_name)?;
@@ -262,12 +269,12 @@ fn main() -> Result<()> {
         }
         Command::Retrieve(args) => {
             let file = load_config(args.config.as_deref())?;
-            let store = StoreOptions::resolve(args.metadata_db, None, None, &file.store)?;
+            let store = StoreOptions::resolve(args.metadata_db, None, None, None, &file.store)?;
             retrieve(args, store)?
         }
         Command::Check(args) => {
             let file = load_config(args.config.as_deref())?;
-            let store = StoreOptions::resolve(args.metadata_db, None, None, &file.store)?;
+            let store = StoreOptions::resolve(args.metadata_db, None, None, None, &file.store)?;
             check_integrity(args, store)?
         }
         Command::Server(flags) => {
@@ -362,6 +369,7 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
         Some(args.store.durability),
         Some(args.store.header_spec()),
         args.store.verify_on_read,
+        args.store.stripe_count,
     )?;
 
     // store.hash applies at creation only: an existing store is addressed by

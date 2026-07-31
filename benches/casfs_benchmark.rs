@@ -40,6 +40,7 @@ fn setup_casfs_with(hasher: Hasher) -> (CasFS, TempDir) {
         durability,
         Some(hasher.into()),
         false, // verify_on_read: benchmarks measure the normal read path
+        None,  // stripe_count: the default 1024, which the sizing note assumes
     )
     .unwrap();
 

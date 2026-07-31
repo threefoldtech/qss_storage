@@ -250,6 +250,7 @@ mod tests {
             inline_metadata_size: Some(1024),
             verify_on_read: false,
             hasher: Hasher::Blake3W32,
+            stripe_count: None,
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
             Some(opts.durability),
             Some(opts.header_spec()),
             false,
+            opts.stripe_count,
         )
         .unwrap();
         casfs.create_bucket(bucket).unwrap();
@@ -351,6 +353,7 @@ mod tests {
             Some(opts.durability),
             Some(opts.header_spec()),
             false,
+            opts.stripe_count,
         )
         .unwrap();
         drop(casfs);

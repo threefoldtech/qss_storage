@@ -73,6 +73,16 @@ pub const DEFAULT_METADATA_DB: StorageEngine = StorageEngine::Fjall;
 /// plus a re-hash per block.
 pub const DEFAULT_VERIFY_ON_READ: bool = false;
 
+/// Per-block lock stripes a store gets when nothing configures a count.
+///
+/// Re-exported from `cas::stripes` rather than restated, so this and the
+/// number the store actually uses are one value.
+pub const DEFAULT_STRIPE_COUNT: usize = crate::cas::stripes::DEFAULT_STRIPE_COUNT;
+
+/// Largest configurable stripe count. Above this the store would allocate
+/// stripes its two-byte index can never reach; see `cas::stripes`.
+pub const MAX_STRIPE_COUNT: usize = crate::cas::stripes::MAX_STRIPE_COUNT;
+
 /// Address the S3 server binds by default.
 pub const DEFAULT_S3_HOST: &str = "localhost";
 
@@ -153,6 +163,40 @@ pub struct StoreConfig {
     /// Re-hash whole blocks on read and refuse a block whose bytes no longer
     /// match its address.
     pub verify_on_read: Option<bool>,
+    /// Number of per-block lock stripes the store's block records are
+    /// serialized on (ADR 0006). Absent means [`DEFAULT_STRIPE_COUNT`].
+    ///
+    /// Sizing: with K concurrent block writers and N stripes, the chance a
+    /// writer is spuriously serialized behind an unrelated block is about
+    /// `(K-1)/N`, so N wants to be roughly 16x the peak concurrent block
+    /// writers. Purely a concurrency knob -- nothing about it is written to
+    /// disk, so two processes may open the same store with different counts
+    /// (each still serializes its own writers correctly).
+    pub stripe_count: Option<usize>,
+}
+
+/// Refuses a stripe count the store cannot honour as written.
+///
+/// Applied to the config-file value at parse time and to the merged
+/// CLI-over-file value at resolve time, because both can be wrong and the
+/// merge is where the value that will actually be used first exists.
+///
+/// Zero is refused rather than clamped: `Stripes::new` would turn it into a
+/// single lock, which serializes every block writer in the process against
+/// every other -- a silent collapse of the parallelism the whole striping
+/// scheme exists for. Anything above [`MAX_STRIPE_COUNT`] is refused for the
+/// mirror-image reason: the stripe index comes from two bytes of the block
+/// hash, so the extra stripes are allocated and never taken, and an operator
+/// who asked for 100000 would get 65536 without being told.
+///
+/// # Errors
+///
+/// [`ConfigError::UnsupportedStripeCount`] naming the offending value.
+pub fn validate_stripe_count(count: usize) -> Result<(), ConfigError> {
+    if count == 0 || count > MAX_STRIPE_COUNT {
+        return Err(ConfigError::UnsupportedStripeCount(count));
+    }
+    Ok(())
 }
 
 /// The `[store.hash]` table: which hash addresses this store's blocks.
@@ -307,20 +351,24 @@ pub fn load_file(path: &Path) -> Result<QssStorageConfig, ConfigError> {
 
 /// Parses config text. `path` is used only for error messages.
 ///
-/// Validates `store.hash` eagerly so a bad algorithm or width is reported at
-/// startup, next to the file that holds it, rather than at the first store
-/// creation.
+/// Validates `store.hash` and `store.stripe_count` eagerly so a bad algorithm,
+/// width or stripe count is reported at startup, next to the file that holds
+/// it, rather than at the first store creation.
 ///
 /// # Errors
 ///
-/// [`ConfigError::Parse`], [`ConfigError::UnknownHashAlgo`] or
-/// [`ConfigError::UnsupportedHashWidth`].
+/// [`ConfigError::Parse`], [`ConfigError::UnknownHashAlgo`],
+/// [`ConfigError::UnsupportedHashWidth`] or
+/// [`ConfigError::UnsupportedStripeCount`].
 pub fn parse(text: &str, path: &Path) -> Result<QssStorageConfig, ConfigError> {
     let config: QssStorageConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
         source: Box::new(source),
     })?;
     config.store.hash.hasher()?;
+    if let Some(count) = config.store.stripe_count {
+        validate_stripe_count(count)?;
+    }
     Ok(config)
 }
 
@@ -348,6 +396,8 @@ pub enum ConfigError {
     UnknownHashAlgo(String),
     /// `store.hash.width` is not a width the algorithm supports.
     UnsupportedHashWidth(u8),
+    /// `store.stripe_count` (or `--stripe-count`) is outside the usable range.
+    UnsupportedStripeCount(usize),
 }
 
 impl Display for ConfigError {
@@ -372,6 +422,13 @@ impl Display for ConfigError {
                 "unsupported block hash width {width} in store.hash.width \
                  (expected 16 or 32)"
             ),
+            ConfigError::UnsupportedStripeCount(count) => write!(
+                f,
+                "unsupported stripe count {count} in store.stripe_count \
+                 (expected 1 to {MAX_STRIPE_COUNT}: 0 would serialize every \
+                  block writer on one lock, and the stripe index is two bytes \
+                  wide so anything larger is never reached)"
+            ),
         }
     }
 }
@@ -394,6 +451,7 @@ durability = "fdatasync"
 inline_metadata_size = 4096
 metadata_db = "fjall"
 verify_on_read = true
+stripe_count = 4096
 
 [store.hash]
 algo = "blake3"
@@ -431,6 +489,7 @@ admin_password = "hunter2"
         assert_eq!(config.store.inline_metadata_size, Some(4096));
         assert_eq!(config.store.metadata_db, Some(StorageEngine::Fjall));
         assert_eq!(config.store.verify_on_read, Some(true));
+        assert_eq!(config.store.stripe_count, Some(4096));
         assert_eq!(config.store.hash.algo.as_deref(), Some("blake3"));
         assert_eq!(config.store.hash.width, Some(16));
         assert_eq!(config.store.hash.hasher().unwrap(), Hasher::Blake3W16);
@@ -467,6 +526,7 @@ admin_password = "hunter2"
         assert_eq!(config.store.durability, Some(DEFAULT_DURABILITY));
         assert_eq!(config.store.metadata_db, Some(DEFAULT_METADATA_DB));
         assert_eq!(config.store.verify_on_read, Some(DEFAULT_VERIFY_ON_READ));
+        assert_eq!(config.store.stripe_count, Some(DEFAULT_STRIPE_COUNT));
         assert_eq!(config.store.hash.algo.as_deref(), Some(DEFAULT_HASH_ALGO));
         assert_eq!(config.store.hash.width, Some(DEFAULT_HASH_WIDTH));
 
@@ -515,6 +575,7 @@ admin_password = "hunter2"
         assert_eq!(config.store.durability, None);
         assert_eq!(config.store.metadata_db, None);
         assert_eq!(config.store.inline_metadata_size, None);
+        assert_eq!(config.store.stripe_count, None);
         assert_eq!(config.store.hash.width, None);
         assert_eq!(config.resp.as_ref().unwrap().host, None);
         assert_eq!(config.resp.as_ref().unwrap().data_dir, None);
@@ -599,6 +660,48 @@ admin_password = "hunter2"
             msg.contains("durability") && msg.contains("buffer"),
             "message must name the migration path: {msg}"
         );
+    }
+
+    /// The two ends of the usable range are refused at parse, next to the file
+    /// that holds them. Both failures are silent otherwise: zero collapses to
+    /// one global lock and anything larger than the two-byte index is
+    /// allocated and never taken, so an operator gets neither what they asked
+    /// for nor a complaint.
+    #[test]
+    fn a_stripe_count_outside_the_usable_range_is_an_error() {
+        let err = parse_str("[store]\nstripe_count = 0\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('0'), "message must name the value: {msg}");
+        assert!(
+            msg.contains(&MAX_STRIPE_COUNT.to_string()),
+            "message must name the ceiling: {msg}"
+        );
+
+        let too_many = MAX_STRIPE_COUNT + 1;
+        let err = parse_str(&format!("[store]\nstripe_count = {too_many}\n")).unwrap_err();
+        assert!(
+            err.to_string().contains(&too_many.to_string()),
+            "message must name the value: {err}"
+        );
+
+        // The boundaries themselves are legal.
+        for count in [1, DEFAULT_STRIPE_COUNT, MAX_STRIPE_COUNT] {
+            let config = parse_str(&format!("[store]\nstripe_count = {count}\n"))
+                .unwrap_or_else(|e| panic!("{count} must be accepted: {e}"));
+            assert_eq!(config.store.stripe_count, Some(count));
+        }
+    }
+
+    /// The configured default and the one the store actually uses are one
+    /// value, not two that happen to match today.
+    #[test]
+    fn the_default_stripe_count_is_the_stores_own() {
+        assert_eq!(
+            DEFAULT_STRIPE_COUNT,
+            crate::cas::stripes::DEFAULT_STRIPE_COUNT
+        );
+        validate_stripe_count(DEFAULT_STRIPE_COUNT)
+            .expect("the built-in default must itself be a legal value");
     }
 
     #[test]

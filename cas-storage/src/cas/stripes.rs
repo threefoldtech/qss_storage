@@ -19,7 +19,21 @@ use std::sync::Arc;
 use crate::metastore::BlockId;
 
 /// Default stripe count. See the module doc for the sizing rule.
+///
+/// `config::DEFAULT_STRIPE_COUNT` re-exports this rather than repeating the
+/// number, so the configured default and the built-in one cannot drift.
 pub(crate) const DEFAULT_STRIPE_COUNT: usize = 1024;
+
+/// Largest stripe count [`Stripes::for_hash`] can address.
+///
+/// The index is the id's first two bytes, so there are exactly 65536 distinct
+/// indices however long the vector is: stripes past this are allocated and
+/// never taken. There is no power-of-two requirement and no rounding -- any
+/// count in `1..=MAX_STRIPE_COUNT` is used in full, because the index is
+/// reduced modulo the count. A count of 0 would panic on the modulo, which is
+/// why [`Stripes::new`] clamps it; the config layer refuses it outright rather
+/// than quietly hand back a single global lock.
+pub(crate) const MAX_STRIPE_COUNT: usize = 1 << 16;
 
 /// A fixed set of async mutexes, indexed by block hash.
 ///

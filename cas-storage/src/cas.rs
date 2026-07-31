@@ -16,7 +16,7 @@ mod delete_path;
 pub mod fs;
 mod placement;
 mod read_path;
-mod stripes;
+pub(crate) mod stripes;
 mod uploads;
 mod write_path;
 
