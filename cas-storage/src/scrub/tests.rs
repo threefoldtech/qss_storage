@@ -63,7 +63,11 @@ pub(super) async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) -> B
 
 /// Writes an object record naming exactly `blocks`, without writing any of
 /// them: the counting rule is about the record, not the bytes.
-pub(super) fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<BlockId>) {
+///
+/// Every caller plants on a free key, so the write displaces nothing and
+/// releases nothing (ADR 0008) -- planting over a live record would drop
+/// that record's references, which is not what a fixture is for.
+pub(super) async fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<BlockId>) {
     fs.create_object_meta(
         bucket,
         key,
@@ -71,6 +75,7 @@ pub(super) fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<Bloc
         ContentHash::from([7u8; 16]),
         ObjectData::SinglePart { blocks },
     )
+    .await
     .unwrap();
 }
 
@@ -119,10 +124,11 @@ async fn expected_counts_count_every_occurrence() {
     // A record that names the same block twice, plus a distinct one.
     let twice = synthetic_id(0x41);
     let once = synthetic_id(0x42);
-    plant_object(&fs, "photos", "doubled", vec![twice, twice, once]);
+    plant_object(&fs, "photos", "doubled", vec![twice, twice, once]).await;
 
     // An inline object holds bytes, not references: it must count nothing.
     fs.store_inlined_object("photos", "small", b"inline".to_vec())
+        .await
         .unwrap();
 
     let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
@@ -223,7 +229,7 @@ async fn holders_of_names_every_holder_once() {
 
     let data = b"shared bytes".repeat(16).to_vec();
     let id = put(&fs, "photos", "live", data).await;
-    plant_object(&fs, "photos", "doubled", vec![id, id]);
+    plant_object(&fs, "photos", "doubled", vec![id, id]).await;
     fs.insert_multipart_part(
         "photos".to_string(),
         "upload-target".to_string(),

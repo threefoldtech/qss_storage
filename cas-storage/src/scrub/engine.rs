@@ -208,11 +208,11 @@ mod tests {
         // CRITICAL: an unrecoverable dangling record with a live holder.
         let gone = synthetic_id(0x05);
         plant_dangling_record(&shared, gone, 1);
-        plant_object(&fs, "photos", "damaged", vec![gone]);
+        plant_object(&fs, "photos", "damaged", vec![gone]).await;
 
         // CRITICAL: a holder pointing at a block with no record.
         let no_record = synthetic_id(0x06);
-        plant_object(&fs, "photos", "points-nowhere", vec![no_record]);
+        plant_object(&fs, "photos", "points-nowhere", vec![no_record]).await;
 
         // WARN: a foreign file.
         std::fs::write(fs.fs_root().join("README"), b"not a block").unwrap();
@@ -419,7 +419,7 @@ mod tests {
         fs.create_bucket("b").unwrap();
         let gone = synthetic_id(0x21);
         plant_dangling_record(&shared, gone, 1);
-        plant_object(&fs, "b", "damaged", vec![gone]);
+        plant_object(&fs, "b", "damaged", vec![gone]).await;
         std::fs::write(fs.fs_root().join("README"), b"foreign").unwrap();
 
         let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared)

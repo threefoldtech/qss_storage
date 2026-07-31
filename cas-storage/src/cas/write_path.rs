@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use super::buffered_byte_stream::BufferedByteStream;
 use super::byte_stream::AsyncByteStream;
+use super::delete_path::release_blocks;
 use super::fs::CasFS;
 use super::shared_block_store::SharedBlockStore;
-use crate::metastore::{BlockId, ContentHash, MetaError, Object, ObjectData};
+use crate::metastore::{BlockId, ContentHash, MetaError, MetaStore, Object, ObjectData};
 use crate::metrics::SharedMetrics;
 use futures::{
     channel::mpsc::unbounded,
@@ -279,11 +280,111 @@ pub(super) async fn store_single_object_and_meta(
             content_hash,
             ObjectData::SinglePart { blocks },
         )
+        .await
         .unwrap();
     Ok(obj)
 }
 
-pub(super) fn store_inlined_object(
+/// The replace transaction, on its own and synchronous.
+///
+/// Separate from [`create_object_meta`] on purpose: no `Transaction` may be
+/// live across an await (ADR 0006 hard rule 3, the `Send`-soundness rule on
+/// `FjallTransaction`), and no task may hold the fjall guard while it
+/// acquires a stripe (hard rule 6, fjall is the leaf lock). Keeping the
+/// whole transaction inside a non-async function makes both true by
+/// construction rather than by inspection of an async frame.
+fn replace_object_record(
+    namespace: &MetaStore,
+    bucket_name: &str,
+    key: &str,
+    raw_obj: Vec<u8>,
+) -> Result<Option<Object>, MetaError> {
+    let mut tx = namespace.begin_transaction();
+    match tx.replace_object(bucket_name, key, raw_obj) {
+        Ok(displaced) => {
+            tx.commit()?;
+            Ok(displaced)
+        }
+        Err(e) => {
+            tx.rollback();
+            Err(e)
+        }
+    }
+}
+
+/// Write an object record, releasing whatever object it replaced (ADR
+/// 0008).
+///
+/// Every write of an object record goes through here: the PUT path, the
+/// inline path, and `CompleteMultipartUpload`. If the key was occupied, the
+/// displaced record's block references are dropped -- one per occurrence,
+/// through the same [`release_blocks`] primitive `delete_object` and
+/// multipart abort use, because an overwrite ends an object's life exactly
+/// as a DELETE does.
+///
+/// # New record first, release second
+///
+/// The replace commits before a single reference is dropped. A crash in
+/// between leaves the displaced blocks over-counted: leakage, INFO, and the
+/// next recount collects it (ADR 0005). The reverse order would drop
+/// references while the OLD record is still the visible one, so a reader
+/// resolving that record races an unlink against nothing -- loss. Same
+/// argument, same direction, as ADR 0003's abort loop.
+///
+/// # The reader race is the delete race, unchanged
+///
+/// A reader that resolved its block list from the record this call
+/// displaces can have a block unlinked mid-read. That is EXACTLY the
+/// delete-versus-reader race, which exists already and is already accepted:
+/// POSIX fd semantics keep an already-open stream alive through the unlink,
+/// and an open-after-unlink fails loudly rather than serving wrong bytes.
+/// The overwrite opens no new window -- it reaches the same release, by the
+/// same primitive, one commit later.
+///
+/// # Dedup arithmetic
+///
+/// When old and new share a block, the new write already bumped it (every
+/// dedup hit bumps, ADR 0006) and this release drops the old occurrence:
+/// net unchanged. Per dropped block -1, per added block +1. Exactly the
+/// truth, with no special case for the shared ones.
+pub(super) async fn create_object_meta(
+    fs: &CasFS,
+    bucket_name: &str,
+    key: &str,
+    size: u64,
+    hash: ContentHash,
+    object_data: ObjectData,
+) -> Result<Object, MetaError> {
+    let obj_meta = Object::new(size, hash, object_data);
+    let displaced = replace_object_record(&fs.namespace, bucket_name, key, obj_meta.to_vec())?;
+
+    // Committed. Only now may the replaced object's references go.
+    if let Some(old) = displaced {
+        let blocks = old.blocks();
+        if !blocks.is_empty() {
+            tracing::debug!(
+                bucket = %bucket_name,
+                key = %key,
+                blocks = blocks.len(),
+                "Overwrite: releasing the replaced object's blocks"
+            );
+            release_blocks(&fs.shared, &fs.metrics, blocks).await;
+        }
+    }
+
+    Ok(obj_meta)
+}
+
+/// The inline write: the object's bytes live in its own record, so it holds
+/// no block references at all.
+///
+/// It still goes through [`create_object_meta`], and that matters most in
+/// the case that looks like it should not need it -- an inline write
+/// REPLACING a block-backed object. The new record names no blocks, so
+/// without the release the replaced object's occurrences would have no
+/// holder and no collector short of fsck. Inline over inline releases
+/// nothing, because there was nothing to release.
+pub(super) async fn store_inlined_object(
     fs: &CasFS,
     bucket_name: &str,
     key: &str,
@@ -291,11 +392,13 @@ pub(super) fn store_inlined_object(
 ) -> Result<Object, MetaError> {
     let content_hash = ContentHash(Md5::digest(&data).into());
     let size = data.len() as u64;
-    fs.create_object_meta(
+    create_object_meta(
+        fs,
         bucket_name,
         key,
         size,
         content_hash,
         ObjectData::Inline { data },
     )
+    .await
 }

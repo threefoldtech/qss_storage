@@ -603,6 +603,7 @@ mod tests {
                 parts: parts.len(),
             },
         )
+        .await
         .unwrap();
 
         // At this instant: no upload record, and no part record for anything

@@ -90,7 +90,7 @@ fn bench_store_methods(c: &mut Criterion) {
             b.iter(|| {
                 let data = create_random_data(size);
                 let key = format!("inline-key-{}", rand::rng().random::<u32>());
-                black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
+                black_box(rt.block_on(fs.store_inlined_object(bucket_name, &key, data))).unwrap()
             })
         });
 
@@ -119,6 +119,11 @@ fn bench_store_methods(c: &mut Criterion) {
 }
 
 fn bench_inlined_object_sizes(c: &mut Criterion) {
+    // The write path is async since ADR 0008: an overwrite releases the
+    // replaced object's blocks, which takes stripes. These keys are random,
+    // so what is measured here is still the fresh-write cost.
+    let rt = Runtime::new().unwrap();
+
     let mut group = c.benchmark_group("store_inlined_object_sizes");
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(50);
@@ -140,7 +145,7 @@ fn bench_inlined_object_sizes(c: &mut Criterion) {
             b.iter(|| {
                 let data = create_random_data(size);
                 let key = format!("key-{}", rand::rng().random::<u32>());
-                black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
+                black_box(rt.block_on(fs.store_inlined_object(bucket_name, &key, data))).unwrap()
             })
         });
     }
@@ -167,7 +172,7 @@ fn bench_store_methods_overhead(c: &mut Criterion) {
         b.iter(|| {
             let data = create_random_data(size);
             let key = format!("inline-key-{}", rand::rng().random::<u32>());
-            black_box(fs.store_inlined_object(bucket_name, &key, data)).unwrap()
+            black_box(rt.block_on(fs.store_inlined_object(bucket_name, &key, data))).unwrap()
         })
     });
 

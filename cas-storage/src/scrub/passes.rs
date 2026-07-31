@@ -635,12 +635,12 @@ mod tests {
 
         // A holder referencing a block that has no record at all.
         let vanished = synthetic_id(0x92);
-        plant_object(&fs, "b", "points-nowhere", vec![vanished]);
+        plant_object(&fs, "b", "points-nowhere", vec![vanished]).await;
 
         // An under-count: three holders, a record that says one.
         let under = synthetic_id(0x93);
         plant_dangling_record(&shared, under, 1);
-        plant_object(&fs, "b", "u1", vec![under, under, under]);
+        plant_object(&fs, "b", "u1", vec![under, under, under]).await;
 
         let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
         let records = walk_records(&ctx).unwrap();
@@ -734,7 +734,7 @@ mod tests {
         // Record says depth 1 and nothing is anywhere.
         let gone = synthetic_id(0xb2);
         plant_dangling_record(&shared, gone, 1);
-        plant_object(&fs, "b", "damaged", vec![gone]);
+        plant_object(&fs, "b", "damaged", vec![gone]).await;
 
         let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
         let records = walk_records(&ctx).unwrap();

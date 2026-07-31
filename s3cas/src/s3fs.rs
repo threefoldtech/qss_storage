@@ -308,16 +308,24 @@ impl S3 for S3FS {
             .flat_map(|mp| mp.blocks().iter().copied())
             .collect();
 
-        let object_meta = try_!(self.casfs.create_object_meta(
-            &bucket,
-            &key,
-            size,
-            content_hash,
-            ObjectData::MultiPart {
-                blocks,
-                parts: parts.len()
-            },
-        ));
+        // The overwrite case is a complete onto an existing key: the record it
+        // displaces is a different object, and its references are released
+        // after this commit (ADR 0008). The blocks THIS object inherits came
+        // out of the claim above and are untouched by that release.
+        let object_meta = try_!(
+            self.casfs
+                .create_object_meta(
+                    &bucket,
+                    &key,
+                    size,
+                    content_hash,
+                    ObjectData::MultiPart {
+                        blocks,
+                        parts: parts.len()
+                    },
+                )
+                .await
+        );
 
         // No cleanup loop: the claim above already removed every part record
         // it returned, in the same transaction that removed the upload record.
@@ -974,7 +982,7 @@ impl S3 for S3FS {
                 {
                     return Err(bad_digest());
                 }
-                let obj_meta = try_!(self.casfs.store_inlined_object(&bucket, &key, data));
+                let obj_meta = try_!(self.casfs.store_inlined_object(&bucket, &key, data).await);
 
                 let output = PutObjectOutput {
                     e_tag: Some(ETag::Strong(obj_meta.format_e_tag())),

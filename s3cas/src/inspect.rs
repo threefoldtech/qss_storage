@@ -257,6 +257,11 @@ mod tests {
     /// Writes `keys` inlined objects into one bucket the way the server does,
     /// then drops the `CasFS` -- fjall holds a directory lock, so the store
     /// has to be closed before a tool can open it.
+    ///
+    /// The writes go through a runtime because the write path is async: it
+    /// may have to release the blocks of an object it replaces (ADR 0008),
+    /// which takes stripes. These keys are all fresh, so nothing is released
+    /// here.
     fn store_with_keys(bucket: &str, keys: usize) -> TempDir {
         let dir = TempDir::new().unwrap();
         let opts = options();
@@ -273,10 +278,17 @@ mod tests {
         )
         .unwrap();
         casfs.create_bucket(bucket).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         for i in 0..keys {
-            casfs
-                .store_inlined_object(bucket, &format!("key-{i}"), b"payload".to_vec())
-                .unwrap();
+            rt.block_on(casfs.store_inlined_object(
+                bucket,
+                &format!("key-{i}"),
+                b"payload".to_vec(),
+            ))
+            .unwrap();
         }
         drop(casfs);
         dir

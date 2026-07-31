@@ -263,8 +263,17 @@ impl CasFS {
         super::buckets::bucket_exists(self, bucket_name)
     }
 
-    // create a meta object and insert it into the database
-    pub fn create_object_meta(
+    /// Write an object record under `key`, releasing the blocks of whatever
+    /// object it replaced (ADR 0008).
+    ///
+    /// The single entry point for every object-record write: PUT, the inline
+    /// path, and `CompleteMultipartUpload`. An overwrite ends the replaced
+    /// object's life exactly as a DELETE does, and pays the same cost -- one
+    /// striped decrement per displaced occurrence. See
+    /// [`write_path::create_object_meta`](super::write_path::create_object_meta)
+    /// for the ordering rule (new record commits first) and why the reader
+    /// race it inherits is the delete race and not a new one.
+    pub async fn create_object_meta(
         &self,
         bucket_name: &str,
         key: &str,
@@ -272,10 +281,7 @@ impl CasFS {
         hash: ContentHash,
         object_data: ObjectData,
     ) -> Result<Object, MetaError> {
-        let obj_meta = Object::new(size, hash, object_data);
-        self.namespace
-            .insert_meta(bucket_name, key, obj_meta.to_vec())?;
-        Ok(obj_meta)
+        super::write_path::create_object_meta(self, bucket_name, key, size, hash, object_data).await
     }
 
     // get meta object from the DB
@@ -536,14 +542,19 @@ impl CasFS {
         super::write_path::store_object(self, bucket_name, key, data).await
     }
 
-    // Store an object inlined in the metadata.
-    pub fn store_inlined_object(
+    /// Store an object inlined in its own metadata record.
+    ///
+    /// Inline objects hold no block references, but the write still releases
+    /// what it replaced: an inline write over a BLOCK-BACKED object is the
+    /// case where the new record names nothing, so the release is the only
+    /// thing between the overwrite and a permanent leak (ADR 0008).
+    pub async fn store_inlined_object(
         &self,
         bucket_name: &str,
         key: &str,
         data: Vec<u8>,
     ) -> Result<Object, MetaError> {
-        super::write_path::store_inlined_object(self, bucket_name, key, data)
+        super::write_path::store_inlined_object(self, bucket_name, key, data).await
     }
 }
 
@@ -987,11 +998,11 @@ mod tests {
     async fn test_store_inlined_object() {
         for (engine, hasher) in matrix() {
             let (fs, _dir) = setup_test_fs(engine, hasher);
-            do_test_store_inlined_object(fs);
+            do_test_store_inlined_object(fs).await;
         }
     }
 
-    fn do_test_store_inlined_object(fs: CasFS) {
+    async fn do_test_store_inlined_object(fs: CasFS) {
         let bucket_name = "test_bucket";
         let key = "test_key1";
         fs.create_bucket(bucket_name).unwrap();
@@ -999,6 +1010,7 @@ mod tests {
         let small_data = b"small test data".to_vec();
         let obj_meta = fs
             .store_inlined_object(bucket_name, key, small_data.clone())
+            .await
             .unwrap();
 
         // Verify inlined data
@@ -1044,11 +1056,12 @@ mod tests {
         }
 
         {
-            // Re-PUT with the SAME key: since ADR 0006 every dedup hit
-            // bumps the rc -- the key_has_block skip is gone. The old
-            // object record is overwritten without a decrement, so the
-            // count is deliberately one high: leak class, reconciled by
-            // fsck (ADR 0005); the skip's under-count was loss class.
+            // Re-PUT with the SAME key. Two rules meet here and cancel:
+            // every dedup hit bumps (ADR 0006, the key_has_block skip is
+            // gone), and the overwrite releases the record it displaced
+            // (ADR 0008). Bump to 2, release back to 1 -- one object, one
+            // reference, exactly the truth. Before 0008 this settled at 2
+            // and waited for fsck.
             let stream =
                 AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_2.clone())) },
@@ -1065,10 +1078,15 @@ mod tests {
                 .get_block(new_obj.blocks()[0].as_slice())
                 .unwrap()
                 .unwrap();
-            assert_eq!(stored_block.rc(), 2, "every dedup hit bumps");
+            assert_eq!(
+                stored_block.rc(),
+                1,
+                "bump for the new object, release for the replaced one"
+            );
         }
         {
-            // A new key referencing the same content bumps again.
+            // A SECOND key referencing the same content bumps and displaces
+            // nothing: two objects, two references.
             let stream =
                 AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_3.clone())) },
@@ -1085,7 +1103,7 @@ mod tests {
                 .get_block(new_obj.blocks()[0].as_slice())
                 .unwrap()
                 .unwrap();
-            assert_eq!(stored_block.rc(), 3);
+            assert_eq!(stored_block.rc(), 2, "two live objects, two references");
         }
     }
 
@@ -1233,22 +1251,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_and_delete_object_with_refcount_same_blocks_samekey() {
+    async fn test_same_key_rewrite_then_delete_frees_the_block() {
         for (engine, hasher) in matrix() {
             let (fs, _dir) = setup_test_fs(engine, hasher);
-            do_test_store_and_delete_object_with_refcount_same_blocks_samekey(fs).await;
+            do_test_same_key_rewrite_then_delete_frees_the_block(fs).await;
         }
     }
 
     // Store the same content twice under ONE key, then delete the key.
     //
-    // Since ADR 0006 the second PUT bumps the rc (the key_has_block skip is
-    // gone), and the overwrite does not decrement the replaced object's
-    // blocks -- so after one DELETE the record survives with rc == 1: a
-    // deliberate leak-class over-count for fsck (ADR 0005) to reconcile.
-    // The pre-0006 behavior (skip the bump so the delete frees the block)
-    // is exactly the under-count that lost data in the multipart trace.
-    async fn do_test_store_and_delete_object_with_refcount_same_blocks_samekey(fs: CasFS) {
+    // The full lifecycle of the rule pair: every dedup hit bumps (ADR 0006,
+    // the key_has_block skip is gone) and every overwrite releases what it
+    // displaced (ADR 0008). The re-PUT bumps to 2 and releases back to 1,
+    // so the single DELETE that follows takes the LAST reference -- record
+    // removed, file unlinked, nothing left for fsck to reconcile.
+    //
+    // Both halves are load-bearing. Without the bump the re-PUT would
+    // under-count, which is the pre-0006 behaviour that lost data in the
+    // multipart trace. Without the release the block would survive this
+    // DELETE at rc 1 with no holder: the leak ADR 0008 closed.
+    async fn do_test_same_key_rewrite_then_delete_frees_the_block(fs: CasFS) {
         let bucket = "test-bucket";
         let key1 = "test/key1";
 
@@ -1286,23 +1308,29 @@ mod tests {
         // Verify both objects share same blocks
         assert_eq!(obj1.blocks(), obj2.blocks());
         assert_eq!(obj1.hash(), obj2.hash());
-        // Every dedup hit bumps: the re-PUT over the same key raised rc
-        // to 2 even though only one object now references the block.
+        // The re-PUT bumped the rc to 2 and the overwrite released the
+        // record it displaced, taking it back to 1: one live object, one
+        // reference.
         let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
             let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            assert_eq!(block.rc(), 2, "every dedup hit bumps");
+            assert_eq!(block.rc(), 1, "bump then release nets to nothing");
         }
 
         // Delete object
         fs.delete_object(bucket, key1).await.unwrap();
 
-        // The record survives with rc == 1: the over-count leaks the block
-        // until fsck reconciles it. Loss (a freed live block) can never
-        // come out of an over-count -- that is the trade ADR 0006 made.
+        // That was the last reference: record gone, file unlinked. Nothing
+        // survives for fsck to collect.
         for id in obj1.blocks() {
-            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            assert_eq!(block.rc(), 1, "leak-class residue, never loss");
+            assert!(
+                block_tree.get_block(id.as_slice()).unwrap().is_none(),
+                "the last reference is gone, so the record must be too"
+            );
+            assert!(
+                !crate::metastore::block_disk_path(id, 1, fs.fs_root().clone()).exists(),
+                "the last release must unlink the file"
+            );
         }
     }
 

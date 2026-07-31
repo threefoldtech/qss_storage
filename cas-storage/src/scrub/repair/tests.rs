@@ -383,7 +383,7 @@ async fn an_unrecoverable_record_is_marked_degraded_not_removed() {
 
     let gone = synthetic_id(0x03);
     plant_dangling_record(&shared, gone, 1);
-    plant_object(&fs, "b", "damaged", vec![gone, gone]);
+    plant_object(&fs, "b", "damaged", vec![gone, gone]).await;
 
     let summary = report_and_repair(&fs, ScrubOptions::metadata_only()).await;
 
@@ -724,7 +724,7 @@ async fn applying_the_full_repair_twice_changes_nothing() {
     plant_orphan_file(fs.fs_root(), &synthetic_id(0x04), 1, b"nobody's bytes");
     let gone = synthetic_id(0x05);
     plant_dangling_record(&shared, gone, 1);
-    plant_object(&fs, "b", "damaged", vec![gone]);
+    plant_object(&fs, "b", "damaged", vec![gone]).await;
     let adoptable = put(&fs, "b", "moved", b"content that moved".repeat(20).to_vec()).await;
     let depth = record(&fs, adoptable).unwrap().depth();
     misplace_block_file(fs.fs_root(), &adoptable, depth, depth + 2);
@@ -768,7 +768,7 @@ async fn a_repair_that_died_halfway_is_finished_by_the_next_run() {
     plant_orphan_file(fs.fs_root(), &orphan, 1, b"nobody's bytes");
     let gone = synthetic_id(0x07);
     plant_dangling_record(&shared, gone, 1);
-    plant_object(&fs, "b", "damaged", vec![gone]);
+    plant_object(&fs, "b", "damaged", vec![gone]).await;
     std::fs::write(fs.fs_root().join("NOTES"), b"foreign").unwrap();
 
     // The strict subset the killed run got through.
