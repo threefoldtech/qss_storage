@@ -3,7 +3,8 @@
 **Status**: Proposed (revised 2026-07-30 after adversarial code review;
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
-refutation; path scheme decided 2026-07-31: deterministic)
+refutation; decided 2026-07-31: deterministic paths, key_has_block skip
+dropped)
 **Date**: 2026-07-30
 
 ---
@@ -309,7 +310,7 @@ was imprecise):
    refcount reconciliation (recount from live objects).
 All three are invisible leakage. None is client-visible loss.
 
-### key_has_block and same-key overwrite (forced decision, new)
+### key_has_block and same-key overwrite (DECIDED 2026-07-31: drop the skip)
 
 Today `store_object` suppresses the dedup bump when the destination key's
 *old* object already contains the block (`write_path.rs:123-127`,
@@ -596,6 +597,11 @@ survives for test injection only; its implementation moves to
   No migration -- no deployed store carries data; `_PATHS`, the stored
   path field, and the prefix allocator are removed wholesale and
   `disk_path` becomes a pure function of `BlockId`.
+- **key_has_block**: skip dropped, decided 2026-07-31 -- every dedup hit
+  bumps rc under the stripe. Converts the silent loss-class under-count
+  (multipart double-occurrence, stale-snapshot skip) into the existing
+  leak-class over-count that ADR 0005's recount reconciles; the
+  overwrite-decrements-replaced-blocks pairing stays follow-up work.
 - **Stripe placement on `SharedBlockStore`**: confirmed (review ask 1 of
   the previous revision), with the two new preconditions in component 1
   (no double-open via `single_namespace`; blocks root bound to the shared
@@ -654,11 +660,9 @@ overwrite-decrement follow-up first); an end-to-end concurrent-PUT
 benchmark to quantify the executor win and measure `(K-1)/N` in practice.
 
 Review asks:
-1. `key_has_block`: agree to drop the skip (loss-class under-count
-   becomes leak-class over-count, reconciled by 0005 recount)?
-2. notx: add a key-stripe for object deletes, or scope `fjall_notx` out
+1. notx: add a key-stripe for object deletes, or scope `fjall_notx` out
    of the loss-never guarantee?
-3. Land before ADR 0005? The review strengthens "before": two of today's
+2. Land before ADR 0005? The review strengthens "before": two of today's
    loss races (defects 1 and 5) are states fsck cannot even detect (an rc
    undercount looks consistent), so reconciliation cannot substitute for
    this fix.
