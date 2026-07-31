@@ -326,8 +326,11 @@ Refcount transitions, per `docs/refcount.md`:
 - new object storing a new block -> rc = 1
 - ANY reuse of an existing block -> rc + 1 (same key or different key;
   the same-key skip was removed by ADR 0006 -- its under-count was the
-  loss trace in `docs/arch/key-has-block-skip.md`, so overwrites now
-  over-count until reconciled)
+  loss trace in `docs/arch/key-has-block-skip.md`)
+- object overwritten -> rc - 1 per occurrence of the object it replaced,
+  through the same `release_blocks` loop a DELETE uses, after the new
+  record commits (ADR 0008). A same-content re-PUT therefore nets to no
+  change: bumped by the write, dropped by the release
 - object deleted -> rc - 1 per block occurrence
 - part record reaped -> rc - 1 per block occurrence: a multipart abort,
   the stale-upload GC, or fsck's `reap_orphan_part`, all through

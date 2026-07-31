@@ -148,3 +148,10 @@ known leak-class over-count, which ADR 0005's refcount recount
 reconciles. The proper long-term pairing -- overwrite decrements the
 replaced object's blocks through ADR 0006's striped delete primitive --
 is recorded as follow-up work, out of scope for ADR 0006.
+
+That follow-up landed as ADR 0008
+(`docs/adr/0008-overwrite-releases-replaced-blocks.md`): an overwrite
+releases the replaced record's occurrences through `release_blocks`,
+after the new record commits. The cost described above is paid back --
+a same-content re-PUT nets to no change -- so nothing of this trade
+survives except the fix itself.

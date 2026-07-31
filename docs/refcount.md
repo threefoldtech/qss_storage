@@ -70,7 +70,19 @@ One reference per block OCCURRENCE in an object: every dedup hit bumps
 the refcount, including a re-PUT of the same content under the same key
 (the old same-key skip produced loss-shaped under-counts in the multipart
 trace -- see `docs/arch/key-has-block-skip.md` -- and was dropped by ADR
-0006). An overwrite therefore deliberately over-counts until reconciled.
+0006).
+
+An overwrite pays that bump back. Writing an object record over an
+existing one releases the replaced record's occurrences, through the same
+striped primitive a DELETE of that object would have used (ADR 0008): the
+new record commits first, the release follows. So per block shared by the
+old object and the new one the net is zero (bumped by the write, dropped
+by the release), per block only the old one held it is -1, per block only
+the new one holds it is +1 -- exactly the truth, with no reconciliation
+pending. This covers every object-record write: PUT, the inline path, and
+`CompleteMultipartUpload`. An overwrite that crashes between the commit
+and the release leaves an over-count, which is leakage and fsck's to
+collect, in keeping with the contract above.
 
 ## Test Plan
 
@@ -80,10 +92,17 @@ trace -- see `docs/arch/key-has-block-skip.md` -- and was dropped by ADR
 - Every reuse of the block increases `refcount` by one -- same key or
   new key alike.
 - Deleting the object will reduce the `refcount` value.
+- Overwriting a key reduces it too, once per occurrence of the replaced
+  object: a same-content re-PUT therefore leaves the count where it was,
+  and N overwrites of one key leave exactly the final object's
+  occurrences.
 - When the `refcount` value reaches zero, the block record is removed and
   its file unlinked (under one stripe hold).
 - Double-DELETE of one key decrements once: the object record is taken
   atomically, so the second DELETE finds nothing to do.
+- Concurrent overwrites of one key decrement once each: the replace is
+  the same kind of atomic pair, so every writer releases exactly the
+  record it displaced and no record is released twice.
 
 **Failure cases:**
 - when writing/reusing block, failed to write the metadata or increase the `refcount`

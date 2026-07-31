@@ -17,11 +17,12 @@ the exit-code contract.
 
 ## When to run it
 
-- **Routinely**, to reclaim leaked references. The same-key overwrite leak
-  is not crash-only: `create_object_meta` blind-upserts the object record
-  and decrements nothing for the object it replaced, so every overwrite
-  leaks the replaced object's refcounts by design. Without a recount,
-  `blocks/` only ever grows.
+- **Routinely**, to reclaim leaked references -- but less urgently since ADR
+  0008. Overwriting a key used to leak the replaced object's refcounts by
+  design, which made a recount the only thing keeping `blocks/` from growing
+  without bound under an ordinary keep-latest workload. An overwrite now
+  releases what it displaced, so steady-state findings on a healthy store
+  shrink toward zero and what remains is residue, not routine.
 - **After a crash or a hard power cut**, especially at
   `durability = "buffer"`, where a record can survive while its file's
   pages do not. An unrepaired dangling record actively poisons dedup: every
