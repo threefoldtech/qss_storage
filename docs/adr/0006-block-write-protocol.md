@@ -4,7 +4,7 @@
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
 refutation; decided 2026-07-31: deterministic paths, key_has_block skip
-dropped)
+dropped, fjall_notx scoped out of loss-never)
 **Date**: 2026-07-30
 
 ---
@@ -195,7 +195,8 @@ can span them, `fs.rs:130-141` vs `shared_block_store.rs:55-74`). A crash
 between the two steps leaves rc over-counts: leakage, never loss. The
 atomic read+remove of the object record defeats double-DELETE of one key
 on the transactional backend (second tx sees the key gone); notx cannot
-provide even that -- see Consequences.
+provide even that, and is scoped out of the loss-never guarantee
+(decided 2026-07-31 -- see Consequences).
 
 The per-block decrement lives *inside* the stripe. This is the material
 change from the previous revision, which ran one big decrement tx before
@@ -515,11 +516,15 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
   ordinary-failure residue is strictly smaller than today's. It is not
   "byte-for-byte today's behavior" -- ordering, temp files, and residue
   shapes all change.
-- notx scope limit: stripes serialize its block-record ops, but
-  double-DELETE of one key cannot be made atomic there (no tx for the
-  object-record read+remove). Either add a key-stripe for deletes or
-  scope `fjall_notx` explicitly outside the loss-never guarantee.
-  Review ask 3.
+- notx scope limit (DECIDED 2026-07-31): `fjall_notx` is scoped out of
+  the loss-never guarantee rather than growing a key-stripe. The striped
+  protocol still closes its practical races (PUT-vs-PUT bump,
+  PUT-vs-DELETE decrement), but concurrent DELETEs of one key remain
+  unserializable there (no tx for the object-record read+remove), and
+  its metadata is never durable (the Durability knob is ignored). The
+  loss-never contract is guaranteed on the transactional backend only;
+  the notx startup warning (`shared_block_store.rs:62-69`) must state
+  that scope explicitly.
 - More moving parts in the write path: stripes, temp dir, two-step
   delete, dir-fsync cache.
 
@@ -602,6 +607,11 @@ survives for test injection only; its implementation moves to
   (multipart double-occurrence, stale-snapshot skip) into the existing
   leak-class over-count that ADR 0005's recount reconciles; the
   overwrite-decrements-replaced-blocks pairing stays follow-up work.
+- **notx scope**: `fjall_notx` scoped out of the loss-never guarantee,
+  decided 2026-07-31 -- no key-stripe. Stripes still fix its bump and
+  decrement races; the double-DELETE-same-key window and the absent
+  metadata durability are accepted and must be named in the startup
+  warning and docs.
 - **Stripe placement on `SharedBlockStore`**: confirmed (review ask 1 of
   the previous revision), with the two new preconditions in component 1
   (no double-open via `single_namespace`; blocks root bound to the shared
@@ -660,9 +670,7 @@ overwrite-decrement follow-up first); an end-to-end concurrent-PUT
 benchmark to quantify the executor win and measure `(K-1)/N` in practice.
 
 Review asks:
-1. notx: add a key-stripe for object deletes, or scope `fjall_notx` out
-   of the loss-never guarantee?
-2. Land before ADR 0005? The review strengthens "before": two of today's
+1. Land before ADR 0005? The review strengthens "before": two of today's
    loss races (defects 1 and 5) are states fsck cannot even detect (an rc
    undercount looks consistent), so reconciliation cannot substitute for
    this fix.
