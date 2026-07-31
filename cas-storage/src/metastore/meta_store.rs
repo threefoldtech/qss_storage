@@ -636,6 +636,36 @@ impl Transaction {
         Ok(Some(record))
     }
 
+    /// The per-part claim (ADR 0003 amendment): reads AND removes the part
+    /// record at `key` in [`MULTIPART_PARTS_TREE`] inside this transaction.
+    ///
+    /// Removing the record IS the claim on its blocks. Complete inherits a
+    /// part's references into the object it mints; abort and the GC release
+    /// them. Whoever takes the record decides which happened, and the loser
+    /// of the take is told the record was already gone -- so no two callers
+    /// can both act on one part's blocks, which is the difference between
+    /// leakage and loss.
+    ///
+    /// `_UPLOADS` and `_MULTIPART_PARTS` live in the same shared database, so
+    /// one transaction spans both: that is what lets complete take the upload
+    /// record and every part it names as a single atomic step
+    /// (`claim_upload_with_parts`).
+    ///
+    /// Raw bytes rather than a decoded record, unlike
+    /// [`take_upload`](Self::take_upload): `MultiPart` is a `cas`-layer type
+    /// and this layer names nothing from above it. The caller decodes -- and
+    /// a caller whose decode fails must roll back, because an undecodable
+    /// record names no blocks and removing it would strand them.
+    ///
+    /// `None` (and no change) if the record was absent.
+    pub fn take_part(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
+        let Some(raw) = self.backend.get(MULTIPART_PARTS_TREE, key)? else {
+            return Ok(None);
+        };
+        self.backend.remove(MULTIPART_PARTS_TREE, key)?;
+        Ok(Some(raw))
+    }
+
     /// The DELETE-side block step (ADR 0006): re-checks the record and
     /// applies one reference decrement inside this transaction.
     ///

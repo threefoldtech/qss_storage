@@ -30,6 +30,7 @@ use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 
 use crate::metrics::SharedMetrics;
+use cas_storage::cas::UploadClaim;
 use cas_storage::metastore::UploadRecord;
 use cas_storage::{BlockId, ContentHash, MultiPart, ObjectData};
 use cas_storage::{BlockStream, CasFS, parse_range_request};
@@ -219,8 +220,10 @@ impl S3 for S3FS {
 
         // Validation runs against the still-unclaimed upload, so a request
         // this rejects leaves the upload intact and the client can retry a
-        // corrected complete -- what S3 does on an InvalidPart.
-        let mut parts = vec![];
+        // corrected complete -- what S3 does on an InvalidPart. It collects
+        // the part NUMBERS; the claim below re-reads the records themselves,
+        // and those values are the authoritative ones.
+        let mut part_numbers = vec![];
         let mut cnt: i32 = 0;
         for part in multipart_upload.parts.iter().flatten() {
             // validate part number
@@ -236,8 +239,8 @@ impl S3 for S3FS {
             let result =
                 self.casfs
                     .get_multipart_part(&bucket, &key, &upload_id, part_number as i64);
-            let mp = match result {
-                Ok(Some(mp)) => mp,
+            match result {
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     error!(
                         "Missing part \"{}\" in multipart upload: part not found",
@@ -253,32 +256,51 @@ impl S3 for S3FS {
                     return Err(s3_error!(InvalidArgument, "Part not uploaded"));
                 }
             };
-            parts.push(mp);
+            part_numbers.push(part_number as i64);
         }
 
-        // The claim: an atomic read+remove of the upload record, and the only
-        // thing serializing this against a concurrent abort or a second
-        // complete. Whoever takes the record proceeds; everyone else answers
-        // NoSuchUpload -- here, an abort that won the race between the
-        // validation above and this line, which is the correct outcome.
+        // The claim: one transaction that takes the upload record AND every
+        // part record named above. It is the only thing serializing this
+        // against a concurrent abort or a second complete -- whoever takes the
+        // upload record proceeds, everyone else answers NoSuchUpload.
+        //
+        // The parts are IN the claim because this object inherits their block
+        // references instead of taking new ones. If the part records outlived
+        // the upload record even for an instant, the GC's orphan sweep could
+        // see them for what they are not -- parts no upload owns -- and
+        // release references this object now holds: loss. Both trees live in
+        // the shared DB, so one transaction closes that window rather than
+        // narrowing it (ADR 0003 amendment).
         //
         // Validating first is safe because while the upload record exists,
-        // part records are removed only by complete and abort, and both must
-        // win this claim before they touch one: no part validated above can
-        // vanish before the claim resolves. What a concurrent caller CAN do is
-        // re-upload a part between the two, in which case the object is built
-        // from the values read above and the cleanup below removes the newer
-        // record -- its blocks stay over-counted until the next recount, the
-        // leak direction (ADR 0005), never loss.
+        // part records are removed only by complete, abort and the GC, and all
+        // three must win a claim before they touch one. What a concurrent
+        // caller CAN do is re-upload a part between validation and claim, in
+        // which case the claim reads the NEWER record and the object is built
+        // from it; the replaced record's blocks stay over-counted until the
+        // next recount, the leak direction (ADR 0005), never loss.
         //
-        // The claim still happens BEFORE the object is created, so a crash in
-        // between leaves part records with no upload record to own them --
-        // orphan parts, which the GC reaps within one sweep. Bounded leakage;
-        // claiming after the object existed would instead let a second
-        // complete mint the object twice over.
-        if try_!(self.casfs.claim_upload(&bucket, &key, &upload_id)).is_none() {
-            return Err(no_such_upload());
-        }
+        // The claim happens BEFORE the object is created, so a crash in
+        // between leaves blocks whose rc counts holders that no longer exist:
+        // over-counts, which the recount collects. Bounded leakage; claiming
+        // after the object existed would instead let a second complete mint
+        // the object twice over.
+        let parts = match try_!(self.casfs.claim_upload_with_parts(
+            &bucket,
+            &key,
+            &upload_id,
+            &part_numbers
+        )) {
+            UploadClaim::Claimed { parts, .. } => parts,
+            UploadClaim::NoUpload => return Err(no_such_upload()),
+            // A part validated a moment ago is gone: nothing was claimed, the
+            // upload survives, and a corrected complete can still be sent --
+            // the same answer the validation loop gives.
+            UploadClaim::MissingPart(part_number) => {
+                error!("Part \"{part_number}\" vanished between validation and claim");
+                return Err(s3_error!(InvalidArgument, "Part not uploaded"));
+            }
+        };
 
         let (content_hash, size) = calculate_multipart_hash(&parts);
         let blocks: Vec<BlockId> = parts
@@ -297,17 +319,11 @@ impl S3 for S3FS {
             },
         ));
 
-        // Try to delete the multipart metadata. If this fails, it is not really an issue.
-        for part in multipart_upload.parts.into_iter().flatten() {
-            if let Err(e) = self.casfs.remove_multipart_part(
-                &bucket,
-                &key,
-                &upload_id,
-                part.part_number.unwrap() as i64,
-            ) {
-                error!("Could not remove part: {}", e);
-            };
-        }
+        // No cleanup loop: the claim above already removed every part record
+        // it returned, in the same transaction that removed the upload record.
+        // Parts the client did NOT name were not claimed and are now orphans
+        // -- their references were never inherited by this object, so the GC
+        // reaps them correctly (ADR 0003 amendment).
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

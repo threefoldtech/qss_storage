@@ -127,6 +127,8 @@ pub use cas::{
     // Stale-upload GC (ADR 0003): what one sweep did, and the sweep itself
     // (the s3cas daemon task's only entry point into it)
     SweepStats,
+    // The outcome of complete's atomic upload-plus-parts claim
+    UploadClaim,
     // Streaming and utilities
     block_stream::{BlockCorruption, BlockStream},
     // Multipart support

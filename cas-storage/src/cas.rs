@@ -7,6 +7,7 @@ pub use fs::CasFS;
 pub use fs::StorageEngine;
 pub use gc::{SweepStats, sweep_stale_uploads};
 pub use shared_block_store::SharedBlockStore;
+pub use uploads::UploadClaim;
 pub(crate) mod block_disk;
 mod buckets;
 mod buffered_byte_stream;

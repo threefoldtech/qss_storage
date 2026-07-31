@@ -4,6 +4,7 @@ use std::{io, path::PathBuf};
 
 use super::multipart::{MultiPart, part_key};
 use super::shared_block_store::SharedBlockStore;
+use super::uploads::UploadClaim;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
@@ -327,6 +328,24 @@ impl CasFS {
         upload_id: &str,
     ) -> Result<Option<UploadRecord>, MetaError> {
         super::uploads::claim_upload(self, bucket, key, upload_id)
+    }
+
+    /// Claim an upload together with the parts a `CompleteMultipartUpload`
+    /// names: one transaction over both trees, so a named part record never
+    /// outlives its upload record (ADR 0003 amendment).
+    ///
+    /// The returned parts are the values that transaction read, and the object
+    /// must be built from them. See
+    /// [`uploads::claim_upload_with_parts`](super::uploads::claim_upload_with_parts)
+    /// for what each outcome means and what a crash after it leaves behind.
+    pub fn claim_upload_with_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[i64],
+    ) -> Result<UploadClaim, MetaError> {
+        super::uploads::claim_upload_with_parts(self, bucket, key, upload_id, part_numbers)
     }
 
     /// Abort an upload: claim it, then remove each part record and drop the

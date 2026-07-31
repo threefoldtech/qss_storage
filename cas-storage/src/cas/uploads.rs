@@ -103,6 +103,116 @@ pub(super) fn claim_upload(
     }
 }
 
+/// What [`claim_upload_with_parts`] found.
+///
+/// Three outcomes because complete has three answers, and the middle one is
+/// not an error: losing the claim is the ordinary end of a race.
+#[derive(Debug)]
+pub enum UploadClaim {
+    /// The upload record and every named part were taken together. The caller
+    /// now owns their blocks and must account for them -- by minting the
+    /// object that inherits them, or by releasing them.
+    Claimed {
+        /// The upload record this claim removed.
+        record: UploadRecord,
+        /// The named parts, in the order they were asked for, as the claiming
+        /// transaction read them.
+        parts: Vec<MultiPart>,
+    },
+    /// No upload record: somebody else completed or aborted it, or it never
+    /// existed. `NoSuchUpload`. Nothing was removed.
+    NoUpload,
+    /// A named part record was not there. Nothing was removed -- the upload
+    /// survives and the client can retry a corrected complete.
+    MissingPart(i64),
+}
+
+/// Complete's claim: takes the upload record AND every part it names, in one
+/// transaction (ADR 0003 amendment).
+///
+/// # Why the parts are in the claim
+///
+/// `complete` does not release the parts' blocks -- it hands them to the
+/// object it mints, which inherits the references the part records held. So
+/// between "the upload record is gone" and "the part records are gone" those
+/// blocks have two claimants on paper and one in truth, and anything that
+/// reaps orphan parts in that window (the GC's phase 2, by construction)
+/// would release references the new object owns. That is loss, and no amount
+/// of narrowing the window makes it not loss.
+///
+/// `_UPLOADS` and `_MULTIPART_PARTS` live in the same shared database, so one
+/// transaction spans both and the window does not exist: a named part record
+/// disappears at the same instant as its upload record. Nothing can observe
+/// an inheritable part as an orphan.
+///
+/// # What the caller must know
+///
+/// - The parts returned are the ones the CLAIMING transaction read, not
+///   whatever an earlier validation pass saw. They are the authoritative
+///   values, and the object must be built from them.
+/// - Every failure rolls back whole: a claim that does not return
+///   [`UploadClaim::Claimed`] has removed nothing, so a rejected complete
+///   leaves the upload intact and retryable.
+/// - A crash after this commits and before the object record exists leaves
+///   blocks with rc but no holder: over-counts, which the recount collects.
+///   Leakage, never loss -- the same trade every other step here makes.
+/// - Parts the client did NOT name survive the claim. Their references were
+///   never inherited, so they are true orphans and the GC reaps them.
+///
+/// Synchronous on purpose: the transaction holds the backend's single-writer
+/// guard, which must not be held across an `.await`.
+pub(super) fn claim_upload_with_parts(
+    fs: &CasFS,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_numbers: &[i64],
+) -> Result<UploadClaim, MetaError> {
+    let mut tx = fs.shared.meta_store().begin_transaction();
+
+    // The upload record first: it is the linearization point, and taking it
+    // is what makes this caller the one that completes.
+    let record = match tx.take_upload(&upload_key(bucket, key, upload_id)) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            tx.rollback();
+            return Ok(UploadClaim::NoUpload);
+        }
+        Err(e) => {
+            tx.rollback();
+            return Err(e);
+        }
+    };
+
+    // Then every named part. S3 caps an upload at 10k parts, so this is a
+    // bounded number of point operations in one transaction -- the same reads
+    // and removes complete always did, now as one atomic step.
+    let mut parts = Vec::with_capacity(part_numbers.len());
+    for &part_number in part_numbers {
+        let raw = match tx.take_part(&part_key(bucket, key, upload_id, part_number)) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                tx.rollback();
+                return Ok(UploadClaim::MissingPart(part_number));
+            }
+            Err(e) => {
+                tx.rollback();
+                return Err(e);
+            }
+        };
+        match MultiPart::try_from(&*raw) {
+            Ok(part) => parts.push(part),
+            Err(e) => {
+                tx.rollback();
+                return Err(MetaError::from(e));
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(UploadClaim::Claimed { record, parts })
+}
+
 /// Every upload record in the store, decoded.
 ///
 /// Value-driven (hard rule 4): the scan decodes VALUES and never parses a
@@ -141,11 +251,21 @@ pub(super) fn upload_parts(
         .collect()
 }
 
-/// Drops one part record and the block references it held.
+/// Claims one part record and drops the block references it held.
+///
+/// # The removal IS the claim
+///
+/// The record is read AND removed in one transaction ([`Transaction::take_part`]),
+/// and the blocks released are the ones that transaction read. Two reapers
+/// racing over one part -- a client's abort against a GC sweep, or two sweeps
+/// -- therefore cannot both release it: exactly one take returns the record,
+/// the other is told it was already gone. Without the atomic pair, both would
+/// read the same blocks and both would decrement them, which is a
+/// double-release: loss, not leakage.
 ///
 /// # Record first, blocks second
 ///
-/// The removal happens BEFORE the release, and a failed removal releases
+/// The take COMMITS before the release begins, and a failed take releases
 /// nothing (hard rule 2, ADR 0003 decision 6). A crash -- or an error --
 /// between the two leaves a block whose rc exceeds its walked holders: an
 /// over-count, which fsck reports INFO and the next recount collects. The
@@ -154,27 +274,54 @@ pub(super) fn upload_parts(
 /// `--repair` would "fix" by raising the rc back, leaking the blocks
 /// permanently. Wrong in the recoverable direction only.
 ///
+/// The transaction is opened and committed without an `.await` in between:
+/// the backend's transaction holds a single-writer guard, and holding one
+/// across a suspension point is what `FjallTransaction`'s safety note
+/// forbids. The release, which does await, happens after the commit.
+///
 /// `storage_key` is passed in rather than rebuilt from the record, because the
 /// GC's orphan sweep reaps records whose key is not reconstructible at all --
 /// the legacy dash-joined ones (ADR 0003: the first sweep IS the migration).
 /// Rebuilding the key there would remove nothing and then release blocks the
 /// surviving record still claims: precisely the forbidden order.
 ///
-/// Returns whether the record was removed (and hence its blocks released).
-pub(super) async fn reap_part(fs: &CasFS, storage_key: &[u8], part: &MultiPart) -> bool {
-    if let Err(e) = fs.shared.multipart_tree().remove(storage_key) {
-        tracing::error!(
-            bucket = %part.bucket(),
-            key = %part.key(),
-            upload_id = %part.upload_id(),
-            part_number = part.part_number(),
-            error = %e,
-            "Could not remove part record; its blocks stay referenced"
-        );
-        return false;
-    }
+/// `Ok(Some(part))` means this caller won the take and released its blocks;
+/// `Ok(None)` that another reaper got there first and there was nothing left
+/// to do.
+pub(super) async fn reap_part(
+    fs: &CasFS,
+    storage_key: &[u8],
+) -> Result<Option<MultiPart>, MetaError> {
+    // Scoped so the transaction -- and its writer guard -- is gone before the
+    // release below awaits.
+    let part = {
+        let mut tx = fs.shared.meta_store().begin_transaction();
+        let raw = match tx.take_part(storage_key) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                tx.rollback();
+                return Ok(None);
+            }
+            Err(e) => {
+                tx.rollback();
+                return Err(e);
+            }
+        };
+        // An undecodable record names no blocks: rolling back leaves it in
+        // place rather than stranding whatever it referenced. fsck's problem.
+        let part = match MultiPart::try_from(&*raw) {
+            Ok(part) => part,
+            Err(e) => {
+                tx.rollback();
+                return Err(MetaError::from(e));
+            }
+        };
+        tx.commit()?;
+        part
+    };
+
     release_blocks(&fs.shared, &fs.metrics, part.blocks()).await;
-    true
+    Ok(Some(part))
 }
 
 /// Aborts an upload: claim it, then reap every part it holds.
@@ -235,8 +382,23 @@ pub(super) async fn abort_upload(
         // that record was written under -- `insert_multipart_part` builds it
         // the same way.
         let storage_key = part_key(bucket, key, upload_id, part.part_number());
-        if reap_part(fs, &storage_key, part).await {
-            reaped += 1;
+        match reap_part(fs, &storage_key).await {
+            Ok(Some(_)) => reaped += 1,
+            // Another reaper took this part between the scan and here (a GC
+            // sweep, since this caller holds the upload claim). It released
+            // the blocks; there is nothing left for this loop to do.
+            Ok(None) => {}
+            // One unreapable part must not strand the rest: its blocks stay
+            // referenced by a record that survives, which is the over-count
+            // direction, and the next sweep retries.
+            Err(e) => tracing::error!(
+                bucket = %bucket,
+                key = %key,
+                upload_id = %upload_id,
+                part_number = part.part_number(),
+                error = %e,
+                "Could not reap a part record; its blocks stay referenced"
+            ),
         }
     }
 
@@ -551,6 +713,182 @@ mod tests {
                 "held by the orphan part record and nothing else"
             );
             assert!(block_file_exists(&fs, id), "leakage, never loss");
+        }
+    }
+
+    /// Complete's claim takes the upload record and every NAMED part in one
+    /// step, and returns the values that transaction read. A part the client
+    /// did not name is left alone -- as an orphan, since its upload record is
+    /// gone, which is exactly what it is: nothing inherited its blocks.
+    #[tokio::test]
+    async fn claiming_with_parts_takes_the_upload_and_the_named_parts() {
+        let (fs, _dir) = test_fs();
+        fs.create_bucket(BUCKET).unwrap();
+        fs.create_upload(BUCKET, KEY, "u1").unwrap();
+
+        put_part(&fs, BUCKET, KEY, "u1", 1, part_data(0xf1)).await;
+        put_part(&fs, BUCKET, KEY, "u1", 2, part_data(0xf2)).await;
+        let unnamed = put_part(&fs, BUCKET, KEY, "u1", 3, part_data(0xf3)).await;
+
+        let claimed = fs
+            .claim_upload_with_parts(BUCKET, KEY, "u1", &[1, 2])
+            .unwrap();
+        let UploadClaim::Claimed { record, parts } = claimed else {
+            panic!("the claim must win: {claimed:?}");
+        };
+
+        assert_eq!(record.upload_id(), "u1");
+        assert_eq!(
+            parts.iter().map(|p| p.part_number()).collect::<Vec<_>>(),
+            [1, 2],
+            "the parts come back in the order they were asked for"
+        );
+
+        // The upload record and the named parts left together: there is no
+        // ordering between them to observe, which is the whole point.
+        assert!(fs.get_upload(BUCKET, KEY, "u1").unwrap().is_none());
+        let left = fs.upload_parts(BUCKET, KEY, "u1").unwrap();
+        assert_eq!(
+            left.iter().map(|p| p.part_number()).collect::<Vec<_>>(),
+            [3],
+            "only the part nobody named survives"
+        );
+        for id in &unnamed {
+            assert_eq!(
+                rc_of(&fs, id),
+                Some(1),
+                "and it still holds its own blocks, alone"
+            );
+        }
+    }
+
+    /// Claiming an upload that is gone changes nothing and says so: the
+    /// `NoSuchUpload` case, whether it was completed, aborted or never made.
+    #[tokio::test]
+    async fn claiming_with_parts_reports_a_missing_upload() {
+        let (fs, _dir) = test_fs();
+        fs.create_bucket(BUCKET).unwrap();
+
+        // A part record with no upload record: the claim must not take it.
+        let orphan = put_part(&fs, BUCKET, KEY, "never", 1, part_data(0xf4)).await;
+
+        let claimed = fs
+            .claim_upload_with_parts(BUCKET, KEY, "never", &[1])
+            .unwrap();
+        assert!(matches!(claimed, UploadClaim::NoUpload), "{claimed:?}");
+
+        assert_eq!(fs.upload_parts(BUCKET, KEY, "never").unwrap().len(), 1);
+        for id in &orphan {
+            assert_eq!(rc_of(&fs, id), Some(1));
+        }
+    }
+
+    /// A named part that is not there rolls the whole claim back: the upload
+    /// record and every other part survive, so the client can retry a
+    /// corrected complete. A half-claimed upload would be unrecoverable.
+    #[tokio::test]
+    async fn a_missing_named_part_rolls_the_whole_claim_back() {
+        let (fs, _dir) = test_fs();
+        fs.create_bucket(BUCKET).unwrap();
+        fs.create_upload(BUCKET, KEY, "u1").unwrap();
+        let held = put_part(&fs, BUCKET, KEY, "u1", 1, part_data(0xf5)).await;
+
+        let claimed = fs
+            .claim_upload_with_parts(BUCKET, KEY, "u1", &[1, 2])
+            .unwrap();
+        assert!(
+            matches!(claimed, UploadClaim::MissingPart(2)),
+            "{claimed:?}"
+        );
+
+        assert!(
+            fs.get_upload(BUCKET, KEY, "u1").unwrap().is_some(),
+            "the upload survives a rejected claim"
+        );
+        assert_eq!(
+            fs.upload_parts(BUCKET, KEY, "u1").unwrap().len(),
+            1,
+            "and so does the part that WAS there"
+        );
+        for id in &held {
+            assert_eq!(rc_of(&fs, id), Some(1));
+        }
+
+        // Retrying with what really exists then works.
+        assert!(matches!(
+            fs.claim_upload_with_parts(BUCKET, KEY, "u1", &[1]).unwrap(),
+            UploadClaim::Claimed { .. }
+        ));
+    }
+
+    /// The reap is a take: the record and its blocks leave together, so two
+    /// reapers over one part -- a client's abort against a GC sweep -- release
+    /// it exactly ONCE. A split read-then-remove lets both read the same
+    /// blocks and both decrement them, which takes a block below its real
+    /// holder count: loss, not leakage.
+    ///
+    /// The part shares its content with a live object, so the block carries
+    /// two references: one release leaves rc 1 and the file on disk, a double
+    /// release takes the record to zero and unlinks bytes the object still
+    /// needs. That is the difference this test can see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_reapers_release_one_part_exactly_once() {
+        /// Fresh content per iteration, so every round is its own race.
+        const STORM: usize = 40;
+
+        let (fs, _dir) = test_fs();
+        fs.create_bucket(BUCKET).unwrap();
+        let fs = std::sync::Arc::new(fs);
+
+        for iteration in 0..STORM {
+            let data: Vec<u8> = format!("reap race {iteration} ")
+                .repeat(256)
+                .into_bytes()
+                .into_iter()
+                .collect();
+            let upload_id = format!("u{iteration}");
+
+            // The object's reference, then the part's: rc 2 on one block.
+            let len = data.len();
+            let object_data = data.clone();
+            let stream = AsyncByteStream::new(futures::stream::once(async move {
+                Ok(bytes::Bytes::from(object_data))
+            }));
+            let object = fs
+                .store_single_object_and_meta(BUCKET, &format!("live-{iteration}"), stream, len)
+                .await
+                .unwrap();
+            let blocks = put_part(&fs, BUCKET, KEY, &upload_id, 1, data).await;
+            assert_eq!(object.blocks(), blocks.as_slice());
+            for id in &blocks {
+                assert_eq!(rc_of(&fs, id), Some(2), "object plus part");
+            }
+
+            let storage_key = part_key(BUCKET, KEY, &upload_id, 1);
+            let reapers: Vec<_> = (0..2)
+                .map(|_| {
+                    let fs = fs.clone();
+                    let storage_key = storage_key.clone();
+                    tokio::spawn(async move { reap_part(&fs, &storage_key).await })
+                })
+                .collect();
+
+            let mut winners = 0;
+            for reaper in reapers {
+                if reaper.await.unwrap().unwrap().is_some() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(winners, 1, "the take has exactly one winner");
+
+            for id in &blocks {
+                assert_eq!(
+                    rc_of(&fs, id),
+                    Some(1),
+                    "released exactly once: the object's reference survives"
+                );
+                assert!(block_file_exists(&fs, id), "and its bytes with it");
+            }
         }
     }
 

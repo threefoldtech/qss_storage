@@ -26,17 +26,25 @@
 //! there is no caller-level recovery to return an error to: the next sweep
 //! sees whatever this one could not do.
 //!
-//! # The window this cannot close
+//! # Why an inheritable part can never look like an orphan
 //!
-//! `complete_multipart_upload` claims the upload record, creates the object
-//! from its parts' blocks -- the object INHERITS those references -- and only
-//! then removes the part records. A sweep landing between the claim and the
-//! removals sees part records with no upload record and cannot tell them from
-//! a crashed abort's residue. Reaping one there would drop references the new
-//! object holds: loss, not leakage. The window is the few milliseconds of one
-//! complete against a sweep that runs hourly at most, and closing it needs a
-//! part-level claim in `complete` (ADR 0003's territory, not this task's), so
-//! it is recorded here rather than papered over.
+//! `complete_multipart_upload` does not release its parts' blocks -- the
+//! object it mints INHERITS those references. So a part record that outlived
+//! its upload record while a complete was in flight would be indistinguishable
+//! from a crashed abort's residue, and reaping it would release references the
+//! new object holds: loss, not leakage.
+//!
+//! That state does not exist. `complete` takes the upload record and every
+//! part it names in ONE transaction (`claim_upload_with_parts`) -- both trees
+//! live in the same shared database -- so a named part disappears at the same
+//! instant as its upload record. Phase 2 can only ever see parts nothing
+//! inherited: an aborted upload's residue, an upload_part that landed after
+//! the claim, a part the completing client never named, or a legacy record.
+//! Every one of those holds its blocks alone, so releasing them is right.
+//!
+//! Two reapers racing over one such part are exclusive as well:
+//! [`reap_part`](super::uploads::reap_part) takes the record and its blocks in
+//! one transaction, so exactly one caller can release any given part.
 
 use std::time::Duration;
 
@@ -223,18 +231,38 @@ async fn sweep_orphan_parts(fs: &CasFS, stats: &mut SweepStats) {
     }
 
     for (storage_key, part) in orphans {
-        if reap_part(fs, &storage_key, &part).await {
-            stats.orphan_parts_reaped += 1;
-            tracing::info!(
+        match reap_part(fs, &storage_key).await {
+            Ok(Some(_)) => {
+                stats.orphan_parts_reaped += 1;
+                tracing::info!(
+                    bucket = %part.bucket(),
+                    key = %part.key(),
+                    upload_id = %part.upload_id(),
+                    part_number = part.part_number(),
+                    "Reaped an orphan part record"
+                );
+            }
+            // The record went between the walk and the take: a client's abort
+            // or a concurrent sweep won it, and released its blocks exactly
+            // once. Not an error, and not this sweep's to count.
+            Ok(None) => tracing::debug!(
                 bucket = %part.bucket(),
                 key = %part.key(),
                 upload_id = %part.upload_id(),
                 part_number = part.part_number(),
-                "Reaped an orphan part record"
-            );
-        } else {
-            // reap_part already logged why; its blocks stay referenced.
-            stats.errors += 1;
+                "Another reaper claimed the orphan part first"
+            ),
+            Err(e) => {
+                stats.errors += 1;
+                tracing::error!(
+                    bucket = %part.bucket(),
+                    key = %part.key(),
+                    upload_id = %part.upload_id(),
+                    part_number = part.part_number(),
+                    error = %e,
+                    "Could not reap an orphan part; its blocks stay referenced"
+                );
+            }
         }
     }
 }
@@ -243,8 +271,8 @@ async fn sweep_orphan_parts(fs: &CasFS, stats: &mut SweepStats) {
 mod tests {
     use super::*;
     use crate::cas::uploads::upload_key;
-    use crate::cas::{AsyncByteStream, StorageEngine};
-    use crate::metastore::{BlockId, ContentHash, Durability, UploadRecord};
+    use crate::cas::{AsyncByteStream, StorageEngine, UploadClaim};
+    use crate::metastore::{BlockId, ContentHash, Durability, ObjectData, UploadRecord};
     use crate::metrics::SharedMetrics;
     use tempfile::{TempDir, tempdir};
 
@@ -531,6 +559,88 @@ mod tests {
         for id in &orphan {
             assert_eq!(rc_of(&fs, id), None);
         }
+    }
+
+    /// The window the amendment closed, end to end. A complete claims its
+    /// upload and its named parts in one step and mints the object that
+    /// inherits their blocks; the instant it returns, neither tree holds
+    /// anything the sweep could mistake for an orphan, and a sweep run right
+    /// then leaves the object's blocks alone.
+    ///
+    /// The part the client never named is the other half: nothing inherited
+    /// ITS blocks, so it is a true orphan and the same sweep reaps it.
+    #[tokio::test]
+    async fn a_completed_upload_leaves_nothing_the_sweep_can_take() {
+        let (fs, _dir) = test_fs();
+        fs.create_upload(BUCKET, KEY, "u1").unwrap();
+
+        let first = put_part(&fs, KEY, "u1", 1, 0x11).await;
+        let second = put_part(&fs, KEY, "u1", 2, 0x12).await;
+        let unnamed = put_part(&fs, KEY, "u1", 3, 0x13).await;
+
+        // Complete, as the handler does it: claim the upload with the parts
+        // the client named, then mint the object from the values the claim
+        // read. No cleanup loop -- the claim already removed those records.
+        let claimed = fs
+            .claim_upload_with_parts(BUCKET, KEY, "u1", &[1, 2])
+            .unwrap();
+        let UploadClaim::Claimed { parts, .. } = claimed else {
+            panic!("the claim must win: {claimed:?}");
+        };
+        let inherited: Vec<BlockId> = parts
+            .iter()
+            .flat_map(|part| part.blocks().iter().copied())
+            .collect();
+        let size = parts.iter().map(|part| part.size() as u64).sum();
+        fs.create_object_meta(
+            BUCKET,
+            KEY,
+            size,
+            ContentHash::from([9u8; 16]),
+            ObjectData::MultiPart {
+                blocks: inherited.clone(),
+                parts: parts.len(),
+            },
+        )
+        .unwrap();
+
+        // At this instant: no upload record, and no part record for anything
+        // the object inherited. There was never a moment in between.
+        assert!(fs.get_upload(BUCKET, KEY, "u1").unwrap().is_none());
+        assert_eq!(
+            fs.upload_parts(BUCKET, KEY, "u1")
+                .unwrap()
+                .iter()
+                .map(|p| p.part_number())
+                .collect::<Vec<_>>(),
+            [3],
+            "only the part the client never named is left"
+        );
+
+        let stats = sweep_stale_uploads(&fs, TTL).await;
+        assert_eq!(
+            stats,
+            SweepStats {
+                uploads_reaped: 0,
+                orphan_parts_reaped: 1,
+                errors: 0
+            },
+            "the sweep takes the unnamed part and nothing else"
+        );
+
+        for id in first.iter().chain(second.iter()) {
+            assert_eq!(
+                rc_of(&fs, id),
+                Some(1),
+                "the object keeps the references it inherited"
+            );
+            assert!(block_file_exists(&fs, id), "and their bytes");
+        }
+        for id in &unnamed {
+            assert_eq!(rc_of(&fs, id), None, "the true orphan's blocks are freed");
+            assert!(!block_file_exists(&fs, id));
+        }
+        assert_eq!(part_count(&fs), 0);
     }
 
     /// Empty store, empty sweep: no uploads, no parts, no errors, no panic.
