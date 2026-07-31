@@ -236,7 +236,10 @@ for nn in $(qssrt_plan); do
     phase_dir="$QSSRT_RUN_DIR/phase-$name"
     mkdir -p "$phase_dir"
 
-    bash "$script" >"$phase_dir/log" 2>&1
+    # stdin from /dev/null: a client tool that decides to go interactive
+    # (valkey-cli with no command, aws with a prompt) would otherwise block
+    # the whole campaign on a terminal read that never comes.
+    bash "$script" >"$phase_dir/log" 2>&1 </dev/null
     rc=$?
     tail -n 3 "$phase_dir/log"
 

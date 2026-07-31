@@ -230,13 +230,27 @@ respd_ensure_stopped() {
     return 0
 }
 
+# SIGTERM, not SIGINT.
+#
+# respd installs no ctrl-c handler, and a background job of a
+# non-interactive shell inherits SIGINT as ignored -- so a SIGINT to respd
+# is a no-op, and the daemon outlives the run holding its port. (s3cas does
+# install one, which is why it stops on SIGINT and respd does not.) SIGTERM
+# has no such inheritance rule and its default action ends the process.
 respd_stop() {
     respd_running || {
         QSSRT_RESPD_PID=""
         return 0
     }
-    kill -INT "$QSSRT_RESPD_PID" 2>/dev/null
-    sleep 1
+    kill -TERM "$QSSRT_RESPD_PID" 2>/dev/null
+    local deadline=$((SECONDS + 15))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        respd_running || {
+            QSSRT_RESPD_PID=""
+            return 0
+        }
+        sleep 0.2
+    done
     kill -9 "$QSSRT_RESPD_PID" 2>/dev/null
     QSSRT_RESPD_PID=""
     return 0
