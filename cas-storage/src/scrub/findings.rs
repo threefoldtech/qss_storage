@@ -76,6 +76,9 @@ pub enum FindingClass {
     HalfDeletedBucket,
     /// An in-flight multipart upload, reported so its parts are visible.
     MultipartUpload,
+    /// A part record whose upload record does not exist: nothing will ever
+    /// complete or abort it, so it holds its blocks forever (ADR 0003).
+    OrphanPart,
     /// The holder set could not be closed, so no recount was run. Nothing
     /// downstream of this is trustworthy.
     HolderEnumerationFailed,
@@ -104,13 +107,14 @@ impl FindingClass {
             FindingClass::CorruptBlock => "corrupt_block",
             FindingClass::HalfDeletedBucket => "half_deleted_bucket",
             FindingClass::MultipartUpload => "multipart_upload",
+            FindingClass::OrphanPart => "orphan_part",
             FindingClass::HolderEnumerationFailed => "holder_enumeration_failed",
             FindingClass::PostRepairRecountDirty => "post_repair_recount_dirty",
         }
     }
 
     /// Every class, for exhaustive tests and for a `--help` that lists them.
-    pub const ALL: [FindingClass; 16] = [
+    pub const ALL: [FindingClass; 17] = [
         FindingClass::RefcountOverCount,
         FindingClass::RefcountUnderCount,
         FindingClass::MissingBlockRecord,
@@ -125,6 +129,7 @@ impl FindingClass {
         FindingClass::CorruptBlock,
         FindingClass::HalfDeletedBucket,
         FindingClass::MultipartUpload,
+        FindingClass::OrphanPart,
         FindingClass::HolderEnumerationFailed,
         FindingClass::PostRepairRecountDirty,
     ];
@@ -140,7 +145,8 @@ impl FindingClass {
             | FindingClass::OffDepthFile
             | FindingClass::AdoptableDanglingRecord
             | FindingClass::DegradedRecord
-            | FindingClass::MultipartUpload => Severity::Info,
+            | FindingClass::MultipartUpload
+            | FindingClass::OrphanPart => Severity::Info,
             FindingClass::ForeignFile | FindingClass::HalfDeletedBucket => Severity::Warn,
             FindingClass::RefcountUnderCount
             | FindingClass::MissingBlockRecord
@@ -249,6 +255,23 @@ impl Finding {
         self
     }
 
+    /// Names the raw STORAGE KEY this finding is about, in the same field a
+    /// path goes in: it is the address of the thing, and a finding has one
+    /// such field.
+    ///
+    /// Rendered losslessly, never lossily (see [`render_storage_key`]): the
+    /// one class that carries a key -- an orphan part record -- is the one
+    /// whose key an operator may have to go and look at, and two different
+    /// records that rendered alike would be indistinguishable in a report
+    /// meant to be diffed. A key that is not printable text renders as
+    /// lowercase hex. `--repair` does not read this back; it re-derives its
+    /// own typed key from a fresh walk.
+    #[must_use]
+    pub fn with_storage_key(mut self, key: &[u8]) -> Self {
+        self.path = Some(render_storage_key(key));
+        self
+    }
+
     /// Attaches the holders a damaged block would take down with it.
     #[must_use]
     pub fn with_holders(mut self, holders: Vec<HolderRef>) -> Self {
@@ -261,6 +284,25 @@ impl Finding {
     pub fn at(mut self, severity: Severity) -> Self {
         self.severity = severity;
         self
+    }
+}
+
+/// A record key as report text: itself when it is printable text, lowercase
+/// hex otherwise.
+///
+/// Both halves are lossless, which is the whole requirement. The legacy
+/// dash-joined part keys are text, and reading `photos-big-u-1-1` beats
+/// reading its hex. ADR 0003's keys are length-prefixed, so they are full
+/// of NUL bytes -- and often *technically* valid UTF-8, since a short
+/// length and an ASCII name are both under 0x80. Emitting those raw would
+/// put control characters in a report an operator reads in a terminal and
+/// escapes in the JSON one, so the test is printability, not decodability.
+/// Hex is the same convention a block address is rendered with
+/// ([`Finding::with_block`]).
+pub(crate) fn render_storage_key(key: &[u8]) -> String {
+    match std::str::from_utf8(key) {
+        Ok(text) if !text.chars().any(char::is_control) => text.to_string(),
+        _ => faster_hex::hex_string(key),
     }
 }
 
@@ -306,6 +348,44 @@ mod tests {
             FindingClass::DegradedRecord.default_severity(),
             Severity::Info
         );
+        // ADR 0003: a part record nothing owns is leakage, not loss. Its
+        // blocks are held by that record and by nothing else, so the store
+        // is consistent -- it is just carrying bytes no client can reach.
+        assert_eq!(FindingClass::OrphanPart.default_severity(), Severity::Info);
+    }
+
+    /// Every class is in the inventory exactly once: `ALL` is what a
+    /// `--help` lists and what the rendering test below iterates, so a class
+    /// missing from it is a class no test ever sees.
+    #[test]
+    fn the_class_inventory_is_complete_and_unique() {
+        let mut names: Vec<&str> = FindingClass::ALL.iter().map(|c| c.as_str()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "a class is listed twice in ALL");
+        assert!(names.contains(&"orphan_part"), "{names:?}");
+    }
+
+    /// A record key is bytes. The rendering must be reversible by eye for
+    /// the legacy keys and unambiguous for the binary ones -- never lossy,
+    /// which would print two different part records identically, and never
+    /// raw control bytes, which a length-prefixed key is full of.
+    #[test]
+    fn storage_keys_render_losslessly() {
+        let legacy = Finding::new(FindingClass::OrphanPart, "a legacy record")
+            .with_storage_key(b"photos-big-u-1-1");
+        assert_eq!(legacy.path.as_deref(), Some("photos-big-u-1-1"));
+
+        // Not UTF-8 at all.
+        let binary = Finding::new(FindingClass::OrphanPart, "a length-prefixed record")
+            .with_storage_key(&[0x06, 0x00, 0xff, 0xfe]);
+        assert_eq!(binary.path.as_deref(), Some("0600fffe"));
+
+        // Valid UTF-8, but a length prefix of NULs: hex, not raw controls.
+        let prefixed = Finding::new(FindingClass::OrphanPart, "an ADR 0003 key")
+            .with_storage_key(&[0x01, 0x00, 0x00, 0x00, b'b']);
+        assert_eq!(prefixed.path.as_deref(), Some("0100000062"));
     }
 
     /// The report is a machine contract: it must serialize, and the absent

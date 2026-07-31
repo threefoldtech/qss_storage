@@ -365,6 +365,26 @@ impl CasFS {
         super::uploads::abort_upload(self, bucket, key, upload_id).await
     }
 
+    /// Claim one part record by the storage key it is filed under, and drop
+    /// the block references it held (ADR 0003).
+    ///
+    /// The take IS the claim: `Ok(None)` means another reaper -- a client's
+    /// abort, a GC sweep -- won it and already released its blocks, which is
+    /// a no-op for this caller and not an error. See
+    /// [`uploads::reap_part`](super::uploads::reap_part) for why the key is
+    /// passed in rather than rebuilt, and why the record leaves before its
+    /// blocks do.
+    ///
+    /// Crate-internal: the daemon reaps through [`Self::abort_upload`] or the
+    /// GC sweep, and the only caller that names a single raw key is fsck's
+    /// `--repair`, which reaps the orphan parts its multipart pass found.
+    pub(crate) async fn reap_part(
+        &self,
+        storage_key: &[u8],
+    ) -> Result<Option<MultiPart>, MetaError> {
+        super::uploads::reap_part(self, storage_key).await
+    }
+
     /// Every in-flight upload record in the store, decoded, unsorted and
     /// unfiltered: `ListMultipartUploads` and the GC's TTL sweep each apply
     /// their own (in-memory) selection.

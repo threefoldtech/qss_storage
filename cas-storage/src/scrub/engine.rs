@@ -155,7 +155,7 @@ pub fn run(ctx: &ScrubContext, options: &ScrubOptions) -> Result<Report, ScrubEr
 mod tests {
     use super::*;
     use crate::cas::crash_fixtures::{
-        plant_dangling_record, plant_degraded_record, plant_orphan_file,
+        plant_dangling_record, plant_degraded_record, plant_orphan_file, plant_upload_record,
     };
     use crate::metastore::ContentHash;
     use crate::scrub::findings::Severity;
@@ -225,7 +225,7 @@ mod tests {
             .remove(b"stranded")
             .unwrap();
 
-        // INFO: an in-flight upload.
+        // INFO: an in-flight upload, two days old, with one part.
         fs.insert_multipart_part(
             "photos".to_string(),
             "big".to_string(),
@@ -234,6 +234,25 @@ mod tests {
             "u-1".to_string(),
             ContentHash::from([9u8; 16]),
             vec![synthetic_id(0x07)],
+        )
+        .unwrap();
+        plant_upload_record(
+            &fs,
+            "photos",
+            "big",
+            "u-1",
+            chrono::Utc::now().timestamp() - 2 * 24 * 60 * 60,
+        );
+
+        // INFO: a part record no upload record owns any more.
+        fs.insert_multipart_part(
+            "photos".to_string(),
+            "big".to_string(),
+            512,
+            1,
+            "u-gone".to_string(),
+            ContentHash::from([10u8; 16]),
+            vec![synthetic_id(0x08)],
         )
         .unwrap();
 
@@ -259,12 +278,12 @@ mod tests {
             1
         );
         assert_eq!(classes(&report, FindingClass::DegradedRecord).len(), 1);
-        // Two holders point at blocks with no record: the object planted
-        // above, and the in-flight upload's part -- part records hold
-        // references like any other holder, which is the point of counting
-        // them unconditionally.
+        // Three holders point at blocks with no record: the object planted
+        // above, and the two part records -- part records hold references
+        // like any other holder, orphaned or not, which is the point of
+        // counting them unconditionally.
         let missing = classes(&report, FindingClass::MissingBlockRecord);
-        assert_eq!(missing.len(), 2, "{missing:#?}");
+        assert_eq!(missing.len(), 3, "{missing:#?}");
         // One artifact, one finding: only the healthy block's stale copy is
         // an off-depth duplicate. The adoption candidate's file sits at the
         // wrong depth too, but its record has no file of its own, so it is
@@ -278,6 +297,12 @@ mod tests {
         assert_eq!(classes(&report, FindingClass::ForeignFile).len(), 1);
         assert_eq!(classes(&report, FindingClass::HalfDeletedBucket).len(), 1);
         assert_eq!(classes(&report, FindingClass::MultipartUpload).len(), 1);
+        let orphan_parts = classes(&report, FindingClass::OrphanPart);
+        assert_eq!(orphan_parts.len(), 1, "{orphan_parts:#?}");
+        assert!(
+            orphan_parts[0].evidence.contains("u-gone"),
+            "{orphan_parts:#?}"
+        );
         // The orphan file, plus the healthy block's stale copy is off-depth,
         // not an orphan.
         let orphans = classes(&report, FindingClass::OrphanFile);

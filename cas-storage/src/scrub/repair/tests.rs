@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 use super::*;
+use crate::cas::AsyncByteStream;
 use crate::cas::crash_fixtures::{
     plant_bit_flip, plant_dangling_record, plant_deflated_rc, plant_half_deleted_bucket,
-    plant_inflated_rc, plant_orphan_file, plant_stale_part,
+    plant_inflated_rc, plant_orphan_file, plant_stale_part, plant_upload_record,
 };
 use crate::metastore::{ContentHash, Object, ObjectData};
 use crate::scrub::report::exit_code;
@@ -92,6 +93,35 @@ fn snapshot(fs: &CasFS) -> (Vec<RecordState>, Vec<FileState>) {
     files.sort();
 
     (records, files)
+}
+
+/// Stores one part the way `UploadPart` does -- the blocks first, which
+/// bumps their refcounts, then the part record -- and returns its block
+/// ids. Without an upload record for the same triple this is an ORPHAN
+/// part: blocks held by a record nothing can complete or abort.
+async fn put_part(
+    fs: &CasFS,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i64,
+    data: Vec<u8>,
+) -> Vec<BlockId> {
+    let stream = AsyncByteStream::new(futures::stream::once(async move {
+        Ok(bytes::Bytes::from(data))
+    }));
+    let (blocks, hash, size) = fs.store_object(bucket, key, stream).await.unwrap();
+    fs.insert_multipart_part(
+        bucket.to_string(),
+        key.to_string(),
+        size as usize,
+        part_number,
+        upload_id.to_string(),
+        hash,
+        blocks.clone(),
+    )
+    .unwrap();
+    blocks
 }
 
 /// The outcomes of one kind, for asserting on what an action said.
@@ -466,6 +496,168 @@ async fn a_non_utf8_object_key_is_warned_about_not_panicked_on() {
     assert_eq!(summary.exit_code(), exit_code::CLEAN, "{}", summary.report);
 }
 
+/// The orphan-part reap, end to end (ADR 0003 decision 9): the record goes
+/// through the daemon's take-style primitive, the references it held are
+/// released, and the block files go with them when nothing else holds
+/// them. A live upload's part -- one whose upload record exists -- is
+/// reported and left exactly where it is.
+#[tokio::test]
+async fn an_orphan_part_is_reaped_and_a_live_uploads_part_is_not() {
+    let dir = tempdir().unwrap();
+    let (_shared, fs) = store(&dir);
+    fs.create_bucket("b").unwrap();
+
+    // A live upload, an hour old: the upload record is what makes it live.
+    plant_upload_record(
+        &fs,
+        "b",
+        "big",
+        "live",
+        chrono::Utc::now().timestamp() - 60 * 60,
+    );
+    let live = put_part(
+        &fs,
+        "b",
+        "big",
+        "live",
+        1,
+        b"a live part".repeat(64).to_vec(),
+    )
+    .await;
+
+    // An orphan: no upload record, its blocks held by the part record alone.
+    let doomed = put_part(
+        &fs,
+        "b",
+        "big",
+        "gone",
+        2,
+        b"an abandoned part".repeat(64).to_vec(),
+    )
+    .await;
+
+    // And an orphan whose content a live object shares: the release drops
+    // the part's OCCURRENCE, and the object keeps the block.
+    let data = b"content two holders share".repeat(64).to_vec();
+    let object = put(&fs, "b", "object", data.clone()).await;
+    let shared_blocks = put_part(&fs, "b", "big", "gone", 3, data).await;
+    assert_eq!(
+        shared_blocks,
+        vec![object],
+        "the premise: one block, two holders"
+    );
+    assert_eq!(rc(&fs, object), 2);
+
+    let summary = report_and_repair(&fs, ScrubOptions::metadata_only()).await;
+
+    let reaped = of_kind(&summary, "reap_orphan_part");
+    assert_eq!(reaped.len(), 2, "{:#?}", summary.outcomes);
+    assert!(reaped.iter().all(|o| o.status == RepairStatus::Applied));
+    assert!(
+        reaped.iter().any(|o| o.detail.contains("upload gone")),
+        "{reaped:#?}"
+    );
+    // The outcome names the record by the key it was filed under.
+    assert!(reaped.iter().all(|o| o.path.is_some()), "{reaped:#?}");
+
+    for id in &doomed {
+        assert!(record(&fs, *id).is_none(), "the last reference is gone");
+        assert!(
+            !block_disk_path(id, 1, fs.fs_root().clone()).exists(),
+            "and so is the file"
+        );
+    }
+    assert_eq!(rc(&fs, object), 1, "the object keeps the block it shares");
+    assert!(recorded_path(&fs, object).is_file());
+
+    assert_eq!(
+        fs.upload_parts("b", "big", "live").unwrap().len(),
+        1,
+        "the live upload's part is untouched"
+    );
+    for id in &live {
+        assert_eq!(rc(&fs, *id), 1);
+        assert!(recorded_path(&fs, *id).is_file());
+    }
+
+    // Clean afterwards: no orphan_part survives, and the live upload is
+    // still reported as the INFO it is.
+    assert_eq!(summary.exit_code(), exit_code::CLEAN, "{}", summary.report);
+    assert!(
+        !summary
+            .report
+            .findings
+            .iter()
+            .any(|f| f.class == FindingClass::OrphanPart),
+        "{}",
+        summary.report
+    );
+    assert_eq!(
+        summary
+            .report
+            .findings
+            .iter()
+            .filter(|f| f.class == FindingClass::MultipartUpload)
+            .count(),
+        1,
+        "{}",
+        summary.report
+    );
+}
+
+/// The reap is rc-consequential, so it is refused on exactly the ground
+/// every other rc mutation is: an unclosed holder set. The record and the
+/// references it holds are left exactly as they were found.
+#[tokio::test]
+async fn an_unclosed_holder_set_refuses_the_orphan_part_reap() {
+    let dir = tempdir().unwrap();
+    let (_shared, fs) = store(&dir);
+    fs.create_bucket("b").unwrap();
+
+    let held = put_part(
+        &fs,
+        "b",
+        "big",
+        "gone",
+        1,
+        b"an abandoned part".repeat(64).to_vec(),
+    )
+    .await;
+    // One object record that will not decode: the holder set cannot close.
+    fs.get_bucket("b")
+        .unwrap()
+        .insert(b"broken", vec![0xffu8; 8])
+        .unwrap();
+
+    let ctx = RepairContext::new(&fs);
+    let report = engine::run(&ctx.scrub_context(), &ScrubOptions::metadata_only()).unwrap();
+    assert!(!report.ran(Pass::Recount), "the premise of this test");
+    assert!(
+        report.ran(Pass::MultipartReport),
+        "the classification itself is fine: the part records decode"
+    );
+    let summary = repair(&ctx, &report, &ScrubOptions::metadata_only())
+        .await
+        .unwrap();
+
+    let refused = of_kind(&summary, "reap_orphan_part");
+    assert_eq!(refused.len(), 1, "{:#?}", summary.outcomes);
+    assert_eq!(refused[0].status, RepairStatus::Skipped);
+    assert_eq!(refused[0].severity, Severity::Warn);
+    assert!(refused[0].detail.contains("holder set"), "{refused:#?}");
+
+    assert_eq!(
+        fs.upload_parts("b", "big", "gone").unwrap().len(),
+        1,
+        "the record stands"
+    );
+    for id in &held {
+        assert_eq!(rc(&fs, *id), 1, "and so does the reference it holds");
+        assert!(recorded_path(&fs, *id).is_file());
+    }
+    assert_eq!(summary.exit_code(), exit_code::CRITICAL);
+}
+
 /// Hard rule 1: with the holder set unclosed, no refcount may move -- in
 /// either direction, by any action. The report says so by leaving the
 /// recount out of `passes_run`, and every rc-mutating action reads that.
@@ -539,7 +731,11 @@ async fn applying_the_full_repair_twice_changes_nothing() {
     std::fs::write(fs.fs_root().join("NOTES"), b"foreign").unwrap();
     put(&fs, "stranded", "k", b"still referenced".repeat(8).to_vec()).await;
     plant_half_deleted_bucket(fs.namespace_meta_store(), "stranded");
+    // Both multipart shapes: a part no upload record owns (reaped) and one
+    // a live upload does (reported, and left alone by both runs).
     plant_stale_part(&fs, "b", "big", "u-1", 1, vec![live]);
+    plant_upload_record(&fs, "b", "big", "u-2", chrono::Utc::now().timestamp() - 60);
+    plant_stale_part(&fs, "b", "big", "u-2", 1, vec![live]);
 
     let first = report_and_repair(&fs, ScrubOptions::full()).await;
     assert!(first.counts.applied > 0, "there was work to do");

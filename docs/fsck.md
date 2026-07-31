@@ -102,7 +102,7 @@ tells "the recount found nothing" from "the recount refused".
 | Disk sweep | `disk_sweep` | block files vs the records naming them |
 | Dangling sweep | `dangling_sweep` | each record vs the file it names |
 | Corruption scrub | `corruption_scrub` | each file's bytes vs its own name (`--scrub` only) |
-| Multipart report | `multipart_report` | in-flight uploads, grouped |
+| Multipart report | `multipart_report` | `_MULTIPART_PARTS` vs `_UPLOADS` |
 | Bucket integrity | `bucket_integrity` | object trees vs `_BUCKETS` rows |
 
 ### 1. Refcount recount
@@ -111,9 +111,10 @@ Walks every holder and counts block references **per occurrence** (the
 counting rule of `docs/refcount.md`: a block listed twice in one object
 counts twice). Two holder classes: object records in every non-reserved
 tree of the namespace DB, and part records in `_MULTIPART_PARTS`
-unconditionally -- with ADR 0003 unimplemented, part records are the only
-holders of an in-flight upload's blocks, and skipping them would recount a
-live upload to zero.
+unconditionally -- a part record is the only holder of an in-flight
+upload's blocks, and skipping them would recount a live upload to zero. An
+*orphan* part record counts as a holder too: it holds its blocks until
+something reaps it, and the recount reports what is, not what should be.
 
 **The closed-holder-set rule.** A recount is only meaningful over the
 complete holder set. Any incompleteness -- a tree that will not open, an
@@ -188,18 +189,47 @@ is opt-in. Everything else finishes in one pass over the metadata.
 
 ### 5. Multipart report
 
-Groups `_MULTIPART_PARTS` by (bucket, key, upload_id) and reports part
-count and total bytes held per upload as `multipart_upload` (INFO).
-Report-only until ADR 0003 lands: reaping needs 0003's abort semantics,
-which decrement through the striped delete primitive, and guessing them
-here would smuggle 0003 in.
+Two trees, one walk each. `_UPLOADS` names every upload that exists (ADR
+0003: the record's existence *is* the upload's), so it decides both halves
+of this pass:
 
-**No age is reported.** A part record carries no timestamp; upload records
-arrive with ADR 0003. Every finding says so in its evidence.
+- one `multipart_upload` (INFO) per upload record: its **age**, the number
+  of parts it holds and their total bytes. An upload with no parts yet is
+  reported too -- on its age alone -- because it is still an upload the TTL
+  will age and an operator can see.
+- one `orphan_part` (INFO) per part record whose (bucket, key, upload_id)
+  has no upload record. Those hold their blocks with nothing left that can
+  complete or abort them: the residue of a crashed abort, of the accepted
+  `upload_part`-versus-abort race, of a part a completing client never
+  named, and of every legacy dash-keyed record written before ADR 0003
+  re-keyed the tree. The finding carries the raw storage key the record is
+  filed under, as text when it is printable (the legacy keys) and lowercase
+  hex otherwise (the length-prefixed ones).
+
+**Age** is wall clock now minus the record's `created_at`, the same
+subtraction the daemon's TTL sweep makes, rendered coarsely (days, hours,
+minutes). fsck is offline and holds the store's lock, so there is no
+concurrent writer to be monotonic against; a store carried to a machine
+with a wrong clock reports a wrong age rather than doing anything about it.
+
+**An inheritable part can never look like an orphan.** A completing upload
+takes its upload record and every part it names in ONE transaction, and the
+object it mints inherits those blocks -- so there is no instant at which a
+part whose references something else now owns is visible without its upload
+record. Reaping is take-style on top of that: the record and its blocks
+leave in one transaction, so two reapers release a part exactly once.
+
+The **daemon's GC is the primary reaper** of both stale uploads (past the
+TTL) and orphan parts; this pass and its repair are the offline backstop
+for a store whose daemon has not been running.
 
 A part record that will not decode is the same refusal the holder walk
 makes -- a part record *is* a holder -- so it surfaces as
-`holder_enumeration_failed`.
+`holder_enumeration_failed`. An UPLOAD record that will not decode refuses
+the pass for a sharper reason: without the full set of upload records a
+live upload's part cannot be told from an orphan, and reaping a live part
+would release references an upload still owns. The pass is then absent from
+`passes_run`, which is what forbids the reaping downstream.
 
 ### 6. Bucket integrity
 
@@ -224,7 +254,8 @@ the whole story.
 | `off_depth_file` | INFO | a redundant copy at a depth the record does not name |
 | `adoptable_dangling_record` | INFO | the record's file is missing but the id is on disk elsewhere |
 | `degraded_record` | INFO | known damage, flagged, awaiting a heal |
-| `multipart_upload` | INFO | an in-flight upload and what it holds |
+| `multipart_upload` | INFO | an in-flight upload, its age and what it holds |
+| `orphan_part` | INFO | a part record whose upload record does not exist |
 | `foreign_file` | WARN | something under `blocks/` that is not this store's layout |
 | `half_deleted_bucket` | WARN | an object tree with no `_BUCKETS` row |
 | `refcount_under_count` | CRITICAL | rc below the holder count: a premature free waiting to happen |
@@ -290,6 +321,7 @@ Actions run in a fixed order, and the order is load-bearing.
 | Action | What it does |
 | --- | --- |
 | `resume_bucket_teardown` | Deletes every object of a stranded tree through the daemon's own striped delete path (so refcounts fall exactly as the crashed teardown would have dropped them), then drops the tree. A non-UTF-8 object key cannot go through that path: it is reported WARN and skipped, the tree is still dropped, and the recount reconciles what it was holding. |
+| `reap_orphan_part` | Takes a part record no upload record owns and releases the block references it held, through the daemon's own take-style primitive (the record and its blocks leave in one transaction). Addressed by the key the walk yielded, never a rebuilt one -- a legacy dash-joined key has no other address. A take that finds the record already gone is a skip, not a failure. Gated on the recount having run *and* on the multipart pass having run: without the full set of upload records, a live part cannot be told from an orphan. |
 | `quarantine_corrupt` | Moves a file whose bytes do not hash to its own name into `blocks/.quarantine/` **and** marks its record degraded. Both halves or neither: a quarantined file with a live record leaves dedup pointing at nothing, and a degraded record over corrupt bytes leaves the bytes where a reader still finds them. |
 | `adopt_orphan` | Re-hashes the candidate copy first (fsck does not have the writer's bytes, so unlike the write path's heal it must verify before trusting), then points the record's depth at it and deletes the remaining copies. A candidate that does not hash is corrupt residue: quarantined. If every candidate fails, the record is marked degraded. |
 | `set_rc` | Sets rc to the walked holder count, in both directions. Gated on the recount having run. |
@@ -417,6 +449,12 @@ version 1.
 - `store.meta_root` is absent when the caller did not supply one.
 - `block`, `path` and `holders` are omitted when empty rather than emitted
   as nulls -- test for presence, not for a null.
+- `path` is a filesystem path for every class but `orphan_part`, where it is
+  the record's storage KEY: the thing that addresses it. Rendered as text
+  when printable, lowercase hex otherwise, and never lossily -- two
+  different records must never render alike. The `reap_orphan_part` outcome
+  names the same key the same way, so a repaired record joins to the finding
+  that reported it.
 - `evidence` is free text for a person. Scripts key off `class`, `severity`
   and the typed fields.
 - `findings` is sorted worst first, then by class, block, path and
@@ -529,6 +567,8 @@ esac
   re-hashed against a whole-block address). `--scrub` is the offline,
   whole-store half: it is the only thing that ever checks cold data. Run
   both.
-- `docs/adr/0003-multipart-lifecycle-and-gc.md` -- where upload age and
-  reaping will come from; until it lands the multipart pass reports and
-  touches nothing.
+- `docs/adr/0003-multipart-lifecycle-and-gc.md` -- the upload lifecycle this
+  pass reads: what an upload record is, why the claim is the only
+  linearization point, and the daemon GC that reaps stale uploads and orphan
+  parts on a TTL. That GC is the primary reaper; fsck is the offline
+  backstop for a store whose daemon has not run.

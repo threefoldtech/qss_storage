@@ -43,8 +43,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cas::block_disk::QUARANTINE_DIR_NAME;
+use crate::cas::multipart::MultiPart;
 use crate::cas::{CasFS, SharedBlockStore};
-use crate::metastore::{Block, BlockId, MetaError, MetaStore, block_disk_path};
+use crate::metastore::{
+    Block, BlockId, MULTIPART_PARTS_TREE, MetaError, MetaStore, block_disk_path,
+};
 
 use super::ScrubContext;
 use super::disk::{DiskWalk, walk_disk};
@@ -234,6 +237,17 @@ impl RepairOutcome {
         self
     }
 
+    /// Names the raw record key this outcome is about, in the same field a
+    /// path goes in and by the same lossless rule a finding uses
+    /// ([`Finding::with_storage_key`]): the two documents must name one
+    /// record identically, or nothing can join a repaired record to the
+    /// finding that reported it.
+    #[must_use]
+    fn with_storage_key(mut self, key: &[u8]) -> Self {
+        self.path = Some(super::findings::render_storage_key(key));
+        self
+    }
+
     /// Overrides the severity the status implies.
     #[must_use]
     fn at(mut self, severity: Severity) -> Self {
@@ -357,6 +371,24 @@ pub enum RepairAction {
         /// Name of the stranded object tree.
         bucket: String,
     },
+    /// Reap a part record whose upload record does not exist: take the
+    /// record and release the blocks it held, through the daemon's own
+    /// take-style primitive (ADR 0003).
+    ReapOrphanPart {
+        /// Bucket the dead upload targeted.
+        bucket: String,
+        /// Key the dead upload targeted.
+        key: String,
+        /// Upload the part belonged to.
+        upload_id: String,
+        /// Position of the part within that upload.
+        part_number: i64,
+        /// The key the record is actually filed under. Carried whole rather
+        /// than rebuilt: a legacy dash-joined key has no other address, and
+        /// a rebuilt key would remove nothing and then release blocks the
+        /// surviving record still claims.
+        storage_key: Vec<u8>,
+    },
     /// Move a block file whose bytes do not hash to its own name out of the
     /// blocks root, and mark its record degraded so future PUTs heal
     /// instead of deduplicating against a poisoned record.
@@ -436,6 +468,7 @@ impl RepairAction {
     pub fn kind(&self) -> &'static str {
         match self {
             RepairAction::ResumeBucketTeardown { .. } => "resume_bucket_teardown",
+            RepairAction::ReapOrphanPart { .. } => "reap_orphan_part",
             RepairAction::QuarantineCorrupt { .. } => "quarantine_corrupt",
             RepairAction::AdoptOrphan { .. } => "adopt_orphan",
             RepairAction::SetRc { .. } => "set_rc",
@@ -458,6 +491,13 @@ impl RepairAction {
             RepairAction::ResumeBucketTeardown { bucket } => {
                 resume_bucket_teardown(ctx, bucket, &mut outcomes).await
             }
+            RepairAction::ReapOrphanPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                storage_key,
+            } => reap_orphan_part(ctx, bucket, key, upload_id, *part_number, storage_key).await,
             RepairAction::QuarantineCorrupt { block, path } => quarantine_corrupt(ctx, block, path),
             RepairAction::AdoptOrphan {
                 block,
@@ -487,6 +527,9 @@ impl RepairAction {
         if let Some(path) = self.path() {
             outcome = outcome.with_path(path);
         }
+        if let Some(key) = self.storage_key() {
+            outcome = outcome.with_storage_key(key);
+        }
 
         outcomes.push(outcome);
         outcomes
@@ -501,9 +544,9 @@ impl RepairAction {
             | RepairAction::MarkDegraded { block }
             | RepairAction::DeleteOrphan { block, .. }
             | RepairAction::DeleteOffDepth { block, .. } => Some(*block),
-            RepairAction::ResumeBucketTeardown { .. } | RepairAction::QuarantineForeign { .. } => {
-                None
-            }
+            RepairAction::ResumeBucketTeardown { .. }
+            | RepairAction::ReapOrphanPart { .. }
+            | RepairAction::QuarantineForeign { .. } => None,
         }
     }
 
@@ -515,9 +558,27 @@ impl RepairAction {
             | RepairAction::DeleteOffDepth { path, .. }
             | RepairAction::QuarantineForeign { path } => Some(path),
             RepairAction::ResumeBucketTeardown { .. }
+            | RepairAction::ReapOrphanPart { .. }
             | RepairAction::AdoptOrphan { .. }
             | RepairAction::SetRc { .. }
             | RepairAction::MarkDegraded { .. } => None,
+        }
+    }
+
+    /// The raw record key this action is about, when it is about one. Only
+    /// the orphan-part reap is: every other subject is addressed by a block
+    /// address or a filesystem path.
+    fn storage_key(&self) -> Option<&[u8]> {
+        match self {
+            RepairAction::ReapOrphanPart { storage_key, .. } => Some(storage_key),
+            RepairAction::ResumeBucketTeardown { .. }
+            | RepairAction::QuarantineCorrupt { .. }
+            | RepairAction::AdoptOrphan { .. }
+            | RepairAction::SetRc { .. }
+            | RepairAction::MarkDegraded { .. }
+            | RepairAction::DeleteOrphan { .. }
+            | RepairAction::DeleteOffDepth { .. }
+            | RepairAction::QuarantineForeign { .. } => None,
         }
     }
 }
@@ -836,6 +897,48 @@ async fn resume_bucket_teardown(
     )))
 }
 
+/// Reaps a part record no upload record owns: the record and the block
+/// references it held leave together.
+///
+/// Goes through the daemon's own primitive
+/// ([`CasFS::reap_part`](crate::cas::CasFS::reap_part)) rather than
+/// removing the record here and letting the closing recount collect the
+/// references. Two reasons, and the second is why this is not a
+/// `tx.remove()`:
+///
+/// - the take IS the claim. `Ok(None)` -- the record was already gone --
+///   is a skip, not a failure, which is what makes a killed `--repair`
+///   re-runnable over the parts it did get to;
+/// - the release drops exactly the occurrences that record held, per
+///   occurrence, through the striped decrement. The recount that closes
+///   the run then validates the result rather than being the thing that
+///   produces it.
+async fn reap_orphan_part(
+    ctx: &RepairContext<'_>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i64,
+    storage_key: &[u8],
+) -> ActionResult {
+    match ctx.fs.reap_part(storage_key).await {
+        Ok(Some(part)) => Ok(Done::Applied(format!(
+            "part {part_number} of upload {upload_id} ({bucket}/{key}) removed, and the {} block \
+             reference(s) it held released",
+            part.blocks().len()
+        ))),
+        Ok(None) => Ok(Done::Skipped(format!(
+            "part {part_number} of upload {upload_id} ({bucket}/{key}) is already gone, so there \
+             was nothing to release"
+        ))),
+        Err(e) => Err(format!(
+            "part {part_number} of upload {upload_id} ({bucket}/{key}) could not be reaped: {e}. \
+             Its blocks stay referenced by the record that survives, which is the over-count \
+             direction, and the next run retries"
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Shared primitives
 // ---------------------------------------------------------------------
@@ -925,9 +1028,12 @@ fn fsync_dir(dir: &Path) -> Result<(), String> {
 
 /// Applies what the report found, then checks its work.
 ///
-/// Two planning rounds, because one action changes what the others must do:
-/// resuming a half-deleted bucket's teardown removes object records, so
-/// every rc below it is counted after the teardowns are done, never before.
+/// Two planning rounds, because one action changes what the others must do.
+/// Round one is the actions that remove HOLDERS -- resuming a half-deleted
+/// bucket's teardown removes object records, reaping an orphan part removes
+/// a part record -- so every rc below them is counted after they are done,
+/// never before. A recount planned beside them would set each rc to a count
+/// that still included the holder about to go.
 ///
 /// `options` decides the post-repair passes; pass the same ones the report
 /// was produced with, or the check will not look at what the repair
@@ -946,6 +1052,10 @@ pub async fn repair(
     let mut outcomes: Vec<RepairOutcome> = Vec::new();
 
     for action in plan_teardowns(ctx, report, &mut outcomes)? {
+        outcomes.extend(action.apply(ctx).await);
+    }
+
+    for action in plan_orphan_parts(ctx, report, &mut outcomes)? {
         outcomes.extend(action.apply(ctx).await);
     }
 
@@ -999,6 +1109,93 @@ fn plan_teardowns(
         .into_iter()
         .map(|bucket| RepairAction::ResumeBucketTeardown { bucket })
         .collect())
+}
+
+/// Round one, second half: the part records no upload record owns (ADR
+/// 0003).
+///
+/// Gated twice. On [`Pass::MultipartReport`], because that pass is what
+/// closes the classification: an upload record that will not decode takes
+/// it down, and without the full set of upload records a live upload's part
+/// cannot be told from an orphan -- reaping one would release references an
+/// upload still owns, which is loss. And on [`Pass::Recount`], like every
+/// action whose consequence is a refcount: the reap releases the references
+/// the part record held.
+///
+/// The daemon's GC is the primary reaper of these; this is the offline
+/// backstop for a store whose daemon has not run (ADR 0003 decision 9).
+fn plan_orphan_parts(
+    ctx: &RepairContext<'_>,
+    report: &Report,
+    outcomes: &mut Vec<RepairOutcome>,
+) -> Result<Vec<RepairAction>, RepairError> {
+    if !report.ran(Pass::MultipartReport) {
+        return Ok(Vec::new());
+    }
+
+    let orphans = orphan_parts(ctx.fs).map_err(RepairError::Store)?;
+    if orphans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !report.ran(Pass::Recount) {
+        outcomes.push(
+            RepairOutcome::new(
+                "reap_orphan_part",
+                RepairStatus::Skipped,
+                format!(
+                    "{} orphan part record(s) left alone: the report's holder set was not closed, \
+                     and reaping a part releases the block references it held",
+                    orphans.len()
+                ),
+            )
+            .at(Severity::Warn),
+        );
+        return Ok(Vec::new());
+    }
+
+    Ok(orphans
+        .into_iter()
+        .map(|(storage_key, part)| RepairAction::ReapOrphanPart {
+            bucket: part.bucket().to_string(),
+            key: part.key().to_string(),
+            upload_id: part.upload_id().to_string(),
+            part_number: part.part_number(),
+            storage_key,
+        })
+        .collect())
+}
+
+/// Part records whose upload record does not exist, each with the key it is
+/// actually filed under, in the tree's own order.
+///
+/// The same derivation `passes::multipart_report` makes; repeated here
+/// typed, because the finding it produces renders that key as report text
+/// and a reap needs the bytes. Value-driven throughout (ADR 0003 hard rule
+/// 4): the triple checked against `_UPLOADS` is the one the part record's
+/// VALUE carries, which is what lets a legacy dash-keyed record -- whose key
+/// no point read can rebuild -- be recognised and reaped at all.
+///
+/// Everything is collected before the caller removes anything: the reap
+/// writes to the tree this iterates.
+fn orphan_parts(fs: &CasFS) -> Result<Vec<(Vec<u8>, MultiPart)>, MetaError> {
+    let tree = fs
+        .shared_block_store()
+        .meta_store()
+        .get_tree_ext(MULTIPART_PARTS_TREE)?;
+
+    let mut orphans = Vec::new();
+    for item in tree.iter_all() {
+        let (storage_key, raw) = item?;
+        let part = MultiPart::try_from(&*raw).map_err(MetaError::from)?;
+        if fs
+            .get_upload(part.bucket(), part.key(), part.upload_id())?
+            .is_none()
+        {
+            orphans.push((storage_key, part));
+        }
+    }
+    Ok(orphans)
 }
 
 /// Object trees with no `_BUCKETS` row, sorted. The same derivation
@@ -1210,7 +1407,8 @@ fn is_repairable(class: FindingClass) -> bool {
         | FindingClass::DanglingRecord
         | FindingClass::AdoptableDanglingRecord
         | FindingClass::CorruptBlock
-        | FindingClass::HalfDeletedBucket => true,
+        | FindingClass::HalfDeletedBucket
+        | FindingClass::OrphanPart => true,
         FindingClass::MissingBlockRecord
         | FindingClass::UndecodableBlockRecord
         | FindingClass::SizeMismatch

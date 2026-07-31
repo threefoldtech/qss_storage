@@ -153,10 +153,47 @@ pub(crate) fn plant_half_deleted_bucket(namespace: &MetaStore, bucket: &str) {
         .unwrap();
 }
 
-/// Residue class 10: a stale part record -- an upload that was never
-/// completed or aborted. Its blocks stay referenced (part records are
-/// holders like any other), so fsck reports it and touches nothing:
-/// reaping needs ADR 0003's abort semantics.
+/// An upload record with a caller-chosen creation time (ADR 0003): the
+/// live half of the multipart shapes, and the only way to test anything
+/// that ages uploads -- fsck's reported age, the GC's TTL -- without
+/// sleeping through a TTL.
+///
+/// `created_at` is a Unix timestamp in seconds, as the record stores it:
+/// `Utc::now().timestamp() - n` is an upload that started `n` seconds ago.
+/// Planted through the same key and the same tree
+/// [`CasFS::create_upload`](super::CasFS::create_upload) writes, so
+/// everything that reads an upload record finds this one.
+pub(crate) fn plant_upload_record(
+    fs: &super::CasFS,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    created_at: i64,
+) {
+    let record = crate::metastore::UploadRecord::with_created_at(
+        created_at,
+        bucket.to_string(),
+        key.to_string(),
+        upload_id.to_string(),
+    );
+    fs.shared_block_store()
+        .uploads_tree()
+        .insert(
+            &super::uploads::upload_key(bucket, key, upload_id),
+            record.to_vec(),
+        )
+        .unwrap();
+}
+
+/// Residue class 10: a stale part record -- a part of an upload that was
+/// never completed or aborted. Its blocks stay referenced (part records are
+/// holders like any other).
+///
+/// With no upload record beside it this plants an ORPHAN part: the shape
+/// ADR 0003's GC and fsck's `orphan_part` finding are about, which
+/// `--repair` reaps. Plant [`plant_upload_record`] for the same triple
+/// first and the part belongs to a live in-flight upload instead, which
+/// fsck reports (`multipart_upload`) and never touches.
 pub(crate) fn plant_stale_part(
     fs: &super::CasFS,
     bucket: &str,
@@ -470,9 +507,11 @@ mod tests {
     }
 
     /// A stale part record holds its blocks like any other holder: that is
-    /// why the recount counts part records unconditionally.
+    /// why the recount counts part records unconditionally. On its own it is
+    /// an ORPHAN part -- no upload record names it -- which is what makes it
+    /// reapable; with an upload record beside it, it is a live upload's part.
     #[test]
-    fn stale_part_record_holds_its_blocks() {
+    fn stale_part_record_holds_its_blocks_and_is_an_orphan_alone() {
         let dir = tempdir().unwrap();
         let (_shared, fs) = fixture_store(dir.path());
         fs.create_bucket("b").unwrap();
@@ -485,5 +524,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(part.blocks(), &[held]);
+        assert!(
+            fs.get_upload("b", "big", "u-1").unwrap().is_none(),
+            "a stale part alone is an orphan: nothing owns it"
+        );
+
+        plant_upload_record(&fs, "b", "big", "u-1", 1_700_000_000);
+        assert!(
+            fs.get_upload("b", "big", "u-1").unwrap().is_some(),
+            "with the upload record, the same part belongs to a live upload"
+        );
+    }
+
+    /// A planted upload record reads back through the daemon's own point
+    /// read, carrying the age it was given: the fixture everything that
+    /// ages an upload is tested against.
+    #[test]
+    fn planted_upload_record_carries_its_chosen_age() {
+        let dir = tempdir().unwrap();
+        let (_shared, fs) = fixture_store(dir.path());
+        let week = 7 * 24 * 60 * 60;
+        let started = chrono::Utc::now().timestamp() - week;
+
+        plant_upload_record(&fs, "b", "big", "u-1", started);
+
+        let record = fs.get_upload("b", "big", "u-1").unwrap().expect("planted");
+        assert_eq!(record.created_at(), started);
+        assert_eq!(record.bucket(), "b");
+        assert_eq!(record.key(), "big");
+        assert_eq!(record.upload_id(), "u-1");
+        // And the listing sees it: the GC's TTL sweep reads it that way.
+        assert_eq!(fs.list_uploads().unwrap().len(), 1);
     }
 }

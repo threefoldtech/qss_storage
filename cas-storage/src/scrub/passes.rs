@@ -11,8 +11,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
+
 use crate::cas::multipart::MultiPart;
-use crate::metastore::{BlockId, MULTIPART_PARTS_TREE, MetaError, block_disk_path};
+use crate::metastore::{
+    BlockId, MULTIPART_PARTS_TREE, MetaError, UPLOADS_TREE, UploadRecord, block_disk_path,
+};
 
 use super::disk::DiskWalk;
 use super::findings::{Finding, FindingClass};
@@ -363,27 +367,74 @@ pub fn corruption_scrub(ctx: &ScrubContext, disk: &DiskWalk) -> Vec<Finding> {
     findings
 }
 
-/// Pass 5: what the in-flight uploads are holding.
+/// Pass 5: what the in-flight uploads are holding, and which part records
+/// no upload owns.
 ///
-/// Report-only, and one finding per upload rather than per part, because
-/// the unit an operator acts on is the upload. Reaping belongs to ADR
-/// 0003's abort path, which decrements through the striped delete
-/// primitive; guessing those semantics here would smuggle 0003 in.
+/// Two trees, one walk each. `_UPLOADS` names every upload that exists
+/// (ADR 0003: the record's existence IS the upload's), so it decides both
+/// halves of this pass:
 ///
-/// DEVIATION from the ADR text, recorded in the evidence of every finding:
-/// no age is reported, because a part record carries no timestamp. It
-/// arrives when ADR 0003 adds upload records.
+/// - one `multipart_upload` finding per upload record, carrying its AGE
+///   alongside the part count and bytes its parts hold. An upload with no
+///   parts yet is reported too -- it is still an upload an operator can see
+///   and the TTL will still age it;
+/// - one `orphan_part` finding per part record whose triple has no upload
+///   record. Those hold their blocks with nothing left that can complete or
+///   abort them: the residue of a crashed abort, of the accepted
+///   upload_part-versus-abort race, of a part a completing client never
+///   named, and of every legacy dash-keyed record. `--repair` reaps them
+///   (the daemon GC is the primary reaper; this is the offline backstop).
+///
+/// Age is wall clock now minus the record's `created_at`, the same
+/// subtraction the GC's TTL makes. fsck is an offline tool holding the
+/// store's lock, so there is no monotonicity to preserve across a
+/// concurrent writer, and a store carried to a machine with a wrong clock
+/// reports a wrong age rather than doing anything about it (ADR 0003).
 ///
 /// # Errors
 ///
 /// [`HolderEnumerationError`] if a part record does not decode -- the same
-/// refusal the holder walk makes, because a part record IS a holder.
+/// refusal the holder walk makes, because a part record IS a holder -- or
+/// if an UPLOAD record does not: without the full set of upload records a
+/// live part cannot be told from an orphan, and the repair that follows
+/// would release blocks an upload still owns. That is loss, so the pass
+/// refuses rather than guessing, and the missing pass in `passes_run`
+/// forbids the reaping downstream.
 pub fn multipart_report(ctx: &ScrubContext) -> Result<Vec<Finding>, HolderEnumerationError> {
     /// Accumulated per (bucket, key, upload_id).
     #[derive(Default)]
     struct Upload {
         parts: u64,
         bytes: u64,
+    }
+
+    /// (bucket, key, upload_id): what a part record and an upload record
+    /// both name, and the only thing that joins them.
+    type Triple = (String, String, String);
+
+    // Value-driven (ADR 0003 hard rule 4): both walks decode VALUES and
+    // never parse a key, so the triple each record reports is its own.
+    let mut records: HashMap<Triple, i64> = HashMap::new();
+    for item in ctx.shared().uploads_tree().iter_all() {
+        let (key, raw) = item.map_err(|source| HolderEnumerationError::Store {
+            tree: Some(UPLOADS_TREE.to_string()),
+            source,
+        })?;
+        let record = UploadRecord::try_from(&*raw).map_err(|e| {
+            HolderEnumerationError::UndecodableRecord {
+                tree: UPLOADS_TREE.to_string(),
+                key: String::from_utf8_lossy(&key).into_owned(),
+                source: MetaError::from(e),
+            }
+        })?;
+        records.insert(
+            (
+                record.bucket().to_string(),
+                record.key().to_string(),
+                record.upload_id().to_string(),
+            ),
+            record.created_at(),
+        );
     }
 
     let tree = ctx
@@ -395,49 +446,108 @@ pub fn multipart_report(ctx: &ScrubContext) -> Result<Vec<Finding>, HolderEnumer
             source,
         })?;
 
-    let mut uploads: HashMap<(String, String, String), Upload> = HashMap::new();
+    let mut uploads: HashMap<Triple, Upload> = HashMap::new();
+    let mut orphans: Vec<Finding> = Vec::new();
 
     for item in tree.iter_all() {
-        let (key, raw) = item.map_err(|source| HolderEnumerationError::Store {
+        let (storage_key, raw) = item.map_err(|source| HolderEnumerationError::Store {
             tree: Some(MULTIPART_PARTS_TREE.to_string()),
             source,
         })?;
         let part =
             MultiPart::try_from(&*raw).map_err(|e| HolderEnumerationError::UndecodableRecord {
                 tree: MULTIPART_PARTS_TREE.to_string(),
-                key: String::from_utf8_lossy(&key).into_owned(),
+                key: String::from_utf8_lossy(&storage_key).into_owned(),
                 source: MetaError::from(e),
             })?;
 
-        let entry = uploads
-            .entry((
-                part.bucket().to_string(),
-                part.key().to_string(),
-                part.upload_id().to_string(),
-            ))
-            .or_default();
+        let triple = (
+            part.bucket().to_string(),
+            part.key().to_string(),
+            part.upload_id().to_string(),
+        );
+        if !records.contains_key(&triple) {
+            // The key is carried whole, because that is the only address a
+            // legacy dash-keyed record has: it cannot be rebuilt from the
+            // triple, and reaping needs the key the walk yielded.
+            orphans.push(
+                Finding::new(
+                    FindingClass::OrphanPart,
+                    format!(
+                        "part {} of upload {} ({}/{}): {} byte(s) held by a part record whose \
+                         upload record does not exist, so nothing can complete or abort it. The \
+                         daemon's GC reaps these on its next sweep; --repair reaps this one",
+                        part.part_number(),
+                        part.upload_id(),
+                        part.bucket(),
+                        part.key(),
+                        part.size()
+                    ),
+                )
+                .with_storage_key(&storage_key),
+            );
+            continue;
+        }
+
+        let entry = uploads.entry(triple).or_default();
         entry.parts += 1;
         entry.bytes += part.size() as u64;
     }
 
-    let mut grouped: Vec<_> = uploads.into_iter().collect();
+    // Wall clock, matching the wall clock `UploadRecord::new` stamped.
+    let now = Utc::now().timestamp();
+    let mut grouped: Vec<(Triple, i64)> = records.into_iter().collect();
     // Stable output: two runs over the same store report in the same order.
+    // The orphans need no sort -- they come out in the tree's key order.
     grouped.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-    Ok(grouped
+    let mut findings: Vec<Finding> = grouped
         .into_iter()
-        .map(|((bucket, key, upload_id), upload)| {
+        .map(|(triple, created_at)| {
+            let held = uploads.remove(&triple).unwrap_or_default();
+            let (bucket, key, upload_id) = triple;
             Finding::new(
                 FindingClass::MultipartUpload,
                 format!(
-                    "upload {upload_id} of {bucket}/{key}: {} part(s), {} byte(s) held. Age is \
-                     not reported: part records carry no timestamp, and upload records arrive \
-                     with ADR 0003",
-                    upload.parts, upload.bytes
+                    "upload {upload_id} of {bucket}/{key}: started {} ago, {} part(s), {} byte(s) \
+                     held",
+                    humanize_age(now - created_at),
+                    held.parts,
+                    held.bytes
                 ),
             )
         })
-        .collect())
+        .collect();
+
+    findings.extend(orphans);
+    Ok(findings)
+}
+
+/// An age in seconds, for a person: days above a day, hours above an hour,
+/// minutes above a minute, seconds below that.
+///
+/// Coarse on purpose. The number an operator acts on is "older than the
+/// TTL", which is measured in days, and a second-exact age would suggest a
+/// precision a wall-clock timestamp does not have. A record stamped in the
+/// future -- a clock that went backwards, or a store carried between
+/// machines -- is reported as a negative age rather than clamped to zero,
+/// so the skew is visible instead of plausible.
+fn humanize_age(seconds: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+
+    let (sign, magnitude) = if seconds < 0 {
+        ("-", seconds.saturating_neg())
+    } else {
+        ("", seconds)
+    };
+    match magnitude {
+        s if s >= DAY => format!("{sign}{} day(s)", s / DAY),
+        s if s >= HOUR => format!("{sign}{} hour(s)", s / HOUR),
+        s if s >= MINUTE => format!("{sign}{} minute(s)", s / MINUTE),
+        s => format!("{sign}{s} second(s)"),
+    }
 }
 
 /// Pass 6: object trees whose bucket is gone.
@@ -495,7 +605,7 @@ mod tests {
     use crate::scrub::{Severity, holders::expected_counts};
 
     use crate::cas::crash_fixtures::{
-        plant_dangling_record, plant_degraded_record, plant_orphan_file,
+        plant_dangling_record, plant_degraded_record, plant_orphan_file, plant_upload_record,
     };
     use tempfile::tempdir;
 
@@ -740,47 +850,200 @@ mod tests {
         assert!(corrupt.evidence.contains("hash to"), "{corrupt:?}");
     }
 
+    /// Seconds ago, as a `created_at` a planted upload record carries.
+    fn started_ago(seconds: i64) -> i64 {
+        Utc::now().timestamp() - seconds
+    }
+
+    /// Plants one part record of `upload_id`, naming one synthetic block.
+    fn plant_part(
+        fs: &crate::cas::CasFS,
+        key: &str,
+        upload_id: &str,
+        part_number: i64,
+        size: usize,
+    ) {
+        fs.insert_multipart_part(
+            "b".to_string(),
+            key.to_string(),
+            size,
+            part_number,
+            upload_id.to_string(),
+            crate::metastore::ContentHash::from([1u8; 16]),
+            vec![synthetic_id(0xd0u8.wrapping_add(part_number as u8))],
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn the_multipart_pass_groups_by_upload() {
+    fn the_multipart_pass_groups_by_upload_and_reports_its_age() {
         let dir = tempdir().unwrap();
         let (shared, fs) = store(&dir);
         fs.create_bucket("b").unwrap();
 
-        for (part_number, size) in [(1i64, 1024usize), (2, 512)] {
-            fs.insert_multipart_part(
-                "b".to_string(),
-                "big".to_string(),
-                size,
-                part_number,
-                "u-1".to_string(),
-                crate::metastore::ContentHash::from([1u8; 16]),
-                vec![synthetic_id(0xd0 + part_number as u8)],
-            )
-            .unwrap();
-        }
-        // A second upload of the same key is a different unit of work.
-        fs.insert_multipart_part(
-            "b".to_string(),
-            "big".to_string(),
-            64,
-            1,
-            "u-2".to_string(),
-            crate::metastore::ContentHash::from([2u8; 16]),
-            vec![synthetic_id(0xdf)],
-        )
-        .unwrap();
+        plant_upload_record(&fs, "b", "big", "u-1", started_ago(3 * 24 * 60 * 60));
+        plant_part(&fs, "big", "u-1", 1, 1024);
+        plant_part(&fs, "big", "u-1", 2, 512);
+        // A second upload of the same key is a different unit of work, and
+        // ages on its own clock.
+        plant_upload_record(&fs, "b", "big", "u-2", started_ago(5 * 60 * 60));
+        plant_part(&fs, "big", "u-2", 1, 64);
+        // An upload nobody has sent a part for yet is still an upload.
+        plant_upload_record(&fs, "b", "empty", "u-3", started_ago(90));
+
+        let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
+        let findings = multipart_report(&ctx).unwrap();
+
+        assert_eq!(findings.len(), 3, "{findings:#?}");
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.class == FindingClass::MultipartUpload && f.severity == Severity::Info)
+        );
+
+        let first = &findings[0];
+        assert!(first.evidence.contains("u-1"), "{first:?}");
+        assert!(first.evidence.contains("2 part(s)"), "{first:?}");
+        assert!(first.evidence.contains("1536 byte(s)"), "{first:?}");
+        assert!(
+            first.evidence.contains("started 3 day(s) ago"),
+            "the age ADR 0003 promised: {first:?}"
+        );
+
+        let second = &findings[1];
+        assert!(second.evidence.contains("u-2"), "{second:?}");
+        assert!(
+            second.evidence.contains("started 5 hour(s) ago"),
+            "an upload younger than a day reports hours: {second:?}"
+        );
+
+        // Sorted by (bucket, key, upload_id), so b/empty comes after b/big:
+        // the upload nobody has uploaded a part for is reported all the same.
+        let third = &findings[2];
+        assert!(third.evidence.contains("u-3"), "{third:?}");
+        assert!(
+            third.evidence.contains("0 part(s), 0 byte(s)"),
+            "an upload with no parts is reported on its age alone: {third:?}"
+        );
+        assert!(
+            third.evidence.contains("started 1 minute(s) ago"),
+            "{third:?}"
+        );
+    }
+
+    /// The classification `--repair` acts on: the upload record decides. A
+    /// part whose triple has one belongs to a live upload and is reported
+    /// with it; a part whose triple has none is an orphan, reported on its
+    /// own and carrying the raw key its reaping needs.
+    #[test]
+    fn parts_without_an_upload_record_are_orphans_not_uploads() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store(&dir);
+        fs.create_bucket("b").unwrap();
+
+        plant_upload_record(&fs, "b", "big", "live", started_ago(60 * 60));
+        plant_part(&fs, "big", "live", 1, 4096);
+        // Same bucket and key, no upload record: the abort-race residue.
+        plant_part(&fs, "big", "gone", 7, 2048);
 
         let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
         let findings = multipart_report(&ctx).unwrap();
 
         assert_eq!(findings.len(), 2, "{findings:#?}");
-        assert!(findings.iter().all(|f| f.severity == Severity::Info));
-        let first = &findings[0];
-        assert!(first.evidence.contains("u-1"), "{first:?}");
-        assert!(first.evidence.contains("2 part(s)"), "{first:?}");
-        assert!(first.evidence.contains("1536 byte(s)"), "{first:?}");
-        assert!(first.evidence.contains("ADR 0003"), "{first:?}");
-        assert!(findings[1].evidence.contains("u-2"));
+        let live = only(&findings, FindingClass::MultipartUpload);
+        assert!(live.evidence.contains("upload live"), "{live:?}");
+        assert!(live.evidence.contains("1 part(s)"), "{live:?}");
+
+        let orphan = only(&findings, FindingClass::OrphanPart);
+        assert_eq!(orphan.severity, Severity::Info);
+        assert!(orphan.evidence.contains("part 7"), "{orphan:?}");
+        assert!(orphan.evidence.contains("upload gone"), "{orphan:?}");
+        assert!(orphan.evidence.contains("2048 byte(s)"), "{orphan:?}");
+        assert!(
+            orphan.evidence.contains("upload record does not exist"),
+            "{orphan:?}"
+        );
+        // The raw storage key, so an operator can find the record and repair
+        // can name what it reaped. An ADR 0003 key is length-prefixed, so it
+        // is not printable text and renders as hex.
+        let rendered = orphan.path.as_deref().expect("the key is carried");
+        assert_eq!(
+            rendered,
+            faster_hex::hex_string(&crate::cas::multipart::part_key("b", "big", "gone", 7)),
+            "{orphan:?}"
+        );
+    }
+
+    /// A legacy dash-keyed record can have no upload record at all -- no
+    /// point read can address it -- so it is an orphan by construction, and
+    /// its key, being printable text, is carried as itself.
+    #[test]
+    fn a_legacy_dash_keyed_part_is_an_orphan_with_a_readable_key() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store(&dir);
+        fs.create_bucket("b").unwrap();
+
+        let record = MultiPart::new(
+            1024,
+            1,
+            "b".to_string(),
+            "big".to_string(),
+            "u-legacy".to_string(),
+            crate::metastore::ContentHash::from([7u8; 16]),
+            vec![synthetic_id(0xd9)],
+        );
+        shared
+            .meta_store()
+            .get_tree_ext(MULTIPART_PARTS_TREE)
+            .unwrap()
+            .insert(b"b-big-u-legacy-1", record.to_vec())
+            .unwrap();
+
+        let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
+        let findings = multipart_report(&ctx).unwrap();
+
+        let orphan = only(&findings, FindingClass::OrphanPart);
+        assert_eq!(orphan.path.as_deref(), Some("b-big-u-legacy-1"));
+    }
+
+    /// An upload record that does not decode takes the pass down, exactly as
+    /// an undecodable part record does: without the full set of upload
+    /// records a live part cannot be told from an orphan, and reaping a live
+    /// part is loss.
+    #[test]
+    fn an_undecodable_upload_record_refuses_the_pass() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store(&dir);
+        fs.create_bucket("b").unwrap();
+        plant_part(&fs, "big", "u-1", 1, 128);
+
+        shared
+            .uploads_tree()
+            .insert(b"not-a-real-key", vec![0xffu8; 3])
+            .unwrap();
+
+        let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
+        match multipart_report(&ctx).unwrap_err() {
+            HolderEnumerationError::UndecodableRecord { tree, .. } => {
+                assert_eq!(tree, UPLOADS_TREE);
+            }
+            other => panic!("expected an undecodable-record refusal, got {other:?}"),
+        }
+    }
+
+    /// Ages read as a person reads them, and a clock that went backwards is
+    /// shown as the skew it is rather than as a plausible zero.
+    #[test]
+    fn ages_are_rendered_in_the_coarsest_unit_that_fits() {
+        assert_eq!(humanize_age(0), "0 second(s)");
+        assert_eq!(humanize_age(59), "59 second(s)");
+        assert_eq!(humanize_age(60), "1 minute(s)");
+        assert_eq!(humanize_age(59 * 60), "59 minute(s)");
+        assert_eq!(humanize_age(60 * 60), "1 hour(s)");
+        assert_eq!(humanize_age(47 * 60 * 60), "1 day(s)");
+        assert_eq!(humanize_age(-90), "-1 minute(s)");
+        // An absurd timestamp must not panic the report that carries it.
+        assert!(humanize_age(i64::MIN).starts_with('-'));
     }
 
     #[tokio::test]
