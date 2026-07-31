@@ -53,6 +53,17 @@ s3d_start() {
 
     mkdir -p "$(qssrt_daemon_dir)" "$QSSRT_S3_STORE"
 
+    # A daemon we did not start is already on the port. Refuse: a phase that
+    # quietly talks to a stranger's daemon reports on a store nobody asked
+    # about, and every measurement it takes is a fiction. (This is not
+    # hypothetical -- it is how the first smoke run of this harness measured
+    # an inline boundary that did not exist.)
+    if s3d_tcp_ready; then
+        check_fail "the S3 port is free before the daemon starts" \
+            "something is already listening on $QSSRT_S3_HOST:$QSSRT_S3_PORT and it is not ours"
+        return 1
+    fi
+
     if [ "${QSSRT_DAEMON_LOG_FILTER:-0}" = "1" ]; then
         # Phase 10's log volume problem: the daemon's subscriber is pinned
         # at INFO and logs every request with its whole input, so a
@@ -84,18 +95,35 @@ s3d_start() {
         QSSRT_S3_PID=$(pgrep -n -f "s3cas server" || true)
     fi
     printf '%s' "$QSSRT_S3_PID" >"$(qssrt_daemon_dir)/s3cas.pid"
-    s3d_wait_ready
+
+    if ! s3d_wait_ready; then
+        check_fail "the daemon comes up" \
+            "no answer on $QSSRT_S3_HOST:$QSSRT_S3_PORT: $(tail -n 2 "$(qssrt_s3_log)")"
+        return 1
+    fi
+    # Ours, and still alive: a daemon that bound the port and then exited
+    # would otherwise leave the phase talking to whoever takes it next.
+    if ! s3d_running; then
+        check_fail "the daemon that answers is the one we started" \
+            "$(tail -n 2 "$(qssrt_s3_log)")"
+        return 1
+    fi
+    return 0
 }
 
-# Polls the S3 endpoint until it answers, or gives up. "Answers" means the
-# TCP port serves HTTP at all -- an unauthenticated request gets a 403,
-# which is a perfectly good sign of life.
+# Is the S3 port accepting connections?
+#
+# A bare TCP connect, deliberately: an unsigned HTTP probe gets a perfectly
+# correct AccessDenied, which the daemon logs at ERROR, which the error gate
+# then reads as a daemon-side failure. The harness must not manufacture the
+# evidence it grades.
+s3d_tcp_ready() {
+    (exec 3<>"/dev/tcp/$QSSRT_S3_HOST/$QSSRT_S3_PORT") 2>/dev/null
+}
+
+# Polls until the endpoint accepts connections, or gives up.
 s3d_wait_ready() {
-    if qssrt_wait_for "${QSSRT_DAEMON_START_TIMEOUT:-60}" \
-        curl -s -o /dev/null "http://$QSSRT_S3_HOST:$QSSRT_S3_PORT/"; then
-        return 0
-    fi
-    return 1
+    qssrt_wait_for "${QSSRT_DAEMON_START_TIMEOUT:-60}" s3d_tcp_ready
 }
 
 s3d_running() {
@@ -152,8 +180,17 @@ s3d_ensure_stopped() {
 
 # --- respd -------------------------------------------------------------
 
+respd_tcp_ready() {
+    (exec 3<>"/dev/tcp/$QSSRT_RESP_HOST/$QSSRT_RESP_PORT") 2>/dev/null
+}
+
 respd_start() {
     mkdir -p "$(qssrt_daemon_dir)" "$QSSRT_RESP_STORE"
+    if respd_tcp_ready; then
+        check_fail "the RESP port is free before respd starts" \
+            "something is already listening on $QSSRT_RESP_HOST:$QSSRT_RESP_PORT"
+        return 1
+    fi
     "$QSSRT_BIN_DIR/respd" \
         --config "$QSSRT_DAEMON_CONFIG" \
         --data-dir "$QSSRT_RESP_STORE" \

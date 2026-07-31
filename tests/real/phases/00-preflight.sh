@@ -114,6 +114,25 @@ else
 fi
 mkdir -p "$QSSRT_S3_STORE" "$QSSRT_RESP_STORE"
 
+# --- the ports ---------------------------------------------------------
+
+# Nothing may be listening yet. A daemon left over from an earlier run
+# answers on the campaign's port with somebody else's store behind it, and
+# every phase then measures that store instead of this one -- silently, and
+# with total confidence.
+port_free() {
+    local host="$1" port="$2" label="$3"
+    if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+        check_fail "$label port $host:$port is free" \
+            "something is already listening; stop it before running the campaign"
+    else
+        check_pass "$label port $host:$port is free"
+    fi
+}
+port_free "$QSSRT_S3_HOST" "$QSSRT_S3_PORT" S3
+port_free "$QSSRT_METRICS_HOST" "$QSSRT_METRICS_PORT" metrics
+port_free "$QSSRT_RESP_HOST" "$QSSRT_RESP_PORT" RESP
+
 # --- space -------------------------------------------------------------
 
 free=$(qssrt_free_bytes "$QSSRT_STORE_ROOT")
