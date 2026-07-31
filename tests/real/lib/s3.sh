@@ -94,7 +94,13 @@ s3_put_generated() {
 # checks in phase 1, which is where a finding about it belongs.
 s3_get_stream() {
     local bucket="$1" key="$2" fifo status
-    fifo="$(qssrt_scratch)/get-$$-${QSSRT_GET_SEQ:-0}"
+    # BASHPID, not $$: $$ is the MAIN shell's pid even inside a subshell,
+    # so under the stress phase every parallel worker computed the SAME
+    # fifo name -- and each held its own copy of the sequence counter, so
+    # the counter separated nothing. Workers rm'd each other's fifo
+    # mid-transfer and then blocked on a recreated inode nobody wrote to,
+    # for the full GET timeout.
+    fifo="$(qssrt_scratch)/get-${BASHPID:-$$}-${QSSRT_GET_SEQ:-0}"
     QSSRT_GET_SEQ=$((${QSSRT_GET_SEQ:-0} + 1))
     rm -f "$fifo"
     mkfifo "$fifo" || return 1
