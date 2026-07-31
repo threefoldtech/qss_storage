@@ -1,6 +1,8 @@
 # Overwrite Releases the Replaced Object's Blocks
 
-**Status**: Proposed
+**Status**: Accepted (2026-07-31, owner sign-off; all three review asks
+approved, self-copy short-circuit chosen -- see Review asks and Open
+Questions below)
 **Date**: 2026-08-01
 
 ---
@@ -56,8 +58,8 @@ per occurrence).
 
 ## Decision
 
-Proposed, pending review: **every object-record write that replaces an
-existing record releases the replaced record's blocks**, in this order:
+Accepted: **every object-record write that replaces an existing record
+releases the replaced record's blocks**, in this order:
 
 ```
 one namespace-DB tx: read old record (if any); insert new record; commit
@@ -226,17 +228,24 @@ arms: overwrite storm same key, overwrite-vs-delete, overwrite-vs-read
 (old-reader equivalence), self-copy; fsck doc line; refcount.md
 counting-rule note (overwrite now releases).
 
-Review asks:
+Review asks (answered 2026-07-31, owner):
 1. Apply to both `create_object_meta` and `store_inlined_object`
-   (inline-over-block-backed releases too) -- agree?
-2. New-record-commits-first, release-after ordering -- agree?
-3. Synchronous release (no deferred queue until measured) -- agree?
+   (inline-over-block-backed releases too) -- **approved**.
+2. New-record-commits-first, release-after ordering -- **approved**.
+3. Synchronous release (no deferred queue until measured) --
+   **approved**.
 
 ---
 
 ## Open Questions
 
 **Behavior definers**
-- [ ] Should `copy_object` onto self be short-circuited (no-op) instead
+- [x] Should `copy_object` onto self be short-circuited (no-op) instead
       of replace+release with net-zero rc? Semantically identical;
       short-circuit skips pointless work but adds a special case.
+      **Answered (2026-07-31, owner): short-circuit.** Self-copy is
+      detected up front and returns success without rewriting the
+      record or touching refcounts. A test pins the no-op: object
+      record unchanged, rc unchanged. (Metadata-directive self-copy,
+      if the S3 layer ever supports REPLACE, is a real record write
+      and takes the uniform replace+release path.)

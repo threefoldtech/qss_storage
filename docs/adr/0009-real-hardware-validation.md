@@ -1,6 +1,8 @@
 # Real-Hardware Validation: aws-cli, valkey-cli, NVMe
 
-**Status**: Proposed
+**Status**: Accepted (2026-07-31, owner sign-off; all five review asks
+answered, both open questions closed -- see below. Owner sizing
+directive: the disk is 3.6 TB at `/s3`, pick max.)
 **Date**: 2026-08-01
 
 ---
@@ -30,7 +32,8 @@ The gap matters because the strongest claims -- file-first durability
 claims whose failure modes live below the layers the in-process
 harnesses fake.
 
-Hardware designated by the owner: `nvme1n1`, xfs, mounted at `/s3`,
+Hardware designated by the owner: `nvme1n1` (3.6 TB), xfs, mounted at
+`/s3`,
 owned by the operating user. The campaign never provisions hardware:
 mkfs and mount are the owner's, done once, outside the scripts.
 
@@ -41,7 +44,7 @@ docs/multipart.md (the behaviors under test); `Makefile` (gates).
 
 ## Decision
 
-Proposed, pending review: a **scripted, repeatable validation campaign
+Accepted: a **scripted, repeatable validation campaign
 in-repo** -- `tests/real/` -- driven by one entrypoint with numbered
 phases, each phase with explicit pass criteria, runnable end-to-end or
 per phase. Not a checklist, not CI: a campaign an operator runs on the
@@ -128,18 +131,19 @@ designated hardware and reads a verdict from.
 10. **The terabyte (the ultimate test)** -- flag-gated (`--tb`), owns
     the disk for a session, replaces phases 5/8/9's scale rather than
     repeating them:
-    - **Fill ~1 TB, capped at 85% of the filesystem**, through the real
+    - **Fill ~3 TiB, capped at 85% of the filesystem** (owner sizing
+      directive 2026-07-31: 3.6 TB disk, fill it), through the real
       S3 path with parallel aws-cli workers, in a composition that
       exercises every regime at once:
-      - 4 x 100 GiB multipart giants (client-driven part sizing);
-      - ~500 GiB of 1-16 MiB objects, tens of thousands of keys
+      - 4 x 300 GiB multipart giants (client-driven part sizing);
+      - ~1.5 TiB of 1-16 MiB objects, hundreds of thousands of keys
         (the block-store working regime);
-      - ~50 GiB of 100 MiB objects (multipart threshold band);
-      - ~1 GiB across one million tiny objects (metadata regime:
-        fjall at 1M+ keys, listings, memory);
-      - a 100 GiB **dedup band written twice** under different keys:
-        logical 200 GiB, stored once -- dedup and rc-exactness at
-        scale, verified by disk usage staying ~100 GiB and fsck's
+      - ~150 GiB of 100 MiB objects (multipart threshold band);
+      - ~3 GiB across three million tiny objects (metadata regime:
+        fjall at 3M+ keys, listings, memory);
+      - a 300 GiB **dedup band written twice** under different keys:
+        logical 600 GiB, stored once -- dedup and rc-exactness at
+        scale, verified by disk usage staying ~300 GiB and fsck's
         recount agreeing.
     - **Verification without a mirror**: every object's content is
       derived from a seeded generator keyed by its object key (a small
@@ -149,28 +153,29 @@ designated hardware and reads a verdict from.
       the dedup band; sampled verification (>= 1%) of the mid and tiny
       bands; the full-store integrity claim comes from the scrub, which
       reads every block regardless.
-    - **A kill -9 mid-fill** (once, at a randomized point past 500 GiB)
+    - **A kill -9 mid-fill** (once, at a randomized point past 1 TiB)
       with resume: the fill is idempotent per key, so the campaign
       restarts the daemon and continues; fsck after the fill must show
       leak-class residue only.
-    - **Metadata-scale checks**: list a million keys through paginated
-      aws-cli listings; time the metadata-only fsck recount at 1M+
-      objects; record fjall DB size and daemon RSS over the run.
-    - **Full scrub at capacity**: the whole ~1 TB re-hashed; throughput
+    - **Metadata-scale checks**: list three million keys through
+      paginated aws-cli listings; time the metadata-only fsck recount
+      at 3M+ objects; record fjall DB size and daemon RSS over the run.
+    - **Full scrub at capacity**: the whole ~3 TiB re-hashed; throughput
       recorded (this is the ADR 0005 sizing estimate's reality check
       at scale).
     - **Teardown at scale**: delete the entire dataset through the
       clients; record the reclaim curve; final fsck reconciles to
       empty.
     - **Pass criteria**: everything campaign-level plus: dedup band
-      stored once (disk usage), rc exact at 1M+ objects (recount
+      stored once (disk usage), rc exact at 3M+ objects (recount
       clean), no daemon panic/OOM/fd exhaustion across the fill, scrub
       zero corruption, teardown reaches empty.
     - **Budget**: the fill dominates -- at a realistic 300-800 MB/s
-      through the full S3 path with fsync durability, ~1 TB is 20-60
-      minutes of pure transfer but realistically 2-4 hours with client
-      overhead and the million-object band; scrub adds one full-disk
-      read; teardown and fsck close it out. Plan an overnight session;
+      through the full S3 path with fsync durability, ~3 TiB is 1-3
+      hours of pure transfer but realistically 4-8 hours with client
+      overhead and the three-million-object band; scrub adds one
+      full-disk read; teardown and fsck close it out. Plan an
+      overnight session;
       the phase checkpoints per band so a rerun resumes rather than
       restarts.
 
@@ -249,8 +254,9 @@ A: Process-crash atomicity: the ordering guarantees that survive the
 page cache (rename-before-record, claim atomicity, residue classes).
 Honest scope: fsync-vs-power-loss needs a power-cut rig or dm-flakey
 style fault injection -- out of scope here, recorded as the known gap.
-The campaign proves the crash-consistency layer above it; dm-flakey is
-the natural phase 11 if the owner wants it later (open question).
+The campaign proves the crash-consistency layer above it; power-loss
+grade testing is deferred to a separate machine the owner will prep
+(see Open Questions, answered).
 
 **Q: How long does a full run take?**
 A: Dominated by dataset writes and the scrub: at NVMe speeds, the
@@ -281,9 +287,11 @@ phase script is the tripwire.
   driving everything. Shell chosen: the campaign IS the real clients;
   wrapping them in Rust adds nothing but compile time. Cost to
   change: moderate.
-- **Dataset scale defaults** (1 GiB single, 2 GiB multipart, >1000-key
-  listings, 30-min stress): sized for a first run; the SCALE knob
-  multiplies. Review ask 1.
+- **Dataset scale defaults**: owner directive (2026-07-31) is "pick
+  max" for the 3.6 TB disk. Defaults land at 4 GiB single-part (just
+  under the 5 GiB single-PUT ceiling), 16 GiB multipart, >1000-key
+  listings, 60-min stress; the SCALE knob divides for smoke runs.
+  Review ask 1, answered.
 - **Verdict format**: `verdict.md` + exit code (0 pass, 1 findings,
   2 fail). Scripting contract once shipped.
 
@@ -300,29 +308,38 @@ config; phases 1-9 as scripts with per-phase pass criteria; a
 `make realtest` target; docs page `docs/realtest.md` (how to prepare
 the disk, run, read the verdict); .gitignore for target/realtest.
 
-Review asks:
-1. Dataset scale defaults (1 GiB / 2 GiB / 30-min stress) -- right
-   first-run sizing for the nvme1n1 disk?
-2. Phase 7's durability matrix at buffer level -- include in the
-   default run or flag-gated (it doubles the crash-phase time)?
-3. Optional curated ceph/s3-tests subset -- include now, later, or
-   never?
+Review asks (answered 2026-07-31, owner):
+1. Dataset scale defaults -- **pick max for the 3.6 TB disk**: 4 GiB
+   single-part, 16 GiB multipart, 60-min stress; the SCALE knob
+   divides for smoke runs.
+2. Phase 7's durability matrix at buffer level -- **included in the
+   default run**; crash grade stays process kill/restart. No
+   broken-disk or power-off faults in this campaign (separate machine
+   later, see Open Questions).
+3. Curated ceph/s3-tests subset -- **later**, once the harness is
+   proven.
 4. `--fresh` wipe semantics (fsck-verified store-dir wipe, never the
-   mount) -- acceptable?
-5. The terabyte (phase 10): composition (4x100 GiB giants / 500 GiB
-   mid / 1M tiny / 100 GiB dedup-doubled), the 85%-of-filesystem cap,
-   and the overnight budget -- agree, or reshape the bands?
+   mount) -- **accepted**.
+5. The terabyte (phase 10) -- **scaled ~3x to fill ~3 TiB** under the
+   85% cap: 4x300 GiB giants / 1.5 TiB mid / 3M tiny / 300 GiB
+   dedup-doubled; the overnight budget grows accordingly (folded into
+   the phase spec above).
 
 ---
 
 ## Open Questions
 
 **Architecture-changers**
-- [ ] Power-loss-grade fault injection (dm-flakey / a power-cut rig)
+- [x] Power-loss-grade fault injection (dm-flakey / a power-cut rig)
       as a future phase 11: is there appetite, or is process-crash
       grade the accepted ceiling for this campaign?
+      **Answered (2026-07-31, owner): process-crash grade is this
+      campaign's ceiling -- kill/restart only, no broken disks or
+      power-off. The owner will prep a separate machine for
+      power-loss-grade testing; phase 11 stays future work there.**
 
 **Behavior definers**
-- [ ] Should the campaign also run against a store on the OS disk
+- [x] Should the campaign also run against a store on the OS disk
       (worst case: shared, slower) to catch same-device assumptions,
       or is /s3-only the contract?
+      **Answered (2026-07-31, owner): /s3-only is the contract.**
