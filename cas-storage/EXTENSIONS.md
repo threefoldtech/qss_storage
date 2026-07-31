@@ -42,9 +42,10 @@ Upstream is `unimplemented!("fjall with transaction does not support number
 of keys")`, which panics on the default `--metadata-db fjall` path of
 `s3cas inspect num-keys`. It does support it: `FjallTree::len` in the same
 file counts via `db.read_tx().len(&partition)`. `num_keys` now opens the
-named partition and does the same, mirroring `FjallStoreNotx::num_keys`.
-Note the two backends differ in exactness: the transactional one is exact,
-`fjall_notx` uses `approximate_len`, as upstream does.
+named partition and does the same. (It originally mirrored
+`FjallStoreNotx::num_keys`; that backend was removed by ADR 0007. The
+transactional count is exact where upstream's notx `approximate_len` was
+not.)
 
 ### `MetaStore::num_keys` returns `Result`
 Upstream returns a bare `usize` and `unwrap()`s the store call, so a backend
@@ -129,19 +130,19 @@ respd, s3cas CLI) moved from `Fdatasync` to `Fsync` -- so the default persist
 behavior is bit-for-bit unchanged, and only explicit flag users see a change:
 they now get what the flag name promised.
 
-### The two fjall backends deduplicated
+### The two fjall backends deduplicated, then reduced to one
 Finding B1 of `docs/as-built/04-code-health.md`. `stores/fjall.rs` and
 `stores/fjall_notx.rs` were near-copies: same function inventory, 161
 identical non-trivial lines, and every extension (`iter_kv`, the checked
 UTF-8 keys, the `num_keys` fix) had to be written twice.
 
-The shared half now lives in `stores/fjall_common.rs`, generic over a
-`FjallFlavor` trait: `FjallStoreOf<F>` (partition cache, tree opening,
-`Store` impl, inlined-metadata threshold, disk space) and `FjallTreeOf<F>`
-(the whole `BaseMetaTree` and `MetaTreeExt` impl, including `range_filter`
-and the two `iter_kv` walks). `FjallStore` and `FjallStoreNotx` are now
-aliases of that generic with their flavor marker; their public API,
-constructors and `Debug` output are unchanged.
+The shared half was first extracted to `stores/fjall_common.rs`, generic
+over a `FjallFlavor` trait. ADR 0007 (2026-07-31) then removed the
+non-transactional backend entirely, and with one flavor left the generic
+layer was folded back into `stores/fjall.rs`: `FjallStore` is a concrete
+struct again, `FjallTree` carries the whole `BaseMetaTree` and
+`MetaTreeExt` impl (including `range_filter` and the two `iter_kv` walks).
+Public API, constructors and `Debug` output are unchanged throughout.
 
 What did *not* unify, and why:
 
@@ -223,12 +224,12 @@ is computed here, in `cas/write_path.rs`, not in the frontends.
 
 The trait additions are implemented in:
 
-- `src/metastore/stores/fjall_common.rs` (shared, generic over the flavor)
-- `src/metastore/stores/fjall.rs`        (transactional flavor)
-- `src/metastore/stores/fjall_notx.rs`   (non-transactional flavor)
+- `src/metastore/stores/fjall.rs` (the only backend since ADR 0007
+  removed `fjall_notx`; the interim `fjall_common.rs` flavor layer was
+  folded back in at the same time)
 
-Both backends preserve upstream's partition cache, durability handling, and
-write-path locking semantics. They share their range plumbing with the
+The backend preserves upstream's partition cache, durability handling, and
+write-path locking semantics. The range plumbing is shared with the
 existing `iter_all` (which is now a one-line wrapper around `iter_kv(None)`).
 
 ## Upstreaming sketch (historical -- moot per the 2026-07-30 ownership decision)
@@ -240,7 +241,8 @@ threefoldtech/s3-cas would have:
    to `MetaTreeExt`, document them, and adjust `iter_all` to be a default
    method that calls `iter_kv(None)` (so existing callers stay green).
 2. Drop the `#[cfg(test)]` on `BaseMetaTree::len` and `is_empty`.
-3. Port both `fjall.rs` and `fjall_notx.rs` impls (copy from this fork).
+3. Port the `fjall.rs` impl (copy from this fork; `fjall_notx.rs` was
+   removed here by ADR 0007, so upstream's copy would need its own port).
 4. Reference respd's RSCAN/SCAN/DBSIZE use cases as motivation.
 
 The `num_keys` fixes are worth a separate, smaller PR that stands on its own
