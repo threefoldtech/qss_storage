@@ -5,7 +5,12 @@
 **Updated**: 2026-07-31 (revised against the as-built ADR 0005/0006/0007
 world; the original draft predates the striped write/delete protocol,
 the fsck machinery, and the notx removal, and its release_blocks and
-race sections described machinery that now exists in different form)
+race sections described machinery that now exists in different form.
+Same day, owner sign-off on all four review asks: TTL default 7 days;
+existence enforcement on upload_part AND empty-parts rejection on
+complete; abort of unknown id returns NoSuchUpload; GC as a daemon
+task, default-on, with the fsck backstop. Decision-complete; Accepted
+on implementation start)
 
 ---
 
@@ -343,23 +348,18 @@ same code.
 
 ## Implementation Plan
 
-### Decisions you will probably want to tweak
-- **TTL default**: 7 days proposed. Alternative: 24h (aggressive,
-  garage-like) or disabled-by-default. Cost to change: none technically
-  (config), but the default ships into fleets and muscle memory.
-  Review ask 1.
-- **Existence enforcement on `upload_part`** (and empty-parts rejection
-  on complete): client-visible semantics. Decide now, before any
-  client depends on the laissez-faire behavior. Review ask 2.
-- **Abort of an unknown upload id**: `NoSuchUpload` (S3-conformant;
-  s3s maps it to 404) vs idempotent success. AWS returns the error;
-  idempotent success is friendlier to blind cleanup scripts. Review
-  ask 3.
-- **GC placement and default**: daemon task default-on at 7 days, with
-  the fsck backstop -- vs default-off (operator opts in), vs fsck-only.
-  Review ask 4.
+### Decisions locked (owner sign-off 2026-07-31)
+- **TTL default**: 7 days, `[multipart] stale_ttl_days`, CLI flag wins,
+  0 disables.
+- **Existence enforcement**: yes, both -- `upload_part` fails
+  `NoSuchUpload` for unknown ids; `complete` rejects an empty parts
+  list.
+- **Abort of an unknown upload id**: `NoSuchUpload` (S3-conformant,
+  404 via s3s).
+- **GC placement**: daemon task, default-on, sweep `max(ttl/20, 1h)`;
+  fsck's `orphan_part` repair ships as the offline backstop.
 - **Upload record codec**: house fixed-width v1 style with golden
-  vectors, settled by 0002/0005/0006 precedent -- not re-asked.
+  vectors, settled by 0002/0005/0006 precedent -- was never re-asked.
 
 ### Known unknowns and how the plan absorbs them
 - s3s pagination semantics for `list_multipart_uploads` `delimiter` /
@@ -383,12 +383,8 @@ abort-vs-upload_part orphan window, GC reap + old-key reap, NoSuchUpload
 cases, empty-parts rejection, listing order/pagination, fsck
 orphan_part end-to-end.
 
-Review asks:
-1. TTL default: 7 days, 24 hours, or disabled-by-default?
-2. Enforce upload-record existence on `upload_part` + reject empty
-   `complete` -- yes/no?
-3. Abort of unknown upload id: `NoSuchUpload` or idempotent success?
-4. GC: daemon task default-on, default-off, or fsck-only?
+Review asks: none -- all four resolved 2026-07-31 (see Decisions
+locked).
 
 ---
 
