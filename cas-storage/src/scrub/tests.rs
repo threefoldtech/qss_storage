@@ -21,7 +21,7 @@ use super::records::walk_records;
 use super::{ScrubContext, disk::walk_disk};
 
 /// One store: a shared block store and a single namespace over it.
-fn store(dir: &TempDir) -> (Arc<SharedBlockStore>, CasFS) {
+pub(super) fn store(dir: &TempDir) -> (Arc<SharedBlockStore>, CasFS) {
     let path = dir.path();
     let shared = Arc::new(
         SharedBlockStore::new(
@@ -49,7 +49,7 @@ fn store(dir: &TempDir) -> (Arc<SharedBlockStore>, CasFS) {
 }
 
 /// Stores `data` under `bucket`/`key` and returns its (single) block id.
-async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) -> BlockId {
+pub(super) async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) -> BlockId {
     let id = fs.hasher().hash(&data);
     let len = data.len();
     let stream = AsyncByteStream::new(futures::stream::once(async move {
@@ -63,7 +63,7 @@ async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) -> BlockId {
 
 /// Writes an object record naming exactly `blocks`, without writing any of
 /// them: the counting rule is about the record, not the bytes.
-fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<BlockId>) {
+pub(super) fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<BlockId>) {
     fs.create_object_meta(
         bucket,
         key,
@@ -74,7 +74,7 @@ fn plant_object(fs: &CasFS, bucket: &str, key: &str, blocks: Vec<BlockId>) {
     .unwrap();
 }
 
-fn synthetic_id(seed: u8) -> BlockId {
+pub(super) fn synthetic_id(seed: u8) -> BlockId {
     BlockId::from([seed; MAX_BLOCKID_SIZE])
 }
 

@@ -8,30 +8,38 @@
 //! - [`records`]: what `_BLOCKS` says (the block records);
 //! - [`disk`]: what is actually on disk (the block files).
 //!
-//! Comparing those three is the passes' job (ADR 0005 component 4), not
-//! this module's. What lives here is the enumeration, and one rule it
-//! enforces on its own: the holder walk refuses on any incompleteness,
-//! because a recount over a partial holder set that then repairs frees live
-//! blocks. Everything else reports.
+//! [`passes`] compares those three and says what the differences mean;
+//! [`engine::run`] walks once, runs the passes and returns a [`report`].
+//! Repair is not here: this module only ever reads (ADR 0005 component 5
+//! owns the actions).
+//!
+//! One rule is enforced below the passes: the holder walk refuses on any
+//! incompleteness, because a recount over a partial holder set that then
+//! repairs frees live blocks. Everything else reports.
 //!
 //! The walkers live in the library rather than in the fsck binary so that
 //! the daemon's own store can be checked by the same code the tool uses,
 //! and so a future online mode can wrap them.
 
 pub mod disk;
+pub mod engine;
 pub mod findings;
 pub mod holders;
+pub mod passes;
 pub mod records;
+pub mod report;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cas::SharedBlockStore;
 use crate::metastore::MetaStore;
 
 pub use disk::{BlockFile, DiskWalk, ForeignPath, walk_disk};
+pub use engine::{ScrubError, ScrubOptions, run};
 pub use findings::{Finding, FindingClass, HolderRef, Severity};
 pub use holders::{ExpectedCounts, HolderEnumerationError, expected_counts, holders_of};
 pub use records::{RecordWalk, walk_records};
+pub use report::{Pass, Report, StoreRef, Summary, exit_code};
 
 /// What a walker needs from an opened store.
 ///
@@ -47,12 +55,34 @@ pub use records::{RecordWalk, walk_records};
 pub struct ScrubContext<'a> {
     namespace: &'a MetaStore,
     shared: &'a SharedBlockStore,
+    meta_root: Option<PathBuf>,
 }
 
 impl<'a> ScrubContext<'a> {
     /// Builds a context over an opened namespace and its block store.
     pub fn new(namespace: &'a MetaStore, shared: &'a SharedBlockStore) -> Self {
-        Self { namespace, shared }
+        Self {
+            namespace,
+            shared,
+            meta_root: None,
+        }
+    }
+
+    /// Records the metadata root, for the report to name.
+    ///
+    /// Optional because nothing in a walk needs it: the databases are
+    /// already open. It is the opener (the fsck binary) that knows which
+    /// path it was told to open, and an operator running several stores
+    /// needs the report to say which one this is.
+    #[must_use]
+    pub fn with_meta_root(mut self, meta_root: impl Into<PathBuf>) -> Self {
+        self.meta_root = Some(meta_root.into());
+        self
+    }
+
+    /// The metadata root, if the opener supplied it.
+    pub fn meta_root(&self) -> Option<&Path> {
+        self.meta_root.as_deref()
     }
 
     /// The namespace metadata store: bucket trees live here.

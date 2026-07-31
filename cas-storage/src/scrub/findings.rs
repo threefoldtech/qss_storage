@@ -36,7 +36,7 @@ pub enum Severity {
 /// What kind of thing was found. One variant per class the ADR 0005 passes
 /// can produce; the severity each carries by default is
 /// [`FindingClass::default_severity`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingClass {
     /// The record's rc is higher than the walked holder count. The expected
@@ -84,6 +84,51 @@ pub enum FindingClass {
 }
 
 impl FindingClass {
+    /// The name this class carries in both renderings.
+    ///
+    /// Must match what serde writes; the test below pins that, so the text
+    /// report and the JSON report can never drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingClass::RefcountOverCount => "refcount_over_count",
+            FindingClass::RefcountUnderCount => "refcount_under_count",
+            FindingClass::MissingBlockRecord => "missing_block_record",
+            FindingClass::UndecodableBlockRecord => "undecodable_block_record",
+            FindingClass::OrphanFile => "orphan_file",
+            FindingClass::OffDepthFile => "off_depth_file",
+            FindingClass::ForeignFile => "foreign_file",
+            FindingClass::SizeMismatch => "size_mismatch",
+            FindingClass::DanglingRecord => "dangling_record",
+            FindingClass::AdoptableDanglingRecord => "adoptable_dangling_record",
+            FindingClass::DegradedRecord => "degraded_record",
+            FindingClass::CorruptBlock => "corrupt_block",
+            FindingClass::HalfDeletedBucket => "half_deleted_bucket",
+            FindingClass::MultipartUpload => "multipart_upload",
+            FindingClass::HolderEnumerationFailed => "holder_enumeration_failed",
+            FindingClass::PostRepairRecountDirty => "post_repair_recount_dirty",
+        }
+    }
+
+    /// Every class, for exhaustive tests and for a `--help` that lists them.
+    pub const ALL: [FindingClass; 16] = [
+        FindingClass::RefcountOverCount,
+        FindingClass::RefcountUnderCount,
+        FindingClass::MissingBlockRecord,
+        FindingClass::UndecodableBlockRecord,
+        FindingClass::OrphanFile,
+        FindingClass::OffDepthFile,
+        FindingClass::ForeignFile,
+        FindingClass::SizeMismatch,
+        FindingClass::DanglingRecord,
+        FindingClass::AdoptableDanglingRecord,
+        FindingClass::DegradedRecord,
+        FindingClass::CorruptBlock,
+        FindingClass::HalfDeletedBucket,
+        FindingClass::MultipartUpload,
+        FindingClass::HolderEnumerationFailed,
+        FindingClass::PostRepairRecountDirty,
+    ];
+
     /// The severity this class carries unless a pass says otherwise.
     ///
     /// Encoded here rather than at each construction site so the ADR's
@@ -135,6 +180,24 @@ pub enum HolderRef {
         /// Position of the part within the upload.
         part_number: i64,
     },
+}
+
+impl std::fmt::Display for HolderRef {
+    /// One line, for the text report.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            HolderRef::Object { bucket, key } => write!(f, "object {bucket}/{key}"),
+            HolderRef::Part {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            } => write!(
+                f,
+                "part {part_number} of upload {upload_id} ({bucket}/{key})"
+            ),
+        }
+    }
 }
 
 /// One thing the scrub found.
@@ -272,6 +335,16 @@ mod tests {
         assert!(json.get("block").is_none(), "{json}");
         assert!(json.get("path").is_none(), "{json}");
         assert!(json.get("holders").is_none(), "{json}");
+    }
+
+    /// The text report and the JSON report name a class identically. Two
+    /// spellings of one name is a bug waiting for a grep to miss it.
+    #[test]
+    fn class_names_match_in_both_renderings() {
+        for class in FindingClass::ALL {
+            let json = serde_json::to_value(class).unwrap();
+            assert_eq!(json, serde_json::Value::String(class.as_str().to_string()));
+        }
     }
 
     /// A part holder names the upload, not just the object: two uploads of
