@@ -55,7 +55,13 @@ impl Stream for BufferedByteStream {
                     let mut buf_remainder = self.buffer.capacity() - self.buffer.len();
                     if bytes.len() < buf_remainder {
                         self.buffer.extend_from_slice(&bytes);
-                    } else if self.buffer.len() == buf_remainder {
+                    } else if bytes.len() == buf_remainder {
+                        // The frame fills the buffer exactly. This condition
+                        // once compared `self.buffer.len()` instead of
+                        // `bytes.len()`, so a frame LARGER than the remainder
+                        // arriving at a buffer that happened to be exactly
+                        // half full was appended whole -- emitting a block
+                        // larger than BLOCK_SIZE. See the regression test.
                         self.buffer.extend_from_slice(&bytes);
                         return Poll::Ready(Some(Ok(vec![mem::replace(
                             &mut self.buffer,
@@ -82,5 +88,71 @@ impl Stream for BufferedByteStream {
                 }
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+
+    /// Collects every emitted block from frames fed through the stream.
+    async fn blocks_from(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let s = AsyncByteStream::new(stream::iter(frames.into_iter().map(|f| Ok(Bytes::from(f)))));
+        let mut buffered = BufferedByteStream::new(s);
+        let mut out = Vec::new();
+        while let Some(item) = buffered.next().await {
+            out.extend(item.unwrap());
+        }
+        out
+    }
+
+    /// Regression test: a frame larger than the remaining buffer space,
+    /// arriving while the buffer is exactly half full, used to be appended
+    /// whole (the condition compared `self.buffer.len()` where `bytes.len()`
+    /// was meant) and emitted a block larger than BLOCK_SIZE. The write path
+    /// assumes no block exceeds BLOCK_SIZE.
+    #[tokio::test]
+    async fn oversized_frame_at_half_full_buffer_never_exceeds_block_size() {
+        let half = BLOCK_SIZE / 2;
+        // Frame 1 half-fills the buffer; frame 2 is bigger than the remainder
+        // (and bigger than the buffered length, dodging both comparisons).
+        let frames = vec![vec![1u8; half], vec![2u8; half + 100_000]];
+        let total: usize = frames.iter().map(Vec::len).sum();
+
+        let blocks = blocks_from(frames).await;
+
+        for (i, block) in blocks.iter().enumerate() {
+            assert!(
+                block.len() <= BLOCK_SIZE,
+                "block {i} is {} bytes, exceeding BLOCK_SIZE ({BLOCK_SIZE})",
+                block.len()
+            );
+        }
+        assert_eq!(
+            blocks.iter().map(Vec::len).sum::<usize>(),
+            total,
+            "no bytes may be lost or duplicated"
+        );
+    }
+
+    /// A frame that fills the buffer exactly emits exactly one full block.
+    #[tokio::test]
+    async fn exact_fill_emits_one_full_block() {
+        let half = BLOCK_SIZE / 2;
+        let blocks = blocks_from(vec![vec![1u8; half], vec![2u8; half]]).await;
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), BLOCK_SIZE);
+    }
+
+    /// A single frame spanning several blocks is split at BLOCK_SIZE.
+    #[tokio::test]
+    async fn long_frame_is_split_at_block_size() {
+        let blocks = blocks_from(vec![vec![3u8; 2 * BLOCK_SIZE + 123]]).await;
+        assert_eq!(
+            blocks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![BLOCK_SIZE, BLOCK_SIZE, 123]
+        );
     }
 }

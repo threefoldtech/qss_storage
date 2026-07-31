@@ -150,11 +150,19 @@ pub(super) async fn store_object(
                 }
                 Ok((false, _)) => {
                     // the block already exists, no need to write it to the storage.
+                    tracing::debug!(target: "cas_storage::locks", "Committing metadata transaction (block exists)");
+                    // A failed commit is a failed PUT, not a panic: the
+                    // refcount bump was not persisted, so nothing needs
+                    // compensation -- report and stop this block.
+                    if let Err(e) = Box::new(store_tx).commit() {
+                        if let Err(e) = tx.unbounded_send(Err(e.into())) {
+                            tracing::error!(error = %e, "Could not send commit error");
+                        }
+                        return;
+                    }
+
                     // No guard: we never transitioned to Pending.
                     fs.metrics.block_ignored();
-
-                    tracing::debug!(target: "cas_storage::locks", "Committing metadata transaction (block exists)");
-                    Box::new(store_tx).commit().unwrap();
 
                     if let Err(e) = tx.unbounded_send(Ok((idx, block_hash))) {
                         tracing::error!(error = %e, "Could not send block id");
@@ -164,7 +172,16 @@ pub(super) async fn store_object(
                 Ok((true, block)) => {
                     // COMMIT IMMEDIATELY to release lock
                     tracing::debug!(target: "cas_storage::locks", "Committing metadata transaction (new block)");
-                    Box::new(store_tx).commit().unwrap();
+                    // A failed commit here means no record was persisted and
+                    // no disk write has started (no guard is Pending yet);
+                    // there is nothing to clean up, and unwinding instead
+                    // would kill the connection task with cleanup skipped.
+                    if let Err(e) = Box::new(store_tx).commit() {
+                        if let Err(e) = tx.unbounded_send(Err(e.into())) {
+                            tracing::error!(error = %e, "Could not send commit error");
+                        }
+                        return;
+                    }
 
                     block
                 }
