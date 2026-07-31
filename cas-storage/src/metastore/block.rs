@@ -120,45 +120,64 @@ impl From<[u8; MAX_BLOCKID_SIZE]> for BlockId {
     }
 }
 
+/// Builds the on-disk path of a block: the ADR 0006 layout.
+///
+/// ```text
+/// <root>/<hex b0>/.../<hex b(depth-1)>/<full-hex id>
+/// ```
+///
+/// Directory names are single hex bytes of the id's leading bytes (2 chars
+/// each); the filename is the full-width lowercase hex of the id (32 or 64
+/// chars), so dir names and file names can never collide. A file's NAME
+/// identifies its block, so any depth is correct -- the depth choice is
+/// performance placement only, and this function is pure: same id + depth =
+/// same path, always.
+///
+/// `depth` is clamped to `1..=id.len()`. A corrupt record depth therefore
+/// yields a well-formed path that simply is not occupied, and the read
+/// surfaces "block file missing" instead of a panic or an aliased path.
+pub fn block_disk_path(id: &BlockId, depth: u8, mut root: PathBuf) -> PathBuf {
+    let depth = (depth as usize).clamp(1, id.len());
+    for byte in &id.as_slice()[..depth] {
+        root.push(hex_string(&[*byte]));
+    }
+    root.push(id.to_hex());
+    root
+}
+
 /// `Block` represents metadata about a stored data block in the content-addressable storage system.
 ///
 /// Each Block contains:
 /// - The size of the actual data
-/// - A path to locate the block in the storage hierarchy
+/// - The fanout depth its file was placed at (the path itself is derived:
+///   see [`block_disk_path`])
 /// - A reference count (rc) tracking how many objects reference this block
-///
-/// The path is stored as a variable-length byte array, which could be optimized in the future.
-// TODO: this can be optimized by making path a `[u8;BLOCKID_SIZE]` and keeping track of a len u8
 #[derive(Debug)]
 pub struct Block {
     /// Size of the block data in bytes
     size: usize,
-    /// Path to the block in the storage hierarchy
-    path: Vec<u8>,
+    /// Fanout depth of the block file, `1..=width(id)`. Pure placement: the
+    /// file's name is the full id at every depth.
+    depth: u8,
     /// Reference count - how many objects reference this block
     rc: usize,
 }
 
-/// Serializes a Block (format v1):
+/// Serializes a Block (format v2):
 ///
 /// ```text
-/// size u64 | path_len u8 | path[path_len] | rc u64
+/// size u64 | depth u8 | rc u64
 /// ```
+///
+/// Format v1 stored a variable-length path allocated from the `_PATHS` tree;
+/// ADR 0006 replaced that with the derived path scheme, and the stored path
+/// bytes with the one-byte depth. The store header version gates the break.
 impl From<&Block> for Vec<u8> {
-    // the debug_assert below bounds the only narrowing cast
-    #[allow(clippy::cast_possible_truncation)]
     fn from(b: &Block) -> Self {
-        // The path length is a single byte: a path is a prefix of a block
-        // hash, so it is at most one full hash width (32) < 256 bytes.
-        debug_assert!(
-            b.path.len() <= u8::MAX as usize,
-            "block path must fit a single length byte"
-        );
-        let mut out = Vec::with_capacity(8 + 1 + b.path.len() + 8);
+        let mut out = Vec::with_capacity(8 + 1 + 8);
 
         put_len(&mut out, b.size);
-        out.push(b.path.len() as u8);
-        out.extend_from_slice(&b.path);
+        out.push(b.depth);
         put_len(&mut out, b.rc);
         out
     }
@@ -171,26 +190,26 @@ impl TryFrom<&[u8]> for Block {
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         let mut r = Reader::new("Block", value);
         let size = r.len("size")?;
-        let path_len = r.u8("path_len")? as usize;
-        let path = r.bytes("path", path_len)?.to_vec();
+        let depth = r.u8("depth")?;
         let rc = r.len("rc")?;
         r.finish()?;
 
-        Ok(Block { size, path, rc })
+        Ok(Block { size, depth, rc })
     }
 }
 
 impl Block {
-    /// Creates a new Block with the specified size and path, initializing the reference count to 1
+    /// Creates a new Block with the specified size and fanout depth,
+    /// initializing the reference count to 1
     ///
     /// # Arguments
     /// * `size` - The size of the block data in bytes
-    /// * `path` - The path to locate the block in the storage hierarchy
+    /// * `depth` - The fanout depth the block file was placed at
     ///
     /// # Returns
     /// A new Block instance with reference count set to 1
-    pub fn new(size: usize, path: Vec<u8>) -> Self {
-        Self { size, path, rc: 1 }
+    pub fn new(size: usize, depth: u8) -> Self {
+        Self { size, depth, rc: 1 }
     }
 
     /// Returns the size of the block data in bytes
@@ -198,32 +217,22 @@ impl Block {
         self.size
     }
 
-    /// Returns a reference to the path of the block
-    pub fn path(&self) -> &[u8] {
-        &self.path
+    /// Returns the fanout depth the block file was placed at
+    pub fn depth(&self) -> u8 {
+        self.depth
     }
 
-    /// Constructs the full filesystem path to the block
-    ///
-    /// This method converts the internal path representation to a filesystem path
-    /// by creating a directory hierarchy based on the block's path bytes.
+    /// Constructs the full filesystem path to the block from its recorded
+    /// depth. GET and DELETE use this -- they never probe.
     ///
     /// # Arguments
+    /// * `id` - The block's address (the tree key this record was read under)
     /// * `root` - The root directory where blocks are stored
     ///
     /// # Returns
     /// The complete filesystem path to the block
-    pub fn disk_path(&self, mut root: PathBuf) -> PathBuf {
-        // path has at least len 1
-        let dirs = &self.path[..self.path.len() - 1];
-        for byte in dirs {
-            root.push(hex_string(&[*byte]));
-        }
-        root.push(format!(
-            "_{}",
-            hex_string(&[self.path[self.path.len() - 1]])
-        ));
-        root
+    pub fn disk_path(&self, id: &BlockId, root: PathBuf) -> PathBuf {
+        block_disk_path(id, self.depth, root)
     }
 
     /// Returns the current reference count of the block
@@ -335,32 +344,24 @@ mod tests {
         assert_eq!(wide.to_hex().len(), MAX_BLOCKID_SIZE * 2);
     }
 
-    /// Block with a two byte path (format v1).
+    /// Block at fanout depth 2 (format v2).
     #[rustfmt::skip]
-    const GOLDEN_SHORT_PATH: &[u8] = &[
+    const GOLDEN_DEPTH_2: &[u8] = &[
         // size = 4096
         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        // path_len = 2
+        // depth = 2
         0x02,
-        // path
-        0xab, 0xcd,
         // rc = 3
         0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    /// Block whose path is a full 32 byte hash -- the widest a path can be,
-    /// and the reason the length stays a single byte.
+    /// Block at the deepest fanout a 32 byte id allows.
     #[rustfmt::skip]
-    const GOLDEN_FULL_PATH: &[u8] = &[
+    const GOLDEN_DEPTH_MAX: &[u8] = &[
         // size = 0x01020304
         0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
-        // path_len = 32
+        // depth = 32
         0x20,
-        // path
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         // rc = 10
         0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
@@ -368,27 +369,27 @@ mod tests {
     fn golden_blocks() -> Vec<(&'static str, Block, &'static [u8])> {
         vec![
             (
-                "short_path",
+                "depth_2",
                 Block {
                     size: 4096,
-                    path: vec![0xab, 0xcd],
+                    depth: 2,
                     rc: 3,
                 },
-                GOLDEN_SHORT_PATH,
+                GOLDEN_DEPTH_2,
             ),
             (
-                "full_path",
+                "depth_max",
                 Block {
                     size: 0x0102_0304,
-                    path: vec![0xff; MAX_BLOCKID_SIZE],
+                    depth: MAX_BLOCKID_SIZE as u8,
                     rc: 10,
                 },
-                GOLDEN_FULL_PATH,
+                GOLDEN_DEPTH_MAX,
             ),
         ]
     }
 
-    /// Format v1 pin: serialization must produce exactly these bytes.
+    /// Format v2 pin: serialization must produce exactly these bytes.
     #[test]
     fn golden_serialization() {
         for (name, block, expected) in golden_blocks() {
@@ -396,13 +397,13 @@ mod tests {
         }
     }
 
-    /// Format v1 pin: the same bytes must decode to the same fields.
+    /// Format v2 pin: the same bytes must decode to the same fields.
     #[test]
     fn golden_deserialization() {
         for (name, block, expected) in golden_blocks() {
             let decoded = Block::try_from(expected).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(decoded.size(), block.size(), "{name} size");
-            assert_eq!(decoded.path(), block.path(), "{name} path");
+            assert_eq!(decoded.depth(), block.depth(), "{name} depth");
             assert_eq!(decoded.rc(), block.rc(), "{name} rc");
         }
     }
@@ -410,10 +411,10 @@ mod tests {
     #[test]
     fn malformed_block_records() {
         // Truncated at every field boundary.
-        for cut in [0usize, 1, 7, 8, 9, 10, 11, 18] {
+        for cut in [0usize, 1, 7, 8, 9, 16] {
             assert!(
                 matches!(
-                    Block::try_from(&GOLDEN_SHORT_PATH[..cut]),
+                    Block::try_from(&GOLDEN_DEPTH_2[..cut]),
                     Err(FsError::Truncated {
                         record: "Block",
                         ..
@@ -423,31 +424,8 @@ mod tests {
             );
         }
 
-        // A path length longer than the record.
-        let mut long_path = GOLDEN_SHORT_PATH.to_vec();
-        long_path[8] = 0xff;
-        assert!(matches!(
-            Block::try_from(long_path.as_slice()),
-            Err(FsError::Truncated {
-                record: "Block",
-                ..
-            })
-        ));
-
-        // A path length shorter than the record: the leftover bytes are not
-        // silently swallowed.
-        let mut short_path = GOLDEN_SHORT_PATH.to_vec();
-        short_path[8] = 0x01;
-        assert_eq!(
-            Block::try_from(short_path.as_slice()).unwrap_err(),
-            FsError::TrailingBytes {
-                record: "Block",
-                extra: 1
-            }
-        );
-
         // One byte too many.
-        let mut extra = GOLDEN_SHORT_PATH.to_vec();
+        let mut extra = GOLDEN_DEPTH_2.to_vec();
         extra.push(0);
         assert_eq!(
             Block::try_from(extra.as_slice()).unwrap_err(),
@@ -455,6 +433,45 @@ mod tests {
                 record: "Block",
                 extra: 1
             }
+        );
+    }
+
+    /// The path scheme: dirs are single hex bytes of the id's prefix, the
+    /// filename is the full-width hex of the id.
+    #[test]
+    fn disk_path_layout() {
+        let mut bytes = [0u8; BLOCKID_SIZE];
+        bytes[0] = 0xab;
+        bytes[1] = 0x01;
+        bytes[2] = 0xff;
+        let id = BlockId::from(bytes);
+        let hex = id.to_hex();
+
+        let d1 = block_disk_path(&id, 1, PathBuf::from("/data/blocks"));
+        assert_eq!(d1, PathBuf::from(format!("/data/blocks/ab/{hex}")));
+
+        let d3 = block_disk_path(&id, 3, PathBuf::from("/data/blocks"));
+        assert_eq!(d3, PathBuf::from(format!("/data/blocks/ab/01/ff/{hex}")));
+
+        // Any depth locates the same block by name: only the dir chain moves.
+        assert_eq!(d1.file_name(), d3.file_name());
+    }
+
+    /// A depth of 0 (which no writer produces) and a depth beyond the id
+    /// width (a corrupt record) both clamp to a well-formed path instead of
+    /// panicking or aliasing another block's path.
+    #[test]
+    fn disk_path_clamps_out_of_range_depths() {
+        let id = BlockId::from([0x11u8; BLOCKID_SIZE]);
+        let root = PathBuf::from("/r");
+
+        assert_eq!(
+            block_disk_path(&id, 0, root.clone()),
+            block_disk_path(&id, 1, root.clone())
+        );
+        assert_eq!(
+            block_disk_path(&id, u8::MAX, root.clone()),
+            block_disk_path(&id, BLOCKID_SIZE as u8, root)
         );
     }
 }

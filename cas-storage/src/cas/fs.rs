@@ -4,12 +4,13 @@ use std::{io, path::PathBuf};
 
 use super::async_fs::{AsyncFileSystem, RealAsyncFs};
 use super::multipart::MultiPart;
+use super::placement::BlockPlacement;
 use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
-    BaseMetaTree, BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore, HeaderSpec,
-    MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
+    BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore, HeaderSpec, MetaError,
+    MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
 use super::byte_stream::AsyncByteStream;
@@ -21,6 +22,10 @@ pub struct CasFS {
     pub(super) namespace: MetaStore,
     pub(super) shared: Arc<SharedBlockStore>,
     pub(super) root: PathBuf,
+    /// Depth placement for new block files (ADR 0006). Lives here while the
+    /// blocks root is still per-CasFS; moves to `SharedBlockStore` together
+    /// with the root.
+    pub(super) placement: Arc<BlockPlacement>,
     pub(super) metrics: SharedMetrics,
     pub(super) verify_on_read: bool,
 }
@@ -140,6 +145,7 @@ impl CasFS {
             async_fs: Box::new(RealAsyncFs),
             namespace,
             shared,
+            placement: Arc::new(BlockPlacement::new(root.clone())),
             root,
             metrics,
             verify_on_read,
@@ -207,10 +213,6 @@ impl CasFS {
     /// for the whole object.
     pub fn verify_on_read(&self) -> bool {
         self.verify_on_read
-    }
-
-    pub(super) fn path_tree(&self) -> Arc<dyn BaseMetaTree> {
-        self.shared.path_tree()
     }
 
     pub fn fs_root(&self) -> &PathBuf {
@@ -571,7 +573,7 @@ mod tests {
         assert_eq!(obj.size(), test_data_len as u64);
         assert_eq!(obj.blocks().len(), 1);
 
-        // Verify block & path was stored
+        // Verify block was stored and its file sits at the derived path
         let block_tree = fs.shared.block_tree();
         assert!(block_tree.len().unwrap() > 0);
         let stored_block = block_tree
@@ -580,7 +582,12 @@ mod tests {
             .unwrap();
         assert_eq!(stored_block.size(), test_data_len);
         assert_eq!(stored_block.rc(), 1);
-        assert!(fs.path_tree().contains_key(stored_block.path()).unwrap());
+        assert!(
+            stored_block
+                .disk_path(&obj.blocks()[0], fs.fs_root().clone())
+                .is_file(),
+            "block file must exist at the depth-derived path"
+        );
 
         // Store the same data again with different key
         // - The same block should be returned
@@ -603,6 +610,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored_block.rc(), 2);
+    }
+
+    /// ADR 0006 orphan healing, end to end: a file named like the block,
+    /// hand-planted on the id's directory chain at a non-policy depth (crash
+    /// residue of an earlier attempt), is adopted by a later PUT -- the
+    /// record stores the orphan's depth and the file ends up with the real
+    /// bytes at that same path.
+    #[tokio::test]
+    async fn test_orphan_block_file_is_healed_in_place() {
+        let (fs, _dir) = setup_test_fs(StorageEngine::Fjall, Hasher::Blake3W32);
+        const BUCKET: &str = "test-bucket";
+        fs.create_bucket(BUCKET).unwrap();
+
+        let data = b"orphan heal payload".repeat(64).to_vec();
+        let id = fs.hasher().hash(&data);
+
+        // Plant garbage at depth 2 on the id's chain, as a torn write would.
+        let orphan_path = crate::metastore::block_disk_path(&id, 2, fs.fs_root().clone());
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"torn garbage").unwrap();
+
+        let len = data.len();
+        let stream =
+            AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data.clone())) }));
+        let obj = fs
+            .store_single_object_and_meta(BUCKET, "healed", stream, len)
+            .await
+            .unwrap();
+        assert_eq!(obj.blocks(), [id]);
+
+        let block = fs
+            .shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.depth(), 2, "record must adopt the orphan's depth");
+        let bytes = std::fs::read(&orphan_path).unwrap();
+        assert_eq!(
+            fs.hasher().hash(&bytes),
+            id,
+            "the orphan path must now hold the real block bytes"
+        );
     }
 
     /// The well known MD5 of zero bytes, which is the ETag S3 clients expect
@@ -773,13 +823,14 @@ mod tests {
         let exists = fs.key_exists(bucket_name, key).unwrap();
         assert!(exists);
 
-        // verify blocks and path exist
+        // verify blocks and their files exist
         let block_tree = fs.shared.block_tree();
         let mut stored_paths = Vec::new();
         for id in obj.blocks() {
             let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            assert!(fs.path_tree().contains_key(block.path()).unwrap());
-            stored_paths.push(block.path().to_vec());
+            let path = block.disk_path(id, fs.fs_root().clone());
+            assert!(path.is_file(), "block file must exist before delete");
+            stored_paths.push(path);
         }
 
         // Delete object
@@ -794,9 +845,9 @@ mod tests {
         for id in obj.blocks() {
             assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
         }
-        // Verify paths were cleaned up
+        // Verify the files are gone too
         for path in stored_paths {
-            assert!(!fs.path_tree().contains_key(&path).unwrap());
+            assert!(!path.exists(), "block file must be unlinked by delete");
         }
     }
 
@@ -991,7 +1042,7 @@ mod tests {
         for id in obj.blocks() {
             assert_eq!(id.len(), hasher.width() as usize);
             let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            let path = block.disk_path(fs.fs_root().clone());
+            let path = block.disk_path(id, fs.fs_root().clone());
             let on_disk = std::fs::read(&path).unwrap();
             assert_eq!(on_disk.len(), block.size());
             assert_eq!(
@@ -1043,7 +1094,7 @@ mod tests {
             .get_block(victim.as_slice())
             .unwrap()
             .unwrap();
-        let path = block.disk_path(fs.fs_root().clone());
+        let path = block.disk_path(&victim, fs.fs_root().clone());
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();

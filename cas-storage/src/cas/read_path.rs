@@ -30,7 +30,7 @@ pub(super) fn get_object_paths(
             .get_block(block.as_slice())?
             .ok_or(MetaError::BlockNotFound)?;
         paths.push((
-            block_meta.disk_path(fs.fs_root().clone()),
+            block_meta.disk_path(block, fs.fs_root().clone()),
             block_meta.size(),
         ));
     }

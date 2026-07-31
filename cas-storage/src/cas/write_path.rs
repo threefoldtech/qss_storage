@@ -126,6 +126,13 @@ pub(super) async fn store_object(
                 false
             };
 
+            // Choose the fanout depth up front (probe for orphans, then the
+            // placement policy). Only the new-block branch of write_block
+            // uses it -- a dedup hit keeps the recorded depth. The reorder in
+            // ADR 0006's write protocol moves this after the dedup check so
+            // hits skip the probe entirely.
+            let depth = fs.placement.choose_depth(&block_hash);
+
             // begin the transaction
             // there are two main things we need to do here:
             // 1. write the meta to the database
@@ -139,7 +146,7 @@ pub(super) async fn store_object(
             // IMPORTANT: In multi-user mode, use shared MetaStore for block transactions
             // to ensure blocks are written to the shared _BLOCKS tree, not user-specific tree
             let mut store_tx = fs.shared.meta_store().begin_transaction();
-            let write_meta_result = store_tx.write_block(block_hash, data_len, key_has_block);
+            let write_meta_result = store_tx.write_block(block_hash, data_len, key_has_block, depth);
 
             let block = match write_meta_result {
                 Err(e) => {
@@ -195,7 +202,7 @@ pub(super) async fn store_object(
 
             // write the actual block to disk
             // if the disk operation fails, we must manually rollback (compensating transaction)
-            let block_path = block.disk_path(fs.fs_root().clone());
+            let block_path = block.disk_path(&block_hash, fs.fs_root().clone());
 
             // Helper to cleanup on failure
             let cleanup_on_failure = || {

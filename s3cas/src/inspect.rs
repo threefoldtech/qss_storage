@@ -10,7 +10,7 @@
 //!   per bucket, one key per object.
 //! - `<meta_root>/blocks/db` -- the *blocks* DB, built by
 //!   `SharedBlockStore::new` from `meta_path.join("blocks")` with `db` pushed
-//!   on top. It holds `_BLOCKS`, `_PATHS` and `_MULTIPART_PARTS`, shared by
+//!   on top. It holds `_BLOCKS` and `_MULTIPART_PARTS`, shared by
 //!   every namespace.
 //!
 //! So `num-keys <bucket>` counts keys in a bucket tree and must open the
@@ -295,7 +295,10 @@ mod tests {
         assert_eq!(labels, vec!["namespace DB", "blocks DB"]);
         for entry in &headers {
             assert_eq!(entry.header.hasher(), Hasher::Blake3W32);
-            assert_eq!(entry.header.version(), 1);
+            assert_eq!(
+                entry.header.version(),
+                cas_storage::metastore::store_header::STORE_HEADER_VERSION
+            );
             let text = entry.render();
             assert!(text.contains("magic:      QSST"), "{text}");
             assert!(text.contains("algo:       blake3 (1)"), "{text}");

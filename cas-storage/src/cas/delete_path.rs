@@ -1,28 +1,17 @@
-use faster_hex::hex_string;
-
 use super::fs::CasFS;
 use crate::metastore::MetaError;
 
 #[tracing::instrument(skip(fs), fields(bucket = %bucket, key = %key, blocks_deleted))]
 pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result<(), MetaError> {
-    let path_map = fs.path_tree();
-
     let block_tree = fs.shared.block_tree();
     let blocks_to_delete = fs.namespace.delete_object(bucket, key, &block_tree)?;
 
     tracing::Span::current().record("blocks_deleted", blocks_to_delete.len());
 
-    for block in blocks_to_delete {
-        async_fs::remove_file(block.disk_path(fs.fs_root().clone()))
+    for (block_id, block) in blocks_to_delete {
+        async_fs::remove_file(block.disk_path(&block_id, fs.fs_root().clone()))
             .await
             .expect("Could not delete file");
-        if let Err(e) = path_map.remove(block.path()) {
-            tracing::error!(
-                path = %hex_string(block.path()),
-                error = %e,
-                "Could not unlink path from path map"
-            );
-        };
     }
 
     Ok(())

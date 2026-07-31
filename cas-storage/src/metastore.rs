@@ -9,7 +9,7 @@ pub mod store_header;
 mod stores;
 mod traits;
 
-pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE};
+pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE, block_disk_path};
 pub use bucket_meta::BucketMeta;
 pub use content_hash::{CONTENT_HASH_SIZE, ContentHash};
 pub use errors::{FsError, MetaError};

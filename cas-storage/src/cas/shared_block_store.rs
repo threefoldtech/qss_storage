@@ -3,19 +3,19 @@ use std::sync::Arc;
 
 use crate::hasher::Hasher;
 use crate::metastore::{
-    BaseMetaTree, BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
+    BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
 };
 
 use super::{StorageEngine, multipart::MultiPartTree};
 
-/// SharedBlockStore manages the shared block metadata (_BLOCKS, _PATHS, and _MULTIPART_PARTS trees)
-/// that is accessed by all users for block refcounting, path allocation, and multipart uploads.
+/// SharedBlockStore manages the shared block metadata (the _BLOCKS and
+/// _MULTIPART_PARTS trees) that is accessed by all users for block
+/// refcounting and multipart uploads.
 ///
 /// This is created once at startup and shared across all CasFS instances.
 pub struct SharedBlockStore {
     meta_store: Arc<MetaStore>,
     block_tree: Arc<BlockTree>,
-    path_tree: Arc<dyn BaseMetaTree>,
     multipart_tree: Arc<MultiPartTree>,
     header: StoreHeader,
     hasher: Hasher,
@@ -60,14 +60,12 @@ impl SharedBlockStore {
         };
 
         let block_tree = meta_store.get_block_tree()?;
-        let path_tree = meta_store.get_path_tree()?;
         let multipart_tree_base = meta_store.get_tree("_MULTIPART_PARTS")?;
         let multipart_tree = MultiPartTree::new(multipart_tree_base);
 
         Ok(Self {
             meta_store: Arc::new(meta_store),
             block_tree: Arc::new(block_tree),
-            path_tree,
             multipart_tree: Arc::new(multipart_tree),
             header,
             hasher: header.hasher(),
@@ -88,11 +86,6 @@ impl SharedBlockStore {
     /// Get a reference to the shared block tree
     pub fn block_tree(&self) -> Arc<BlockTree> {
         Arc::clone(&self.block_tree)
-    }
-
-    /// Get a reference to the shared path tree
-    pub fn path_tree(&self) -> Arc<dyn BaseMetaTree> {
-        Arc::clone(&self.path_tree)
     }
 
     /// Get a reference to the shared multipart tree

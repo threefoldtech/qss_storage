@@ -55,7 +55,13 @@ pub const STORE_HEADER_SIZE: usize = 32;
 pub const STORE_HEADER_MAGIC: [u8; 4] = *b"QSST";
 
 /// Format version this build writes and is willing to open.
-pub const STORE_HEADER_VERSION: u16 = 1;
+///
+/// v1: ADR 0002 -- BLAKE3 addressing, u64 on-disk fields, this header.
+/// v2: ADR 0006 -- block records store a fanout depth instead of allocated
+///     path bytes; the `_PATHS` tree no longer exists. A v1 store would be
+///     misread (its block records do not decode as v2), so it is refused at
+///     open. No migration exists: no deployed v1 store carries data.
+pub const STORE_HEADER_VERSION: u16 = 2;
 
 /// File name of the sidecar copy written next to the db directory at
 /// creation. Recovery from it is a manual operation.
@@ -387,11 +393,11 @@ mod tests {
     /// A header created with the default spec at a pinned timestamp, byte for
     /// byte. Changing this vector changes the on-disk format.
     ///
-    /// magic "QSST" | version 1 | algo 1 (blake3) | width 32 |
+    /// magic "QSST" | version 2 | algo 1 (blake3) | width 32 |
     /// created_at 0x0000000068000001 | 16 zero bytes
     const GOLDEN: [u8; STORE_HEADER_SIZE] = [
         0x51, 0x53, 0x53, 0x54, // "QSST"
-        0x01, 0x00, // version 1
+        0x02, 0x00, // version 2 (ADR 0006 block record format)
         0x01, // algo: blake3
         0x20, // width: 32
         0x01, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00, // created_at
@@ -468,14 +474,24 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         let mut raw = GOLDEN;
-        raw[4..6].copy_from_slice(&2u16.to_le_bytes());
+        raw[4..6].copy_from_slice(&3u16.to_le_bytes());
         let err = StoreHeader::from_bytes(&raw).unwrap_err();
-        assert_eq!(err, StoreHeaderError::UnsupportedVersion(2));
+        assert_eq!(err, StoreHeaderError::UnsupportedVersion(3));
         assert!(
             err.to_string()
-                .contains("unsupported QSST store format version 2"),
+                .contains("unsupported QSST store format version 3"),
             "{err}"
         );
+    }
+
+    /// The migration gate for ADR 0006's block record change: a v1 store
+    /// must be refused at open, not misread.
+    #[test]
+    fn rejects_the_previous_version() {
+        let mut raw = GOLDEN;
+        raw[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let err = StoreHeader::from_bytes(&raw).unwrap_err();
+        assert_eq!(err, StoreHeaderError::UnsupportedVersion(1));
     }
 
     #[test]
@@ -663,10 +679,10 @@ mod tests {
     #[test]
     fn refuses_a_doctored_version() {
         let mut raw = GOLDEN;
-        raw[4..6].copy_from_slice(&2u16.to_le_bytes());
+        raw[4..6].copy_from_slice(&3u16.to_le_bytes());
         let msg = refusal_for(raw.to_vec());
         assert!(
-            msg.contains("unsupported QSST store format version 2"),
+            msg.contains("unsupported QSST store format version 3"),
             "{msg}"
         );
     }

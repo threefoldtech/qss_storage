@@ -11,6 +11,7 @@ mod buffered_byte_stream;
 pub mod byte_stream;
 mod delete_path;
 pub mod fs;
+mod placement;
 mod read_path;
 mod write_path;
 

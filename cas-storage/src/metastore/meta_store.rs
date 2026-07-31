@@ -21,7 +21,6 @@ pub struct MetaStore {
 /// These constants define the names of the special trees used internally
 const DEFAULT_BUCKET_TREE: &str = "_BUCKETS";
 const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
-const DEFAULT_PATH_TREE: &str = "_PATHS";
 
 impl MetaStore {
     /// Creates a new MetaStore instance with the given store implementation.
@@ -177,16 +176,6 @@ impl MetaStore {
         self.store.tree_open(name)
     }
 
-    /// Returns the path metadata tree.
-    ///
-    /// This tree is used to store file path metadata and path-related information.
-    ///
-    /// # Returns
-    /// A tree instance or an error
-    pub fn get_path_tree(&self) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
-        self.store.tree_open(DEFAULT_PATH_TREE)
-    }
-
     /// Checks if a bucket with the given name exists.
     ///
     /// # Arguments
@@ -232,7 +221,7 @@ impl MetaStore {
     /// [`MetaError::ReservedBucketName`] for a name starting with `_`. A
     /// bucket becomes a tree of its own name, so such a bucket would collide
     /// with the store's internal trees (`_STORE_HEADER`, `_BUCKETS`,
-    /// `_BLOCKS`, `_PATHS`, `_MULTIPART_PARTS`) and hand a client the store's
+    /// `_BLOCKS`, `_MULTIPART_PARTS`) and hand a client the store's
     /// own bookkeeping. S3 bucket naming forbids these names anyway; this is
     /// the store enforcing it for every caller, respd included.
     pub fn insert_bucket(&self, bucket_name: &str, raw_bucket: Vec<u8>) -> Result<(), MetaError> {
@@ -329,7 +318,9 @@ impl MetaStore {
     /// * `key` - The key of the object to delete
     ///
     /// # Returns
-    /// A vector of Block objects that should be physically deleted, or an error
+    /// The `(BlockId, Block)` pairs that should be physically deleted -- the
+    /// id is returned alongside because the file path is derived from it
+    /// (see `block_disk_path`) -- or an error
     ///
     /// # Note
     /// This method currently handles reference counting and block management directly.
@@ -345,7 +336,7 @@ impl MetaStore {
         bucket: &str,
         key: &str,
         block_tree: &BlockTree,
-    ) -> Result<Vec<Block>, MetaError> {
+    ) -> Result<Vec<(BlockId, Block)>, MetaError> {
         let bucket_tree = self.get_bucket_ext(bucket)?;
 
         // Get the object metadata
@@ -355,7 +346,7 @@ impl MetaStore {
         };
 
         let obj = Object::try_from(&*raw_object)?;
-        let mut to_delete: Vec<Block> = Vec::with_capacity(obj.blocks().len());
+        let mut to_delete: Vec<(BlockId, Block)> = Vec::with_capacity(obj.blocks().len());
 
         tracing::debug!(
             bucket = bucket,
@@ -381,7 +372,7 @@ impl MetaStore {
                             "Block rc==1: deleting block and marking for file deletion"
                         );
                         block_tree.remove(block_id.as_slice())?;
-                        to_delete.push(block);
+                        to_delete.push((*block_id, block));
                     } else {
                         // Otherwise decrement the reference count
                         let old_rc = block.rc();
@@ -453,7 +444,6 @@ impl Debug for MetaStore {
             .field("store", &"<Store>")
             .field("bucket_tree_name", &DEFAULT_BUCKET_TREE)
             .field("block_tree_name", &DEFAULT_BLOCK_TREE)
-            .field("path_tree_name", &DEFAULT_PATH_TREE)
             .field("inlined_metadata_size", &self.inlined_metadata_size)
             .finish()
     }
@@ -603,15 +593,20 @@ impl Transaction {
         self.backend.rollback();
     }
 
-    /// Writes a block to the database, handling reference counting and path creation.
+    /// Writes a block to the database, handling reference counting.
     ///
-    /// This method either creates a new block or updates an existing one's reference count.
-    /// For new blocks, it also creates the necessary path entries.
+    /// This method either creates a new block or updates an existing one's
+    /// reference count. The existence check and the mutation happen on this
+    /// transaction, so committing makes them one atomic read-modify-write.
     ///
     /// # Arguments
     /// * `block_hash` - The hash of the block to write
     /// * `data_len` - The length of the block data
     /// * `key_has_block` - Whether the key already has this block
+    /// * `depth` - The fanout depth the caller chose for the block file
+    ///   (see `cas::placement`); recorded on new blocks, ignored on a dedup
+    ///   hit -- the existing record's depth stands, since that is where the
+    ///   file is.
     ///
     /// # Returns
     /// A tuple containing:
@@ -622,6 +617,7 @@ impl Transaction {
         block_hash: BlockId,
         data_len: usize,
         key_has_block: bool,
+        depth: u8,
     ) -> Result<(bool, Block), MetaError> {
         // Check if the block already exists
         match self
@@ -660,63 +656,18 @@ impl Transaction {
 
                 Ok((false, block))
             }
-            // Block doesn't exist, create it
+            // Block doesn't exist, create it at the caller's chosen depth.
+            // The path is derived from the id and this depth
+            // (`block_disk_path`), so there is nothing to allocate: the
+            // `_PATHS` tree and its prefix allocator are gone (ADR 0006).
             None => {
-                // Find the shortest prefix of the hash that is not already
-                // claimed by a different block; that prefix becomes this
-                // block's on-disk path. The full-width prefix is part of the
-                // search (it was not, which is how prefix exhaustion used to
-                // leave idx at 0 and write an empty path that later panicked
-                // in Block::disk_path).
-                let width = block_hash.len();
-                let mut idx = 0;
-                for index in 1..=width {
-                    match self
-                        .backend
-                        .get(DEFAULT_PATH_TREE, &block_hash.as_slice()[..index])
-                    {
-                        Ok(Some(existing)) => {
-                            // The full-width key can only be held by this very
-                            // hash, since a path entry stores the hash that
-                            // owns it. Then the path is already ours to use.
-                            if index == width && existing == block_hash.as_slice() {
-                                idx = index;
-                            }
-                            continue;
-                        }
-                        Ok(None) => {
-                            idx = index;
-                            break;
-                        }
-                        Err(e) => return Err(MetaError::OtherDBError(e.to_string())),
-                    }
-                }
-
-                if idx == 0 {
-                    // Every prefix up to and including the full hash is taken
-                    // by another hash. For a real hash this cannot happen: the
-                    // full-width prefix is the hash itself, so a different hash
-                    // holding it would be a hash collision. Refuse rather than
-                    // write a zero-length path.
-                    return Err(MetaError::OtherDBError(format!(
-                        "path tree exhausted for block {}: every prefix is taken by another hash",
-                        block_hash.to_hex()
-                    )));
-                }
-
-                let path = block_hash.as_slice()[..idx].to_vec();
-
-                // insert this new path
-                self.backend
-                    .insert(DEFAULT_PATH_TREE, &path, block_hash.as_slice().to_vec())?;
-
-                // insert this new block
-                let block = Block::new(data_len, path);
+                let block = Block::new(data_len, depth);
 
                 tracing::debug!(
                     block_hash = %block_hash.to_hex(),
                     rc = block.rc(),
                     data_len = data_len,
+                    depth = depth,
                     key_has_block = key_has_block,
                     "Creating new block with rc=1"
                 );
@@ -778,59 +729,44 @@ mod tests {
         (MetaStore::new(store, None), dir)
     }
 
-    /// Claims every prefix of `hash` of length `1..=upto` in the path tree for
-    /// a *different* block, which is what a run of unlucky collisions would
-    /// leave behind.
-    fn claim_prefixes(meta: &MetaStore, hash: &BlockId, upto: usize) {
-        let path_tree = meta.get_path_tree().unwrap();
-        let squatter = BlockId::from([0xffu8; BLOCKID_SIZE]);
-        for index in 1..=upto {
-            path_tree
-                .insert(&hash.as_slice()[..index], squatter.as_slice().to_vec())
-                .unwrap();
-        }
-    }
-
-    /// Regression: with every prefix shorter than the full hash taken, the
-    /// block used to be written with a zero-length path, which then panicked
-    /// in `Block::disk_path`. It must fall back to the full-width path.
+    /// A new block records the depth the caller chose; the derived disk path
+    /// follows it.
     #[test]
-    fn write_block_falls_back_to_full_width_path() {
+    fn write_block_records_the_given_depth() {
         let (meta, dir) = test_store();
         let hash = BlockId::from([0xaau8; BLOCKID_SIZE]);
-        claim_prefixes(&meta, &hash, BLOCKID_SIZE - 1);
 
         let mut tx = meta.begin_transaction();
-        let (new, block) = tx.write_block(hash, 42, false).unwrap();
+        let (new, block) = tx.write_block(hash, 42, false, 3).unwrap();
         tx.commit().unwrap();
 
         assert!(new);
-        assert!(!block.path().is_empty(), "block path must never be empty");
-        assert_eq!(block.path(), hash.as_slice());
-        // The path is usable: this panics on an empty path.
-        let _ = block.disk_path(dir.path().to_path_buf());
+        assert_eq!(block.depth(), 3);
+        assert_eq!(
+            block.disk_path(&hash, dir.path().to_path_buf()),
+            crate::metastore::block_disk_path(&hash, 3, dir.path().to_path_buf())
+        );
     }
 
-    /// If even the full-width key is held by a different hash -- impossible for
-    /// a real hash, since that key *is* the hash -- writing must fail loudly
-    /// instead of storing an empty path.
+    /// A dedup hit bumps the rc and keeps the ORIGINAL depth -- that is where
+    /// the file is; the caller's depth guess is ignored.
     #[test]
-    fn write_block_refuses_when_every_prefix_is_taken() {
+    fn write_block_dedup_hit_keeps_the_recorded_depth() {
         let (meta, _dir) = test_store();
-        let hash = BlockId::from([0xaau8; BLOCKID_SIZE]);
-        claim_prefixes(&meta, &hash, BLOCKID_SIZE);
+        let hash = BlockId::from([0xabu8; BLOCKID_SIZE]);
 
         let mut tx = meta.begin_transaction();
-        let err = tx.write_block(hash, 42, false).unwrap_err();
-        tx.rollback();
+        let (new, _) = tx.write_block(hash, 42, false, 2).unwrap();
+        tx.commit().unwrap();
+        assert!(new);
 
-        match err {
-            MetaError::OtherDBError(msg) => assert!(
-                msg.contains("path tree exhausted"),
-                "unexpected message: {msg}"
-            ),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let mut tx = meta.begin_transaction();
+        let (new, block) = tx.write_block(hash, 42, false, 7).unwrap();
+        tx.commit().unwrap();
+
+        assert!(!new);
+        assert_eq!(block.rc(), 2);
+        assert_eq!(block.depth(), 2, "dedup must not move the block");
     }
 
     /// A bucket becomes a tree of its own name, so a bucket named like one of
@@ -841,13 +777,7 @@ mod tests {
     fn insert_bucket_refuses_reserved_names() {
         let (meta, _dir) = test_store();
 
-        for name in [
-            "_STORE_HEADER",
-            "_BLOCKS",
-            "_PATHS",
-            "_MULTIPART_PARTS",
-            "_",
-        ] {
+        for name in ["_STORE_HEADER", "_BLOCKS", "_MULTIPART_PARTS", "_"] {
             let raw = BucketMeta::new(name.to_string()).to_vec();
             match meta.insert_bucket(name, raw).unwrap_err() {
                 MetaError::ReservedBucketName(refused) => assert_eq!(refused, name),
@@ -868,24 +798,27 @@ mod tests {
         assert!(meta.bucket_exists("photos").unwrap());
     }
 
-    /// The ordinary case: a fresh hash takes the one-byte prefix, and a second
-    /// hash sharing that first byte takes the two-byte prefix.
+    /// Two hashes sharing a leading byte can both live at depth 1: their
+    /// full-id filenames can never collide, so no allocator is involved.
     #[test]
-    fn write_block_uses_shortest_free_prefix() {
-        let (meta, _dir) = test_store();
+    fn write_block_shared_prefix_needs_no_allocation() {
+        let (meta, dir) = test_store();
         let first = BlockId::from([0x11u8; BLOCKID_SIZE]);
         let mut second_bytes = [0x11u8; BLOCKID_SIZE];
         second_bytes[1] = 0x22;
         let second = BlockId::from(second_bytes);
 
         let mut tx = meta.begin_transaction();
-        let (_, first_block) = tx.write_block(first, 1, false).unwrap();
+        let (_, first_block) = tx.write_block(first, 1, false, 1).unwrap();
         tx.commit().unwrap();
-        assert_eq!(first_block.path(), &[0x11]);
 
         let mut tx = meta.begin_transaction();
-        let (_, second_block) = tx.write_block(second, 1, false).unwrap();
+        let (_, second_block) = tx.write_block(second, 1, false, 1).unwrap();
         tx.commit().unwrap();
-        assert_eq!(second_block.path(), &[0x11, 0x22]);
+
+        let p1 = first_block.disk_path(&first, dir.path().to_path_buf());
+        let p2 = second_block.disk_path(&second, dir.path().to_path_buf());
+        assert_eq!(p1.parent(), p2.parent(), "same depth-1 dir");
+        assert_ne!(p1, p2, "full-id names never collide");
     }
 }

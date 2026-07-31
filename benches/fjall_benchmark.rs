@@ -67,12 +67,10 @@ fn create_block_id(id: u8) -> BlockId {
     BlockId::from(block_id)
 }
 
-// Helper to create a test block
+// Helper to create a test block at fanout depth 1
 fn create_test_block(id: u8, size: usize) -> (BlockId, Vec<u8>) {
     let block_id = create_block_id(id);
-    // Create path from block_id
-    let path = block_id.as_slice().to_vec();
-    let block = Block::new(size, path);
+    let block = Block::new(size, 1);
     (block_id, block.to_vec())
 }
 
@@ -210,7 +208,7 @@ fn bench_transaction(c: &mut Criterion) {
             b.iter(|| {
                 let mut tx = store.begin_transaction();
                 let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false)).unwrap();
+                black_box(tx.write_block(block_id, 1024, false, 1)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
         });
@@ -254,7 +252,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 // Use a transaction
                 let mut tx = store.begin_transaction();
                 let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false)).unwrap();
+                black_box(tx.write_block(block_id, 1024, false, 1)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
         });
