@@ -610,6 +610,154 @@ async fn test_list_of_absent_bucket_creates_nothing() -> Result<()> {
     Ok(())
 }
 
+/// A delimiter listing rolls keys up into CommonPrefixes: each distinct
+/// rolled-up prefix appears exactly once, counts against MaxKeys like an
+/// object, and never reappears on a later page -- the page consumes the
+/// whole group so the continuation token resumes past it.
+#[tokio::test]
+#[tracing::instrument]
+async fn test_delimiter_listing_rolls_up_common_prefixes() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(setup_test(StorageEngine::Fjall, Some(1)));
+    let bucket = format!("test-delim-{}", Uuid::new_v4());
+    let bucket_str = bucket.as_str();
+    create_bucket(&c, bucket_str).await?;
+
+    for key in [
+        "a/1.txt",
+        "a/2.txt",
+        "b/mid.txt",
+        "b/x/deep.txt",
+        "root1.txt",
+        "root2.txt",
+    ] {
+        c.put_object()
+            .bucket(bucket_str)
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await?;
+    }
+
+    // One page: two rolled-up prefixes, two loose objects.
+    let all = c
+        .list_objects_v2()
+        .bucket(bucket_str)
+        .delimiter("/")
+        .send()
+        .await?;
+    let prefixes: Vec<_> = all
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    let keys: Vec<_> = all.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(prefixes, ["a/", "b/"]);
+    assert_eq!(keys, ["root1.txt", "root2.txt"]);
+    assert_eq!(all.key_count(), Some(4), "prefixes count like objects");
+    assert_eq!(all.is_truncated(), Some(false));
+
+    // Paged one item at a time: the sequence is a/, b/, root1, root2 with
+    // no prefix repeated across pages.
+    let mut token: Option<String> = None;
+    let mut seq: Vec<String> = Vec::new();
+    loop {
+        let mut req = c
+            .list_objects_v2()
+            .bucket(bucket_str)
+            .delimiter("/")
+            .max_keys(1);
+        if let Some(t) = &token {
+            req = req.continuation_token(t);
+        }
+        let page = page_of(req.send().await?);
+        seq.extend(page.0);
+        token = page.1;
+        if token.is_none() {
+            break;
+        }
+        assert!(seq.len() <= 4, "pagination must terminate: {seq:?}");
+    }
+    assert_eq!(seq, ["a/", "b/", "root1.txt", "root2.txt"]);
+
+    // Prefix and delimiter together: one loose key, one deeper roll-up.
+    let under_b = c
+        .list_objects_v2()
+        .bucket(bucket_str)
+        .prefix("b/")
+        .delimiter("/")
+        .send()
+        .await?;
+    let prefixes: Vec<_> = under_b
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    let keys: Vec<_> = under_b.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(prefixes, ["b/x/"]);
+    assert_eq!(keys, ["b/mid.txt"]);
+
+    // The v1 listing rolls up the same way and answers NextMarker when a
+    // delimiter page truncates.
+    let v1 = c
+        .list_objects()
+        .bucket(bucket_str)
+        .delimiter("/")
+        .max_keys(2)
+        .send()
+        .await?;
+    let prefixes: Vec<_> = v1
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    assert_eq!(prefixes, ["a/", "b/"]);
+    assert_eq!(v1.is_truncated(), Some(true));
+    let marker = v1
+        .next_marker()
+        .expect("a truncated delimiter page names its marker");
+    let v1_rest = c
+        .list_objects()
+        .bucket(bucket_str)
+        .delimiter("/")
+        .marker(marker)
+        .send()
+        .await?;
+    let keys: Vec<_> = v1_rest.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["root1.txt", "root2.txt"]);
+    assert!(v1_rest.common_prefixes().is_empty());
+
+    Ok(())
+}
+
+/// The items of one ListObjectsV2 page in order (prefixes then keys is
+/// fine here: a max-keys(1) page holds exactly one of them), plus the
+/// continuation token when the page says it is truncated.
+fn page_of(
+    page: aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+) -> (Vec<String>, Option<String>) {
+    let mut items: Vec<String> = page
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix().map(str::to_owned))
+        .collect();
+    items.extend(
+        page.contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_owned)),
+    );
+    assert!(
+        items.len() <= 1,
+        "a max-keys(1) page holds one item: {items:?}"
+    );
+    if page.is_truncated() == Some(true) {
+        (items, page.next_continuation_token().map(str::to_owned))
+    } else {
+        (items, None)
+    }
+}
+
 #[tokio::test]
 #[tracing::instrument]
 async fn test_multipart() -> Result<()> {
