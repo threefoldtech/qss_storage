@@ -306,6 +306,12 @@ missing file does not error.
 
 ## Component 7: notx contract scope + docs
 
+**Check ADR 0007 first**: it proposes removing the fjall_notx backend
+outright. If accepted before this component runs, component 7 becomes
+the removal (delete `fjall_notx.rs`, reject the config value with a
+migration message, drop the notx arms from components 5/6/9's work and
+tests) and the warning/docs updates below are moot.
+
 - Update the startup warning (`shared_block_store.rs:62-69`): state
   that the loss-never contract is guaranteed on the transactional
   backend only; on `fjall_notx` concurrent DELETEs of one key are

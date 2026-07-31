@@ -96,7 +96,8 @@ explicitly (see Decision).
 
 Related: ADR 0002 (BLAKE3 addressing), ADR 0004 (store ownership -- the
 `.tmp` sweep depends on it), ADR 0005 (fsck -- reconciles the failure
-residue), `docs/refcount.md` (leakage-allowed / loss-never),
+residue), ADR 0007 (the fjall_notx backend's fate -- this ADR only
+scopes it out), `docs/refcount.md` (leakage-allowed / loss-never),
 `docs/arch/deadlock-fix.md`.
 
 ---
@@ -642,7 +643,8 @@ survives for test injection only; its implementation moves to
   decided 2026-07-31 -- no key-stripe. Stripes still fix its bump and
   decrement races; the double-DELETE-same-key window and the absent
   metadata durability are accepted and must be named in the startup
-  warning and docs.
+  warning and docs. The backend's overall fate is ADR 0007's question
+  (removal proposed there).
 - **Landing order**: ADR 0006 lands before ADR 0005, decided
   2026-07-31. Fsck cannot detect the rc undercounts defects 1 and 5
   produce (an undercount looks internally consistent), so
