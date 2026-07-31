@@ -1,8 +1,10 @@
 # Overwrite Releases the Replaced Object's Blocks
 
-**Status**: Accepted (2026-07-31, owner sign-off; all three review asks
-approved, self-copy short-circuit chosen -- see Review asks and Open
-Questions below)
+**Status**: Accepted and IMPLEMENTED (2026-07-31, owner sign-off; all
+three review asks approved, self-copy short-circuit chosen). Landed on
+`development` as the commit series `ee9c691..fd7f028` (components of
+`docs/plans/adr-0008-implementation.md`, one commit per component;
+as-built deviations marked "(as built)" below).
 **Date**: 2026-08-01
 
 ---
@@ -41,12 +43,17 @@ Affected write paths (everything that writes an object record over a
 possibly-existing key):
 
 - `create_object_meta` -- called by `put_object`, by
-  `complete_multipart_upload`, and by `copy_object`'s destination write;
+  `complete_multipart_upload`, and by `copy_object`'s destination write
+  (as built: no such write exists -- `copy_object` is `NotImplemented`
+  at HEAD, the audit found no CasFS-level copy at all);
 - `store_inlined_object` -- an inline overwrite of a block-backed object
   must release the old blocks too (the new record holds no references
   at all);
 - respd's `set` -- always inline over inline, no references on either
-  side: covered by the same code path, no-op in practice.
+  side: covered by the same code path, no-op in practice (as built:
+  respd writes through its own tree, not this path, and carries no
+  block store -- the no-op conclusion holds structurally rather than
+  by shared code).
 
 Related: ADR 0003 (release_blocks, the claim patterns), ADR 0005 (the
 recount that today collects this leak; its expectations tighten), ADR
@@ -168,7 +175,9 @@ stop leaking.
 - copy_object with source == destination (self-copy overwrite): the
   displaced record's blocks are the source's blocks; the new record
   bumped them as dedup hits; net rc unchanged. Verify with a test, not
-  an argument.
+  an argument. (As built: moot at HEAD, `copy_object` is
+  `NotImplemented`; the short-circuit decision below binds its future
+  implementation.)
 
 ---
 
@@ -227,6 +236,18 @@ delete the rc-exactness allowances and tighten those tests; race
 arms: overwrite storm same key, overwrite-vs-delete, overwrite-vs-read
 (old-reader equivalence), self-copy; fsck doc line; refcount.md
 counting-rule note (overwrite now releases).
+
+As built: the two entry points became `async` (the release takes
+stripes); the replace tx itself lives in a synchronous helper,
+`write_path::replace_object_record`, so no `Transaction` ever sits in
+an async frame (ADR 0006 hard rules 3 and 6). The self-copy race arm
+is moot (no `copy_object` at HEAD); the storms, delete race, and
+old-reader equivalence all landed. The rc-exactness allowance deletion
+rode the wiring commit -- splitting them would have left the tree red
+between commits. Doc updates reached four files, not two: `fsck.md`,
+`refcount.md`, `as-built/02-storage-model.md`, and
+`arch/key-has-block-skip.md` both asserted the now-false "overwrites
+over-count until reconciled".
 
 Review asks (answered 2026-07-31, owner):
 1. Apply to both `create_object_meta` and `store_inlined_object`
