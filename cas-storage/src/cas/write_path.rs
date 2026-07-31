@@ -131,7 +131,7 @@ pub(super) async fn store_object(
             // uses it -- a dedup hit keeps the recorded depth. The reorder in
             // ADR 0006's write protocol moves this after the dedup check so
             // hits skip the probe entirely.
-            let depth = fs.placement.choose_depth(&block_hash);
+            let depth = fs.shared.placement().choose_depth(&block_hash);
 
             // begin the transaction
             // there are two main things we need to do here:

@@ -4,7 +4,6 @@ use std::{io, path::PathBuf};
 
 use super::async_fs::{AsyncFileSystem, RealAsyncFs};
 use super::multipart::MultiPart;
-use super::placement::BlockPlacement;
 use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
@@ -21,11 +20,6 @@ pub struct CasFS {
     pub(super) async_fs: Box<dyn AsyncFileSystem>,
     pub(super) namespace: MetaStore,
     pub(super) shared: Arc<SharedBlockStore>,
-    pub(super) root: PathBuf,
-    /// Depth placement for new block files (ADR 0006). Lives here while the
-    /// blocks root is still per-CasFS; moves to `SharedBlockStore` together
-    /// with the root.
-    pub(super) placement: Arc<BlockPlacement>,
     pub(super) metrics: SharedMetrics,
     pub(super) verify_on_read: bool,
 }
@@ -88,13 +82,15 @@ fn part_key(bucket: &str, key: &str, upload_id: &str, part_number: i64) -> Strin
 }
 
 impl CasFS {
-    /// Build a `CasFS` for one namespace, sharing a block/path/multipart
-    /// store across namespaces via `shared`.
+    /// Build a `CasFS` for one namespace, sharing a block/multipart store
+    /// across namespaces via `shared`.
     ///
     /// Layout on disk:
-    ///   `root/blocks/` - block data files
     ///   `namespace_meta_path/db/` - this namespace's metadata DB
-    ///   (the shared DB lives wherever `SharedBlockStore::new` was given)
+    ///   (the shared DB and the block data files live wherever
+    ///   `SharedBlockStore::new` was given -- the blocks root is the store's,
+    ///   not this namespace's, so cross-namespace dedup always resolves to
+    ///   one set of files)
     ///
     /// The namespace DB is headered like every other store. Its header takes
     /// the hash the shared block store already carries, so the two DBs of one
@@ -108,9 +104,7 @@ impl CasFS {
     /// `verify_on_read` turns on block verification on read; see
     /// [`CasFS::verify_on_read`] for what it does and does not cover. It is a
     /// constructor parameter until the config file gives it a home.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut root: PathBuf,
         mut namespace_meta_path: PathBuf,
         shared: Arc<SharedBlockStore>,
         metrics: SharedMetrics,
@@ -120,13 +114,8 @@ impl CasFS {
         verify_on_read: bool,
     ) -> Result<Self, MetaError> {
         namespace_meta_path.push("db");
-        root.push("blocks");
 
-        // Canonicalize both paths to eliminate getcwd() syscalls in async operations
-        // This is critical for performance as it avoids repeated getcwd() on every file op
-        std::fs::create_dir_all(&root).ok();
-        root = root.canonicalize().unwrap_or(root);
-
+        // Canonicalize to eliminate getcwd() syscalls in async operations
         std::fs::create_dir_all(&namespace_meta_path).ok();
         namespace_meta_path = namespace_meta_path
             .canonicalize()
@@ -145,8 +134,6 @@ impl CasFS {
             async_fs: Box::new(RealAsyncFs),
             namespace,
             shared,
-            placement: Arc::new(BlockPlacement::new(root.clone())),
-            root,
             metrics,
             verify_on_read,
         })
@@ -155,7 +142,8 @@ impl CasFS {
     /// Convenience constructor for single-namespace consumers (CLI ops,
     /// tests, third-party library users who only need one namespace).
     ///
-    /// Builds a dedicated `SharedBlockStore` at `meta_path.join("blocks")`
+    /// Builds a dedicated `SharedBlockStore` with its blocks DB at
+    /// `meta_path/blocks/db/` and its block data files at `root/blocks/`,
     /// and returns a `CasFS` whose namespace metadata lives at
     /// `meta_path/db/`.
     ///
@@ -165,6 +153,16 @@ impl CasFS {
     /// [`HeaderSpec::default`].
     ///
     /// `verify_on_read` is passed straight to [`CasFS::new`].
+    ///
+    /// # One process, one store
+    ///
+    /// Every call mints a PRIVATE `SharedBlockStore` -- with its own stripe
+    /// set and placement state. A process must not open the same on-disk
+    /// store through this twice: two instances would not share stripes, and
+    /// the per-block serialization that the write and delete protocols rely
+    /// on (ADR 0006) would silently not hold between them. Open one `CasFS`
+    /// per store, or build one `SharedBlockStore` and hand it to
+    /// [`CasFS::new`] per namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn single_namespace(
         root: PathBuf,
@@ -178,13 +176,14 @@ impl CasFS {
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
+            root.join("blocks"),
             storage_engine,
             inlined_metadata_size,
             durability,
             spec,
+            None,
         )?);
         Self::new(
-            root,
             meta_path,
             shared,
             metrics,
@@ -215,8 +214,10 @@ impl CasFS {
         self.verify_on_read
     }
 
+    /// Root directory of the block data files -- the store's, shared by
+    /// every namespace.
     pub fn fs_root(&self) -> &PathBuf {
-        &self.root
+        self.shared.blocks_root()
     }
 
     pub fn max_inlined_data_length(&self) -> usize {
@@ -610,6 +611,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored_block.rc(), 2);
+    }
+
+    /// ADR 0006: two namespaces over one `SharedBlockStore` resolve one
+    /// stripe set and ONE disk path per block. Cross-namespace dedup must
+    /// bump the shared record and never write a second file.
+    #[tokio::test]
+    async fn test_two_namespaces_share_stripes_and_block_paths() {
+        let dir = tempdir().unwrap();
+        let shared = Arc::new(
+            crate::cas::SharedBlockStore::new(
+                dir.path().join("meta/blocks"),
+                dir.path().join("blocks"),
+                StorageEngine::Fjall,
+                Some(1),
+                Some(Durability::Buffer),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let ns = |name: &str| {
+            CasFS::new(
+                dir.path().join("meta").join(name),
+                shared.clone(),
+                METRICS.clone(),
+                StorageEngine::Fjall,
+                Some(1),
+                Some(Durability::Buffer),
+                false,
+            )
+            .unwrap()
+        };
+        let alice = ns("alice");
+        let bob = ns("bob");
+        alice.create_bucket("b").unwrap();
+        bob.create_bucket("b").unwrap();
+
+        let data = b"cross namespace dedup payload".repeat(40).to_vec();
+        let id = alice.hasher().hash(&data);
+
+        // Same stripe object from both namespaces.
+        assert!(Arc::ptr_eq(
+            &alice.shared.stripes().for_hash(&id),
+            &bob.shared.stripes().for_hash(&id)
+        ));
+
+        let put = |fs: &CasFS, data: Vec<u8>| {
+            let len = data.len();
+            let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) }));
+            (stream, len)
+        };
+        let (stream, len) = put(&alice, data.clone());
+        let obj_a = alice
+            .store_single_object_and_meta("b", "k", stream, len)
+            .await
+            .unwrap();
+        let (stream, len) = put(&bob, data.clone());
+        let obj_b = bob
+            .store_single_object_and_meta("b", "k", stream, len)
+            .await
+            .unwrap();
+        assert_eq!(obj_a.blocks(), obj_b.blocks());
+
+        // One record, rc 2, one file at one path derived from ONE root.
+        let block = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.rc(), 2, "dedup must bump the shared record");
+        let path_a = block.disk_path(&id, alice.fs_root().clone());
+        let path_b = block.disk_path(&id, bob.fs_root().clone());
+        assert_eq!(path_a, path_b, "both namespaces derive the same path");
+        assert!(path_a.is_file());
     }
 
     /// ADR 0006 orphan healing, end to end: a file named like the block,

@@ -43,18 +43,21 @@
 //! use std::sync::Arc;
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create shared block store (once, shared across all namespaces)
+//! // Create shared block store (once, shared across all namespaces). It
+//! // owns the blocks DB AND the block data root: every namespace derives
+//! // block file paths from that one root.
 //! let shared = Arc::new(SharedBlockStore::new(
 //!     PathBuf::from("./data/meta/blocks"),
+//!     PathBuf::from("./data/blocks"),
 //!     StorageEngine::Fjall,
 //!     None,
 //!     Some(Durability::Fsync),
 //!     None,                // header spec (defaults to blake3/32)
+//!     None,                // stripe count (defaults to 1024)
 //! )?);
 //!
 //! // One CasFS per namespace (e.g. per user)
 //! let alice = CasFS::new(
-//!     PathBuf::from("./data"),
 //!     PathBuf::from("./data/meta/user_alice"),
 //!     shared.clone(),
 //!     Default::default(),

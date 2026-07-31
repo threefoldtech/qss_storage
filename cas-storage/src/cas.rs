@@ -13,6 +13,7 @@ mod delete_path;
 pub mod fs;
 mod placement;
 mod read_path;
+mod stripes;
 mod write_path;
 
 pub use byte_stream::AsyncByteStream;

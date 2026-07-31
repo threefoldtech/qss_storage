@@ -6,19 +6,35 @@ use crate::metastore::{
     BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
 };
 
+use super::placement::BlockPlacement;
+use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
 use super::{StorageEngine, multipart::MultiPartTree};
 
-/// SharedBlockStore manages the shared block metadata (the _BLOCKS and
-/// _MULTIPART_PARTS trees) that is accessed by all users for block
-/// refcounting and multipart uploads.
+/// SharedBlockStore manages everything block-scoped that must be one per
+/// store, not one per namespace: the shared block metadata (the _BLOCKS and
+/// _MULTIPART_PARTS trees), the blocks file root on disk, the per-block
+/// stripe set, and the depth placement state.
 ///
 /// This is created once at startup and shared across all CasFS instances.
+/// The blocks root living HERE is load-bearing (ADR 0006): block records are
+/// shared across namespaces, so if two namespaces derived file paths from
+/// different roots, a dedup hit in one would point at a file only the other
+/// can see. One store, one root.
 pub struct SharedBlockStore {
     meta_store: Arc<MetaStore>,
     block_tree: Arc<BlockTree>,
     multipart_tree: Arc<MultiPartTree>,
     header: StoreHeader,
     hasher: Hasher,
+    /// Root directory of the block data files.
+    blocks_root: PathBuf,
+    /// Fanout-depth placement for new block files.
+    placement: BlockPlacement,
+    /// Per-block-hash lock stripes; every `_BLOCKS` mutation runs under one.
+    // TODO(adr-0006): the allow dies when the write path (component 5)
+    // starts taking stripes.
+    #[allow(dead_code)]
+    stripes: Stripes,
 }
 
 impl SharedBlockStore {
@@ -31,17 +47,23 @@ impl SharedBlockStore {
     ///
     /// # Arguments
     /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/db)
+    /// * `blocks_root` - Root directory for the block data files, shared by
+    ///   every namespace of this store
     /// * `storage_engine` - Storage engine
     /// * `inlined_metadata_size` - Maximum size for inlined metadata
     /// * `durability` - Durability level for transactions
     /// * `spec` - Hash written into the header of a *new* store; ignored when
     ///   an existing store is opened. `None` takes [`HeaderSpec::default`].
+    /// * `stripe_count` - Number of block lock stripes; `None` takes
+    ///   [`DEFAULT_STRIPE_COUNT`]. Sizing rule in `cas::stripes`.
     pub fn new(
         mut path: PathBuf,
+        mut blocks_root: PathBuf,
         storage_engine: StorageEngine,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
         spec: Option<HeaderSpec>,
+        stripe_count: Option<usize>,
     ) -> Result<Self, MetaError> {
         path.push("db");
 
@@ -49,6 +71,9 @@ impl SharedBlockStore {
         // This is critical for performance as it avoids repeated getcwd() on every file op
         std::fs::create_dir_all(&path).ok();
         path = path.canonicalize().unwrap_or(path);
+
+        std::fs::create_dir_all(&blocks_root).ok();
+        blocks_root = blocks_root.canonicalize().unwrap_or(blocks_root);
 
         let spec = spec.unwrap_or_default();
         let (meta_store, header) = match storage_engine {
@@ -69,7 +94,29 @@ impl SharedBlockStore {
             multipart_tree: Arc::new(multipart_tree),
             header,
             hasher: header.hasher(),
+            placement: BlockPlacement::new(blocks_root.clone()),
+            blocks_root,
+            stripes: Stripes::new(stripe_count.unwrap_or(DEFAULT_STRIPE_COUNT)),
         })
+    }
+
+    /// Root directory of the block data files. One per store: every
+    /// namespace derives block file paths from this root and no other.
+    pub fn blocks_root(&self) -> &PathBuf {
+        &self.blocks_root
+    }
+
+    /// The store's depth placement state for new block files.
+    pub(super) fn placement(&self) -> &BlockPlacement {
+        &self.placement
+    }
+
+    /// The store's per-block lock stripes.
+    // TODO(adr-0006): the allow dies when the write path (component 5)
+    // starts taking stripes.
+    #[allow(dead_code)]
+    pub(super) fn stripes(&self) -> &Stripes {
+        &self.stripes
     }
 
     /// The hash function this store's blocks are addressed by, as recorded in
