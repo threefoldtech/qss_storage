@@ -101,8 +101,9 @@ explicitly (see Decision).
 
 Related: ADR 0002 (BLAKE3 addressing), ADR 0004 (store ownership -- the
 `.tmp` sweep depends on it), ADR 0005 (fsck -- reconciles the failure
-residue), ADR 0007 (the fjall_notx backend's fate -- this ADR only
-scopes it out), `docs/refcount.md` (leakage-allowed / loss-never),
+residue enumerated here; the built tool is `docs/fsck.md`), ADR 0007 (the
+fjall_notx backend's fate -- this ADR only scopes it out),
+`docs/refcount.md` (leakage-allowed / loss-never),
 `docs/arch/deadlock-fix.md`.
 
 ---

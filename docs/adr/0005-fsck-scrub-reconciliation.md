@@ -91,7 +91,8 @@ Related: ADR 0002 (addressing, headers, verify-on-read), ADR 0003
 (multipart GC -- still Proposed; see the multipart pass), ADR 0004 (store
 ownership -- still Proposed; no longer a hard dependency, see Decision),
 ADR 0006 (the protocol whose residue this reconciles), ADR 0007 (one
-backend), `docs/refcount.md`.
+backend), `docs/refcount.md`, `docs/fsck.md` (the operator page for what
+this ADR built).
 
 ---
 
@@ -103,6 +104,13 @@ subcommand; working name `qss-storage-fsck`, naming per the qss_storage
 convention). It opens the store's fjall DBs through the same
 header-aware path as the daemon and the existing tools (never creates,
 refuses on header mismatch).
+
+**(as built)** The binary is the sibling workspace crate
+`qss-storage-fsck`, bin-only, over cas-storage's `scrub` library. The
+walkers, passes and repair actions live in the library exactly as decided;
+making the binary its own crate keeps clap and the async runtime out of the
+library's dependency tree. Moving it to a literal `[[bin]]` inside
+cas-storage later is mechanical.
 
 **Exclusivity** is inherited, not built: fjall's LOCK file makes fsck and
 a running daemon mutually exclusive on every DB fsck opens. The residual
@@ -118,6 +126,13 @@ in the shared DB -- and **refuses to run the recount (and any repair) if
 any part of it fails to open or parse**. A recount over a partial holder
 set that then "repairs" would free live blocks: loss by repair, the one
 failure mode this tool must structurally exclude.
+
+**(as built)** The bucket trees are enumerated with the new
+`Store::list_trees` (every non-reserved tree of the namespace DB), NOT from
+the `_BUCKETS` rows -- precisely so that a half-deleted bucket's surviving
+object tree stays counted. Its row is already gone (pass 6), so a
+row-driven enumeration would have dropped those objects from the count and
+authorised freeing the blocks they still hold.
 
 ### Passes
 
@@ -141,6 +156,15 @@ failure mode this tool must structurally exclude.
    a file whose id has a record at a different depth (INFO), foreign
    file, i.e. unparseable name (WARN), file-size vs record-size mismatch
    (CRITICAL -- a corruption tell that costs one stat, no read).
+   **(as built)** The walk also skips `.quarantine` at the top level (what
+   an earlier repair set aside) and the store's OWN metadata paths, which
+   the opener declares: in the default single-root layout
+   (`--meta-root . --fs-root .`) the shared blocks DB and its header
+   sidecar sit at `<meta_root>/blocks/db` and
+   `<meta_root>/blocks/store_header.bin`, i.e. INSIDE the blocks root this
+   pass walks. Without that exclusion every run would report the live
+   database as a foreign file -- and `--repair` would have renamed it into
+   quarantine.
 3. **Dangling-record sweep**. One stat per record via the pure
    `disk_path`. Before classifying, cross-reference against pass 2's
    orphans: a dangling record whose id exists as an orphan at another
@@ -150,7 +174,11 @@ failure mode this tool must structurally exclude.
    pair collapses to one repaired INFO. An un-adoptable dangling record
    is CRITICAL: the bytes are gone, every holder object is damaged, and
    the record poisons future same-content PUTs (see the damaged-block
-   decision below).
+   decision below). **(as built)** There is no pair to collapse: pass 2
+   yields that file to this pass, so one artifact produces one INFO
+   adoption candidate even before repair. A record already flagged
+   degraded is reported here too, as INFO -- known damage awaiting a heal,
+   not a fresh CRITICAL discovery.
 4. **Corruption scrub** (`--scrub`, disk-bound). Re-hash every block file
    against its own filename; verify record size. Self-attributing: no DB
    lookup per file. The offline, whole-store complement to
@@ -159,6 +187,10 @@ failure mode this tool must structurally exclude.
    grouped by upload. **Report-only until ADR 0003 lands**: reaping
    requires 0003's abort semantics (which decrements through the striped
    delete primitive), and guessing them here would smuggle 0003 in.
+   **(as built)** Part count and total bytes per upload only -- no age. A
+   part record carries no timestamp, so per-upload age is unreportable
+   until ADR 0003 adds upload records; every finding states that in its
+   evidence rather than leaving the omission to be discovered.
 6. **Bucket integrity**. Object trees in the namespace DB with no bucket
    meta (the `bucket_delete` crash residue): WARN; under `--repair`,
    resume the teardown, then let the closing recount reconcile.
@@ -171,7 +203,12 @@ Report-only by default. `--repair` applies:
   premature-free landmine -- the CRITICAL finding, its evidence, and
   the nonzero exit all remain, so the bug it indicates is not hidden.
   (The original draft refused to touch under-counts; leaving a known
-  under-count in place leaves loss armed.)
+  under-count in place leaves loss armed.) **(as built)** A recounted
+  value of zero frees the block: rc=0 is not a representable state in this
+  protocol, so the action does what the last decrement does -- record
+  removed in a transaction, then the file unlinked. Record first, so a
+  crash between the two leaves an orphan file (leakage) rather than a
+  record with no bytes (loss).
 - delete orphan files and off-depth duplicates (nothing references
   them);
 - quarantine, never delete: corrupt blocks and foreign files rename into
@@ -180,7 +217,13 @@ Report-only by default. `--repair` applies:
 - adoption for dangling-record/orphan pairs (hash-verified, above);
 - resume half-deleted bucket teardowns;
 - after all actions: **re-run the recount; anything but a clean diff is
-  CRITICAL** and exits nonzero.
+  CRITICAL** and exits nonzero. **(as built)** Every pass re-runs, not
+  only the recount, and the check is by finding class: a class this tool
+  claims to repair that is still standing afterwards becomes
+  `post_repair_recount_dirty` (CRITICAL) whatever its own severity would
+  be, while classes nobody repairs (a holder pointing at a missing record,
+  an undecodable record, a size mismatch) are expected to survive and say
+  nothing about whether the repair worked.
 
 ### Damaged blocks: heal vs accounting
 
@@ -233,7 +276,9 @@ shipped.
      Library code: the daemons' stores must be checkable by the same
      code the CLI uses, and a future online mode wraps these.
 2. **Pass engine**
-   - `Finding { severity, class, ids, evidence }`; passes are functions
+   - `Finding { severity, class, ids, evidence }` (**as built**:
+     `{severity, class, block, path, evidence, holders}`, with `block`,
+     `path` and `holders` omitted when empty); passes are functions
      over shared walker outputs -- one record walk powers both the
      recount diff and the dangling sweep; the disk walk powers orphan,
      off-depth, foreign, and size findings in one traversal.
@@ -247,7 +292,8 @@ shipped.
      not recovered. The report file is written before repair begins.
 4. **CLI** (store-level binary, DECIDED 2026-07-31)
    - Its own binary target homed in cas-storage (working name
-     `qss-storage-fsck`), `--meta-root`/`--fs-root` plus the
+     `qss-storage-fsck`; **as built** the sibling crate of that name over
+     the `scrub` library, see Decision), `--meta-root`/`--fs-root` plus the
      StoreOptions merge the other tools use; `[--scrub] [--repair]
      [--json]`. Usable against any store root regardless of which
      daemon owns it (respd stores verifiably hold no blocks today, but
@@ -424,6 +470,13 @@ kill-mid-repair test.
 - **Binary name**: `qss-storage-fsck` is a working name (qss_storage
   naming convention; never bare qss). Cost to change: operator-facing
   once documented.
+
+**(as built)** All three are settled and documented in `docs/fsck.md`,
+so all three are now operator-facing contracts: the report and repair
+documents are both schema `version: 1` with the field names that page
+lists; quarantine is the filesystem one, `blocks/.quarantine/`, with a
+numeric suffix on name collision and nothing ever deleted from it; and
+the binary ships as `qss-storage-fsck`.
 
 ### Known unknowns and how the plan absorbs them
 - Real-store scale: per-pass selection is the first lever, per-bucket

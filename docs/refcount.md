@@ -21,6 +21,35 @@ durably before their record commits (file-first). Crash and cancellation
 residue is therefore always over-counts or orphan files (leakage, ADR
 0005's reconciliation feed), never under-counts.
 
+## Reconciliation
+
+The other half of this contract is `qss-storage-fsck`, the offline tool ADR
+0005 built (`docs/fsck.md`). It walks every reference holder -- object
+records in each bucket tree, part records of in-flight uploads -- counts one
+reference per block OCCURRENCE by the rule above, and compares that with
+`_BLOCKS` and with what is actually on disk. The workflow is report, then
+repair, then recount: the report is emitted before any repair runs,
+`--repair` applies the safe subset (rc set to the walked truth in both
+directions, orphan and off-depth files deleted, corrupt and foreign files
+quarantined rather than deleted, adoption of a record whose bytes turn up at
+another depth, half-deleted bucket teardowns resumed), and every pass then
+runs again -- anything the tool claims to repair that still stands is
+CRITICAL and the run exits nonzero. A recount to zero frees the block the
+way a last decrement does: the record is removed and its file unlinked, so
+rc=0 is never a state anything observes. No refcount is touched at all
+unless the holder enumeration closed completely; a count over a partial
+holder set would authorise freeing blocks that are still referenced, which
+is loss by repair.
+
+The one residue this contract cannot express -- a record whose bytes are
+gone (a `buffer`-durability power cut, or corruption) -- gets the `degraded`
+flag on the block record rather than a removal. The record keeps accounting
+for its surviving holders, so nothing under-counts, and the write path
+treats a degraded record as absent for dedup: the next PUT of that content
+writes the file, clears the flag and adds its own reference in the same
+striped transaction. Damage stops propagating without the accounting ever
+lying.
+
 ## Counting rule
 
 One reference per block OCCURRENCE in an object: every dedup hit bumps
