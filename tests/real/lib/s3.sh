@@ -187,6 +187,24 @@ s3_list_ls() {
     s3cmd ls --recursive "s3://$1/${2:-}" 2>/dev/null | awk '{print $4}' | grep -v '^$'
 }
 
+# PUT of generated content, streamed: the generator feeds aws-cli's stdin
+# and nothing lands on local disk, which is what makes a 300 GiB giant
+# possible at all. --expected-size is load-bearing twice over: it lets the
+# client choose a part size that stays under the 10,000-part ceiling (300
+# GiB at the pinned 8 MB chunk would be 38,400 parts), and it makes the
+# resulting part sizing reproducible instead of stream-guessed.
+#
+# s3_put_stream <bucket> <s3-key> <gen-key> <size>
+#
+# The generator key is a separate argument because the dedup band writes
+# the SAME content under DIFFERENT S3 keys: content is keyed by gen-key,
+# placement by s3-key.
+s3_put_stream() {
+    local bucket="$1" key="$2" genkey="$3" size="$4"
+    gen_stream "$genkey" "$size" |
+        s3cmd cp --quiet --expected-size "$size" - "s3://$bucket/$key"
+}
+
 # --- bulk paths --------------------------------------------------------
 
 # Uploads a whole directory under a prefix in one aws invocation.
