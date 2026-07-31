@@ -15,6 +15,7 @@
 //! misplaced block. Likewise a file directly under the root: `depth` is
 //! clamped to at least 1, so no record can ever name it.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +73,12 @@ pub struct DiskWalk {
 /// down, a directory by either name is not a fanout directory and is
 /// reported foreign like anything else.
 ///
+/// The store's own metadata files are skipped too, wherever they turn up
+/// ([`ScrubContext::store_own_paths`]): the default layout runs the tools
+/// with one root for both (`--meta-root . --fs-root .`), which puts the
+/// shared block database and its header sidecar *inside* the blocks root.
+/// They are not block data and they are not foreign -- they are the store.
+///
 /// # Errors
 ///
 /// [`io::Error`] if a directory cannot be read. Deliberately fatal: a
@@ -83,7 +90,14 @@ pub fn walk_disk(ctx: &ScrubContext) -> io::Result<DiskWalk> {
     if !root.exists() {
         return Ok(walk);
     }
-    walk_dir(&root, &[], ctx.id_width(), &mut walk, true)?;
+    walk_dir(
+        &root,
+        &[],
+        ctx.id_width(),
+        &ctx.store_own_paths(),
+        &mut walk,
+        true,
+    )?;
     Ok(walk)
 }
 
@@ -94,6 +108,7 @@ fn walk_dir(
     dir: &Path,
     chain: &[u8],
     id_width: usize,
+    store_own: &HashSet<PathBuf>,
     walk: &mut DiskWalk,
     at_root: bool,
 ) -> io::Result<()> {
@@ -104,6 +119,9 @@ fn walk_dir(
 
     for entry in entries {
         let path = entry.path();
+        if store_own.contains(&path) {
+            continue;
+        }
         let file_type = entry.file_type()?;
 
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -123,7 +141,7 @@ fn walk_dir(
                 Some(byte) => {
                     let mut deeper = chain.to_vec();
                     deeper.push(byte);
-                    walk_dir(&path, &deeper, id_width, walk, false)?;
+                    walk_dir(&path, &deeper, id_width, store_own, walk, false)?;
                 }
                 None => walk.foreign.push(ForeignPath {
                     path,

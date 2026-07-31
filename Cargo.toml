@@ -4,6 +4,7 @@ members = [
     "s3cas",
     "respd",
     "benches",
+    "qss-storage-fsck",
 ]
 resolver = "2"
 

@@ -472,6 +472,49 @@ fn tmp_and_quarantine_are_skipped_only_at_the_root() {
     );
 }
 
+/// The layout the tools ship with -- one root for both halves of the store
+/// (`--meta-root .` and `--fs-root .`) -- puts the shared block database and
+/// its header sidecar INSIDE the blocks root, where the disk walk runs. They
+/// are the store's own files: reporting them foreign would be wrong, and a
+/// repair acting on that finding would rename the live database into
+/// quarantine.
+#[test]
+fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let fs = CasFS::single_namespace(
+        root.clone(),
+        root.clone(),
+        SharedMetrics::default(),
+        StorageEngine::Fjall,
+        Some(1),
+        Some(Durability::Buffer),
+        None,
+        false,
+    )
+    .unwrap();
+    let blocks_db = root.join("blocks").join("db");
+    assert!(blocks_db.is_dir(), "the premise: the DB is under blocks/");
+
+    let ctx = ScrubContext::new(fs.namespace_meta_store(), fs.shared_block_store())
+        .with_meta_root(root.clone());
+    let walk = walk_disk(&ctx).unwrap();
+    assert!(walk.files.is_empty());
+    assert!(
+        walk.foreign.is_empty(),
+        "the store's own metadata is not residue: {:?}",
+        walk.foreign
+    );
+
+    // The rule is exactly the opener's knowledge: a context that was not told
+    // which meta root it opened cannot know, and says so by reporting them.
+    let blind = ScrubContext::new(fs.namespace_meta_store(), fs.shared_block_store());
+    assert!(
+        !walk_disk(&blind).unwrap().foreign.is_empty(),
+        "without a meta root there is nothing to compare against"
+    );
+}
+
 /// The two fileless residue classes seen through the walkers: both are
 /// records the record walk decodes and the disk walk knows nothing about.
 /// Telling them apart is a pass's job; producing the raw material is this

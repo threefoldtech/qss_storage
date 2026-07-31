@@ -2693,6 +2693,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qss-storage-fsck"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cas-storage",
+ "clap",
+ "futures",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

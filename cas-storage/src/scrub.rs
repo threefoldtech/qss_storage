@@ -30,10 +30,12 @@ pub mod records;
 pub mod repair;
 pub mod report;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::cas::SharedBlockStore;
 use crate::metastore::MetaStore;
+use crate::metastore::store_header::STORE_HEADER_SIDECAR;
 
 pub use disk::{BlockFile, DiskWalk, ForeignPath, walk_disk};
 pub use engine::{ScrubError, ScrubOptions, run};
@@ -88,6 +90,32 @@ impl<'a> ScrubContext<'a> {
     /// The metadata root, if the opener supplied it.
     pub fn meta_root(&self) -> Option<&Path> {
         self.meta_root.as_deref()
+    }
+
+    /// Paths that are the store's own metadata rather than block data, in the
+    /// canonical form the disk walk compares against.
+    ///
+    /// The two databases of a store sit at `<meta_root>/db` and
+    /// `<meta_root>/blocks/db`, each with a header sidecar next to it -- and
+    /// the tools default to one root for both halves (`--meta-root .
+    /// --fs-root .`), which puts the block database and its sidecar *inside*
+    /// `<fs_root>/blocks`, the tree [`walk_disk`] walks. Reporting them
+    /// foreign would be wrong, and a `--repair` acting on that finding would
+    /// rename the live database into quarantine.
+    ///
+    /// Derived from the meta root, so a caller that did not supply one gets
+    /// nothing skipped: only the opener knows which paths it opened.
+    /// Non-existent candidates drop out here, so the walk compares against
+    /// paths that are really there.
+    pub fn store_own_paths(&self) -> HashSet<PathBuf> {
+        let Some(meta_root) = &self.meta_root else {
+            return HashSet::new();
+        };
+        [meta_root.clone(), meta_root.join("blocks")]
+            .iter()
+            .flat_map(|dir| [dir.join("db"), dir.join(STORE_HEADER_SIDECAR)])
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect()
     }
 
     /// The namespace metadata store: bucket trees live here.

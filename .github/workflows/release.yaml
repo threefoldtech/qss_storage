@@ -44,13 +44,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release -p s3cas
+        run: cargo build --release -p s3cas -p qss-storage-fsck
 
       - name: Upload Linux binary
         uses: actions/upload-artifact@v4
         with:
           name: s3cas-linux
           path: target/release/s3cas
+
+      - name: Upload Linux fsck binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qss-storage-fsck-linux
+          path: target/release/qss-storage-fsck
 
   build-macos:
     needs: [test]
@@ -68,13 +74,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release -p s3cas
+        run: cargo build --release -p s3cas -p qss-storage-fsck
 
       - name: Upload macOS binary
         uses: actions/upload-artifact@v4
         with:
           name: s3cas-macos
           path: target/release/s3cas
+
+      - name: Upload macOS fsck binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qss-storage-fsck-macos
+          path: target/release/qss-storage-fsck
 
   create-release:
     needs: [build-linux, build-macos]
@@ -91,6 +103,8 @@ jobs:
           ls -la artifacts
           ls -la artifacts/s3cas-linux || echo "Linux directory not found"
           ls -la artifacts/s3cas-macos || echo "macOS directory not found"
+          ls -la artifacts/qss-storage-fsck-linux || echo "fsck Linux directory not found"
+          ls -la artifacts/qss-storage-fsck-macos || echo "fsck macOS directory not found"
 
       - name: Rename binaries to include platform
         run: |
@@ -99,6 +113,14 @@ jobs:
           fi
           if [ -f "artifacts/s3cas-macos/s3cas" ]; then
             mv artifacts/s3cas-macos/s3cas artifacts/s3cas-macos/s3cas-macos
+          fi
+          if [ -f "artifacts/qss-storage-fsck-linux/qss-storage-fsck" ]; then
+            mv artifacts/qss-storage-fsck-linux/qss-storage-fsck \
+               artifacts/qss-storage-fsck-linux/qss-storage-fsck-linux
+          fi
+          if [ -f "artifacts/qss-storage-fsck-macos/qss-storage-fsck" ]; then
+            mv artifacts/qss-storage-fsck-macos/qss-storage-fsck \
+               artifacts/qss-storage-fsck-macos/qss-storage-fsck-macos
           fi
 
       - name: Create Release
@@ -114,3 +136,5 @@ jobs:
           files: |
             artifacts/s3cas-linux/s3cas-linux
             artifacts/s3cas-macos/s3cas-macos
+            artifacts/qss-storage-fsck-linux/qss-storage-fsck-linux
+            artifacts/qss-storage-fsck-macos/qss-storage-fsck-macos
