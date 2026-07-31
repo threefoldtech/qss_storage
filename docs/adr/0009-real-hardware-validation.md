@@ -125,6 +125,54 @@ designated hardware and reads a verdict from.
    (S3 deletes, respd deletes, bucket removal); final fsck: the store
    should reconcile to empty (or enumerate exactly what remains and
    why); record reclaimed-space curve.
+10. **The terabyte (the ultimate test)** -- flag-gated (`--tb`), owns
+    the disk for a session, replaces phases 5/8/9's scale rather than
+    repeating them:
+    - **Fill ~1 TB, capped at 85% of the filesystem**, through the real
+      S3 path with parallel aws-cli workers, in a composition that
+      exercises every regime at once:
+      - 4 x 100 GiB multipart giants (client-driven part sizing);
+      - ~500 GiB of 1-16 MiB objects, tens of thousands of keys
+        (the block-store working regime);
+      - ~50 GiB of 100 MiB objects (multipart threshold band);
+      - ~1 GiB across one million tiny objects (metadata regime:
+        fjall at 1M+ keys, listings, memory);
+      - a 100 GiB **dedup band written twice** under different keys:
+        logical 200 GiB, stored once -- dedup and rc-exactness at
+        scale, verified by disk usage staying ~100 GiB and fsck's
+        recount agreeing.
+    - **Verification without a mirror**: every object's content is
+      derived from a seeded generator keyed by its object key (a small
+      deterministic stream generator in tests/real/lib), so GET
+      verification recomputes and byte-compares streaming -- there is
+      no second terabyte anywhere. Full verification of the giants and
+      the dedup band; sampled verification (>= 1%) of the mid and tiny
+      bands; the full-store integrity claim comes from the scrub, which
+      reads every block regardless.
+    - **A kill -9 mid-fill** (once, at a randomized point past 500 GiB)
+      with resume: the fill is idempotent per key, so the campaign
+      restarts the daemon and continues; fsck after the fill must show
+      leak-class residue only.
+    - **Metadata-scale checks**: list a million keys through paginated
+      aws-cli listings; time the metadata-only fsck recount at 1M+
+      objects; record fjall DB size and daemon RSS over the run.
+    - **Full scrub at capacity**: the whole ~1 TB re-hashed; throughput
+      recorded (this is the ADR 0005 sizing estimate's reality check
+      at scale).
+    - **Teardown at scale**: delete the entire dataset through the
+      clients; record the reclaim curve; final fsck reconciles to
+      empty.
+    - **Pass criteria**: everything campaign-level plus: dedup band
+      stored once (disk usage), rc exact at 1M+ objects (recount
+      clean), no daemon panic/OOM/fd exhaustion across the fill, scrub
+      zero corruption, teardown reaches empty.
+    - **Budget**: the fill dominates -- at a realistic 300-800 MB/s
+      through the full S3 path with fsync durability, ~1 TB is 20-60
+      minutes of pure transfer but realistically 2-4 hours with client
+      overhead and the million-object band; scrub adds one full-disk
+      read; teardown and fsck close it out. Plan an overnight session;
+      the phase checkpoints per band so a rerun resumes rather than
+      restarts.
 
 ### Pass criteria (campaign-level)
 
@@ -155,8 +203,8 @@ finding, filed with its phase log, and the verdict says FAIL.
   ACLs, policies) drowning the signal; no RESP coverage; no crash or
   durability phases -- the part this campaign uniquely adds.
 - **Bets on**: conformance breadth mattering more than depth on our
-  claims. Not rejected -- deferred as an optional phase 10 (a curated
-  subset), review ask 3.
+  claims. Not rejected -- deferred as an optional add-on phase (a
+  curated subset), review ask 3.
 
 ### CI-cloud execution
 - **The idea**: run the campaign in CI on cloud instances.
@@ -209,7 +257,8 @@ A: Dominated by dataset writes and the scrub: at NVMe speeds, the
 functional phases are minutes; stress and soak are configured wall
 time (default 30 min); the scrub reads the whole store once. Budget
 2-4 hours default, tunable via a SCALE knob (dataset multiplier) in
-the campaign config.
+the campaign config. The terabyte (phase 10, --tb) is outside the
+default budget: it is its own overnight session.
 
 **Q: What stops /s3 residue from one run poisoning the next?**
 A: The preflight refuses a non-empty store unless `--resume` is
@@ -256,10 +305,13 @@ Review asks:
    first-run sizing for the nvme1n1 disk?
 2. Phase 7's durability matrix at buffer level -- include in the
    default run or flag-gated (it doubles the crash-phase time)?
-3. Optional phase 10: curated ceph/s3-tests subset -- include now,
-   later, or never?
+3. Optional curated ceph/s3-tests subset -- include now, later, or
+   never?
 4. `--fresh` wipe semantics (fsck-verified store-dir wipe, never the
    mount) -- acceptable?
+5. The terabyte (phase 10): composition (4x100 GiB giants / 500 GiB
+   mid / 1M tiny / 100 GiB dedup-doubled), the 85%-of-filesystem cap,
+   and the overnight budget -- agree, or reshape the bands?
 
 ---
 
