@@ -156,13 +156,21 @@ rail_fresh() {
         fi
     done
 
-    if [ -d "$root/s3" ] && ! rail_store_exists "$root/s3"; then
+    # A store directory that exists but holds no store is fine when it is
+    # empty -- that is a run that got as far as mkdir and no further, and
+    # there is nothing in it to lose. Non-empty and not a store is a
+    # refusal: whatever is in there, this campaign did not put it there.
+    if [ -d "$root/s3" ] && [ -n "$(ls -A "$root/s3" 2>/dev/null)" ] &&
+        ! rail_store_exists "$root/s3"; then
         check_fail "--fresh refuses a directory that is not a qss store" \
             "$root/s3 has no db/ and blocks/db/; wipe it by hand if you meant to"
         return 1
     fi
 
-    if [ -d "$root/s3" ]; then
+    # The ADR's condition: wipe only after fsck confirms this is a qss store
+    # (or the directory is empty -- an empty directory has nothing to
+    # confirm and nothing to lose).
+    if rail_store_exists "$root/s3"; then
         if fsck_can_open "$root/s3"; then
             check_pass "--fresh: fsck confirms $root/s3 is a qss store"
         else

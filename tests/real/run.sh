@@ -157,8 +157,10 @@ qssrt_plan() {
         done
         [ "$QSSRT_TB" = 1 ] && plan+=(10)
     fi
+    # Preflight first and once, however it was selected.
     printf '00\n'
     for n in "${plan[@]}"; do
+        [ "$((10#$n))" = 0 ] && continue
         printf '%02d\n' "$((10#$n))"
     done
     : # keep the function's status clean whatever the last test decided
