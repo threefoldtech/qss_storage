@@ -19,6 +19,32 @@ qssrt_respd_log() { printf '%s/respd.log' "$(qssrt_daemon_dir)"; }
 
 # --- s3cas -------------------------------------------------------------
 
+# Phases run as subprocesses of the driver, so a daemon one phase started is
+# not a child of the next one. The pid file is what makes a daemon
+# adoptable: a phase picks up the running daemon instead of starting a
+# second one against a store whose fjall LOCK is already held.
+#
+# The comm check is not decoration. Pids are reused, and killing an
+# unrelated process because a stale pid file named it is exactly the kind of
+# damage a test harness must not be capable of.
+s3d_adopt() {
+    local pid_file="$(qssrt_daemon_dir)/s3cas.pid" pid
+    [ -f "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "s3cas" ] || return 1
+    QSSRT_S3_PID="$pid"
+    return 0
+}
+
+# The daemon this phase needs: the one already running, or a new one.
+s3d_ensure_running() {
+    s3d_running && return 0
+    s3d_adopt && return 0
+    s3d_start "$@"
+}
+
 # Starts the S3 daemon. An explicit durability level overrides the campaign
 # config, which is how phase 7 runs the same crash cycle at buffer level.
 s3d_start() {
@@ -117,9 +143,10 @@ s3d_restart() {
 }
 
 # Ensures the daemon is stopped, for the phases that need the fjall LOCK
-# (every fsck run).
+# (every fsck run) and for the driver's own teardown.
 s3d_ensure_stopped() {
-    s3d_running && s3d_stop
+    s3d_running || s3d_adopt || return 0
+    s3d_stop
     return 0
 }
 
@@ -141,6 +168,29 @@ respd_start() {
 
 respd_running() {
     [ -n "$QSSRT_RESPD_PID" ] && kill -0 "$QSSRT_RESPD_PID" 2>/dev/null
+}
+
+respd_adopt() {
+    local pid_file="$(qssrt_daemon_dir)/respd.pid" pid
+    [ -f "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "respd" ] || return 1
+    QSSRT_RESPD_PID="$pid"
+    return 0
+}
+
+respd_ensure_running() {
+    respd_running && return 0
+    respd_adopt && return 0
+    respd_start
+}
+
+respd_ensure_stopped() {
+    respd_running || respd_adopt || return 0
+    respd_stop
+    return 0
 }
 
 respd_stop() {
