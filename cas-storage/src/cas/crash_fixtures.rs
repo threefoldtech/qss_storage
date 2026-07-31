@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use crate::metastore::{Block, BlockId, block_disk_path};
+use crate::metastore::{Block, BlockId, ContentHash, MetaStore, block_disk_path};
 
 /// Residue class 1: an orphan block file without a record -- the crash
 /// window between the rename and the record commit, or a cancelled PUT
@@ -76,6 +76,107 @@ pub(crate) fn plant_degraded_record(
     // No file either: degraded means the bytes are gone.
 }
 
+/// Rewrites an existing record's rc to exactly `rc`, leaving size, depth
+/// and flags alone. The shared half of the two rc-residue constructors
+/// below; goes through [`Transaction::put_block_record`], which is the raw
+/// write fsck's repair uses too.
+fn set_rc(shared: &super::shared_block_store::SharedBlockStore, id: BlockId, rc: usize) {
+    let record = shared
+        .block_tree()
+        .get_block(id.as_slice())
+        .unwrap()
+        .expect("the record to adjust must exist");
+    let adjusted = Block::from_parts(record.size(), record.depth(), rc, record.flags());
+    let mut tx = shared.meta_store().begin_transaction();
+    tx.put_block_record(id, &adjusted).unwrap();
+    tx.commit().unwrap();
+}
+
+/// Residue class 6: an inflated refcount -- the leak direction. Produced by
+/// the same-key overwrite (which bumps for the new object and decrements
+/// nothing for the replaced one) and by a DELETE that crashed after
+/// removing the object record. Costs space, never data; fsck's recount
+/// lowers it to the walked truth.
+pub(crate) fn plant_inflated_rc(
+    shared: &super::shared_block_store::SharedBlockStore,
+    id: BlockId,
+    extra: usize,
+) {
+    let rc = shared
+        .block_tree()
+        .get_block(id.as_slice())
+        .unwrap()
+        .expect("the record to inflate must exist")
+        .rc();
+    set_rc(shared, id, rc + extra);
+}
+
+/// Residue class 7: a deflated refcount -- the loss direction, and the one
+/// no protocol path produces: it means a reference was dropped without its
+/// holder going away, so the next DELETE of one holder frees a block the
+/// others still read. fsck reports it CRITICAL and raises it back to the
+/// walked truth.
+pub(crate) fn plant_deflated_rc(
+    shared: &super::shared_block_store::SharedBlockStore,
+    id: BlockId,
+    missing: usize,
+) {
+    let rc = shared
+        .block_tree()
+        .get_block(id.as_slice())
+        .unwrap()
+        .expect("the record to deflate must exist")
+        .rc();
+    set_rc(shared, id, rc.saturating_sub(missing));
+}
+
+/// Residue class 8: silent corruption -- a block file whose bytes changed
+/// under a name that still claims their old hash. Same name, same length,
+/// so only a re-hash sees it: the shape the `--scrub` pass exists for.
+pub(crate) fn plant_bit_flip(blocks_root: &Path, id: &BlockId, depth: u8) {
+    let path = block_disk_path(id, depth, blocks_root.to_path_buf());
+    let mut bytes = std::fs::read(&path).expect("the block file to rot must exist");
+    assert!(!bytes.is_empty(), "an empty block cannot be bit-flipped");
+    bytes[0] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+/// Residue class 9: a half-deleted bucket -- `bucket_delete` removes the
+/// `_BUCKETS` row before tearing the objects down, so a crash mid-loop
+/// strands an object tree that no listing names and whose records still
+/// hold block references. fsck resumes the teardown.
+pub(crate) fn plant_half_deleted_bucket(namespace: &MetaStore, bucket: &str) {
+    namespace
+        .get_allbuckets_tree()
+        .unwrap()
+        .remove(bucket.as_bytes())
+        .unwrap();
+}
+
+/// Residue class 10: a stale part record -- an upload that was never
+/// completed or aborted. Its blocks stay referenced (part records are
+/// holders like any other), so fsck reports it and touches nothing:
+/// reaping needs ADR 0003's abort semantics.
+pub(crate) fn plant_stale_part(
+    fs: &super::CasFS,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i64,
+    blocks: Vec<BlockId>,
+) {
+    fs.insert_multipart_part(
+        bucket.to_string(),
+        key.to_string(),
+        1024,
+        part_number,
+        upload_id.to_string(),
+        ContentHash::from([5u8; 16]),
+        blocks,
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +215,20 @@ mod tests {
 
     fn some_id(seed: u8) -> BlockId {
         BlockId::from([seed; crate::metastore::BLOCKID_SIZE])
+    }
+
+    /// Stores `data` as one object and returns its single block id: the
+    /// live shape the rc and corruption fixtures damage.
+    async fn put(fs: &CasFS, bucket: &str, key: &str, data: Vec<u8>) -> BlockId {
+        let id = fs.hasher().hash(&data);
+        let len = data.len();
+        let stream = crate::cas::AsyncByteStream::new(futures::stream::once(async move {
+            Ok(bytes::Bytes::from(data))
+        }));
+        fs.store_single_object_and_meta(bucket, key, stream, len)
+            .await
+            .unwrap();
+        id
     }
 
     /// Orphan file: on disk, not in the tree. The shape fsck's
@@ -244,5 +359,131 @@ mod tests {
             !block.disk_path(&id, fs.fs_root().clone()).exists(),
             "a degraded record has no file"
         );
+    }
+
+    /// Inflated and deflated rc: only the count moves. Everything else the
+    /// record says stays true, which is what makes the recount's diff the
+    /// only evidence fsck has.
+    #[tokio::test]
+    async fn rc_residue_moves_the_count_and_nothing_else() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = fixture_store(dir.path());
+        fs.create_bucket("b").unwrap();
+        let id = put(&fs, "b", "k", b"a real block".repeat(20).to_vec()).await;
+
+        let before = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.rc(), 1);
+
+        plant_inflated_rc(&shared, id, 4);
+        let inflated = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(inflated.rc(), 5, "one real holder, four leaked");
+        assert_eq!(inflated.size(), before.size());
+        assert_eq!(inflated.depth(), before.depth());
+        assert!(!inflated.is_degraded());
+
+        plant_deflated_rc(&shared, id, 5);
+        let deflated = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(deflated.rc(), 0, "a reference dropped without its holder");
+        assert!(
+            deflated.disk_path(&id, fs.fs_root().clone()).is_file(),
+            "the file is untouched: only the accounting is damaged"
+        );
+    }
+
+    /// A bit flip keeps the name and the length, so nothing short of a
+    /// re-hash can tell: the whole reason the corruption scrub reads bytes.
+    #[tokio::test]
+    async fn bit_flip_keeps_the_name_and_the_length() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = fixture_store(dir.path());
+        fs.create_bucket("b").unwrap();
+        let id = put(&fs, "b", "k", b"bytes that rot".repeat(20).to_vec()).await;
+        let depth = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .unwrap()
+            .depth();
+        let path = block_disk_path(&id, depth, fs.fs_root().clone());
+        let before = std::fs::read(&path).unwrap();
+
+        plant_bit_flip(fs.fs_root(), &id, depth);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), before.len(), "same length");
+        assert_ne!(after, before, "different bytes");
+        assert_ne!(
+            shared.hasher().hash(&after),
+            id,
+            "the file no longer hashes to the name it is filed under"
+        );
+    }
+
+    /// A half-deleted bucket: the row is gone, the tree and its records are
+    /// not, and the objects still hold their block references.
+    #[tokio::test]
+    async fn half_deleted_bucket_keeps_its_tree_and_its_references() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = fixture_store(dir.path());
+        fs.create_bucket("doomed").unwrap();
+        let id = put(&fs, "doomed", "k", b"still referenced".repeat(8).to_vec()).await;
+
+        plant_half_deleted_bucket(fs.namespace_meta_store(), "doomed");
+
+        assert!(
+            !fs.list_buckets()
+                .unwrap()
+                .iter()
+                .any(|b| b.name() == "doomed"),
+            "no listing names it any more"
+        );
+        assert!(
+            fs.namespace_meta_store()
+                .list_trees()
+                .unwrap()
+                .iter()
+                .any(|t| t == "doomed"),
+            "the object tree outlives the row"
+        );
+        assert_eq!(
+            shared
+                .block_tree()
+                .get_block(id.as_slice())
+                .unwrap()
+                .unwrap()
+                .rc(),
+            1,
+            "the stranded object still holds its reference"
+        );
+    }
+
+    /// A stale part record holds its blocks like any other holder: that is
+    /// why the recount counts part records unconditionally.
+    #[test]
+    fn stale_part_record_holds_its_blocks() {
+        let dir = tempdir().unwrap();
+        let (_shared, fs) = fixture_store(dir.path());
+        fs.create_bucket("b").unwrap();
+        let held = some_id(0x55);
+
+        plant_stale_part(&fs, "b", "big", "u-1", 1, vec![held]);
+
+        let part = fs
+            .get_multipart_part("b", "big", "u-1", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(part.blocks(), &[held]);
     }
 }

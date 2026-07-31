@@ -10,8 +10,8 @@
 //!
 //! [`passes`] compares those three and says what the differences mean;
 //! [`engine::run`] walks once, runs the passes and returns a [`report`].
-//! Repair is not here: this module only ever reads (ADR 0005 component 5
-//! owns the actions).
+//! Everything up to there only ever reads; [`mod@repair`] is the one module
+//! that mutates, and it runs after a report has been emitted, never before.
 //!
 //! One rule is enforced below the passes: the holder walk refuses on any
 //! incompleteness, because a recount over a partial holder set that then
@@ -27,6 +27,7 @@ pub mod findings;
 pub mod holders;
 pub mod passes;
 pub mod records;
+pub mod repair;
 pub mod report;
 
 use std::path::{Path, PathBuf};
@@ -39,6 +40,10 @@ pub use engine::{ScrubError, ScrubOptions, run};
 pub use findings::{Finding, FindingClass, HolderRef, Severity};
 pub use holders::{ExpectedCounts, HolderEnumerationError, expected_counts, holders_of};
 pub use records::{RecordWalk, walk_records};
+pub use repair::{
+    RepairAction, RepairContext, RepairCounts, RepairError, RepairOutcome, RepairStatus,
+    RepairSummary, repair,
+};
 pub use report::{Pass, Report, StoreRef, Summary, exit_code};
 
 /// What a walker needs from an opened store.

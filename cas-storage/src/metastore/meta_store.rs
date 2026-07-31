@@ -727,9 +727,10 @@ impl Transaction {
     /// the protocol's accounting rules apply. Daemon paths use the striped
     /// read-modify-writes above instead.
     ///
-    /// Test-gated until fsck's repair actions land (ADR 0005 component 5);
-    /// today the crash fixtures are its only caller.
-    #[cfg(test)]
+    /// Callers are ADR 0005's repair actions, which run offline under the
+    /// store's exclusive open, and the crash fixtures. A daemon path
+    /// reaching for this would be writing an rc it did not derive under the
+    /// stripe.
     pub(crate) fn put_block_record(
         &mut self,
         block_hash: BlockId,
@@ -737,6 +738,20 @@ impl Transaction {
     ) -> Result<(), MetaError> {
         self.backend
             .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())
+    }
+
+    /// Removes the record for `block_hash`; an absent record is not an
+    /// error.
+    ///
+    /// The counterpart of [`put_block_record`](Self::put_block_record) for
+    /// the one repair that must erase rather than rewrite: a recount that
+    /// comes back zero. The protocol has no rc=0 state -- the daemon's
+    /// decrement removes the record at its last reference -- so fsck's
+    /// set-rc removes the record here and unlinks the file, exactly as
+    /// [`decrement_block_rc`](Self::decrement_block_rc) would have.
+    pub(crate) fn remove_block_record(&mut self, block_hash: BlockId) -> Result<(), MetaError> {
+        self.backend
+            .remove(DEFAULT_BLOCK_TREE, block_hash.as_slice())
     }
 }
 
