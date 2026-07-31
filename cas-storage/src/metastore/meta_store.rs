@@ -593,91 +593,67 @@ impl Transaction {
         self.backend.rollback();
     }
 
-    /// Writes a block to the database, handling reference counting.
+    /// The dedup half of the ADR 0006 write protocol: if a record for
+    /// `block_hash` exists, bump its reference count by one INSIDE this
+    /// transaction and return the updated block; otherwise return `None`
+    /// and change nothing.
     ///
-    /// This method either creates a new block or updates an existing one's
-    /// reference count. The existence check and the mutation happen on this
-    /// transaction, so committing makes them one atomic read-modify-write.
+    /// The existence check and the rc mutation are one transactional
+    /// read-modify-write (hard rule 2) -- never split this into a pre-tx
+    /// read with a blind write. Every dedup hit bumps: the old
+    /// `key_has_block` skip undercounted references and is gone (ADR 0006).
     ///
-    /// # Arguments
-    /// * `block_hash` - The hash of the block to write
-    /// * `data_len` - The length of the block data
-    /// * `key_has_block` - Whether the key already has this block
-    /// * `depth` - The fanout depth the caller chose for the block file
-    ///   (see `cas::placement`); recorded on new blocks, ignored on a dedup
-    ///   hit -- the existing record's depth stands, since that is where the
-    ///   file is.
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// * A boolean indicating whether the block was newly created
-    /// * The Block object
-    pub fn write_block(
-        &mut self,
-        block_hash: BlockId,
-        data_len: usize,
-        key_has_block: bool,
-        depth: u8,
-    ) -> Result<(bool, Block), MetaError> {
-        // Check if the block already exists
+    /// The caller must hold the block's stripe (hard rule 1).
+    pub fn bump_block_rc(&mut self, block_hash: BlockId) -> Result<Option<Block>, MetaError> {
         match self
             .backend
             .get(DEFAULT_BLOCK_TREE, block_hash.as_slice())?
         {
-            // Block exists
+            None => Ok(None),
             Some(block_data) => {
                 let mut block = Block::try_from(&*block_data as &[u8])?;
-
-                // If the key doesn't have this block, increment the reference count
-                if !key_has_block {
-                    let old_rc = block.rc();
-                    block.increment_refcount();
-                    let new_rc = block.rc();
-                    tracing::debug!(
-                        block_hash = %block_hash.to_hex(),
-                        old_rc = old_rc,
-                        new_rc = new_rc,
-                        key_has_block = key_has_block,
-                        "Block exists: incrementing refcount"
-                    );
-                    self.backend.insert(
-                        DEFAULT_BLOCK_TREE,
-                        block_hash.as_slice(),
-                        block.to_vec(),
-                    )?;
-                } else {
-                    tracing::debug!(
-                        block_hash = %block_hash.to_hex(),
-                        rc = block.rc(),
-                        key_has_block = key_has_block,
-                        "Block exists: NOT incrementing (key already has it)"
-                    );
-                }
-
-                Ok((false, block))
-            }
-            // Block doesn't exist, create it at the caller's chosen depth.
-            // The path is derived from the id and this depth
-            // (`block_disk_path`), so there is nothing to allocate: the
-            // `_PATHS` tree and its prefix allocator are gone (ADR 0006).
-            None => {
-                let block = Block::new(data_len, depth);
-
+                let old_rc = block.rc();
+                block.increment_refcount();
                 tracing::debug!(
                     block_hash = %block_hash.to_hex(),
-                    rc = block.rc(),
-                    data_len = data_len,
-                    depth = depth,
-                    key_has_block = key_has_block,
-                    "Creating new block with rc=1"
+                    old_rc = old_rc,
+                    new_rc = block.rc(),
+                    "Block exists: incrementing refcount"
                 );
-
                 self.backend
                     .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())?;
-
-                Ok((true, block))
+                Ok(Some(block))
             }
         }
+    }
+
+    /// The new-block half of the ADR 0006 write protocol: insert a fresh
+    /// record (rc = 1) for `block_hash` at the given fanout depth.
+    ///
+    /// Callable only after the block's file is durable at its final path
+    /// (hard rule 5) and only while holding the block's stripe (hard
+    /// rule 1) -- under the stripe no re-check is needed: only stripe
+    /// holders insert, and [`bump_block_rc`](Self::bump_block_rc) just said
+    /// there is no record.
+    pub fn insert_new_block(
+        &mut self,
+        block_hash: BlockId,
+        data_len: usize,
+        depth: u8,
+    ) -> Result<Block, MetaError> {
+        let block = Block::new(data_len, depth);
+
+        tracing::debug!(
+            block_hash = %block_hash.to_hex(),
+            data_len = data_len,
+            depth = depth,
+            "Creating new block with rc=1"
+        );
+
+        self.backend
+            .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())?;
+
+        Ok(block)
     }
 }
 
@@ -732,15 +708,15 @@ mod tests {
     /// A new block records the depth the caller chose; the derived disk path
     /// follows it.
     #[test]
-    fn write_block_records_the_given_depth() {
+    fn insert_new_block_records_the_given_depth() {
         let (meta, dir) = test_store();
         let hash = BlockId::from([0xaau8; BLOCKID_SIZE]);
 
         let mut tx = meta.begin_transaction();
-        let (new, block) = tx.write_block(hash, 42, false, 3).unwrap();
+        let block = tx.insert_new_block(hash, 42, 3).unwrap();
         tx.commit().unwrap();
 
-        assert!(new);
+        assert_eq!(block.rc(), 1);
         assert_eq!(block.depth(), 3);
         assert_eq!(
             block.disk_path(&hash, dir.path().to_path_buf()),
@@ -748,25 +724,52 @@ mod tests {
         );
     }
 
-    /// A dedup hit bumps the rc and keeps the ORIGINAL depth -- that is where
-    /// the file is; the caller's depth guess is ignored.
+    /// A dedup bump increments rc and keeps the ORIGINAL depth -- that is
+    /// where the file is.
     #[test]
-    fn write_block_dedup_hit_keeps_the_recorded_depth() {
+    fn bump_block_rc_hits_and_keeps_the_recorded_depth() {
         let (meta, _dir) = test_store();
         let hash = BlockId::from([0xabu8; BLOCKID_SIZE]);
 
+        // No record yet: the bump reports a miss and mutates nothing.
         let mut tx = meta.begin_transaction();
-        let (new, _) = tx.write_block(hash, 42, false, 2).unwrap();
-        tx.commit().unwrap();
-        assert!(new);
+        assert!(tx.bump_block_rc(hash).unwrap().is_none());
+        tx.rollback();
 
         let mut tx = meta.begin_transaction();
-        let (new, block) = tx.write_block(hash, 42, false, 7).unwrap();
+        tx.insert_new_block(hash, 42, 2).unwrap();
         tx.commit().unwrap();
 
-        assert!(!new);
+        let mut tx = meta.begin_transaction();
+        let block = tx.bump_block_rc(hash).unwrap().expect("record exists");
+        tx.commit().unwrap();
+
         assert_eq!(block.rc(), 2);
         assert_eq!(block.depth(), 2, "dedup must not move the block");
+    }
+
+    /// A bump inside a rolled-back transaction leaves the record untouched:
+    /// the RMW is transactional, not a blind write.
+    #[test]
+    fn bump_block_rc_rolls_back_with_the_transaction() {
+        let (meta, _dir) = test_store();
+        let hash = BlockId::from([0xacu8; BLOCKID_SIZE]);
+
+        let mut tx = meta.begin_transaction();
+        tx.insert_new_block(hash, 42, 1).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = meta.begin_transaction();
+        tx.bump_block_rc(hash).unwrap().expect("record exists");
+        tx.rollback();
+
+        let block = meta
+            .get_block_tree()
+            .unwrap()
+            .get_block(hash.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.rc(), 1, "rolled-back bump must not persist");
     }
 
     /// A bucket becomes a tree of its own name, so a bucket named like one of
@@ -801,7 +804,7 @@ mod tests {
     /// Two hashes sharing a leading byte can both live at depth 1: their
     /// full-id filenames can never collide, so no allocator is involved.
     #[test]
-    fn write_block_shared_prefix_needs_no_allocation() {
+    fn shared_prefix_needs_no_allocation() {
         let (meta, dir) = test_store();
         let first = BlockId::from([0x11u8; BLOCKID_SIZE]);
         let mut second_bytes = [0x11u8; BLOCKID_SIZE];
@@ -809,11 +812,11 @@ mod tests {
         let second = BlockId::from(second_bytes);
 
         let mut tx = meta.begin_transaction();
-        let (_, first_block) = tx.write_block(first, 1, false, 1).unwrap();
+        let first_block = tx.insert_new_block(first, 1, 1).unwrap();
         tx.commit().unwrap();
 
         let mut tx = meta.begin_transaction();
-        let (_, second_block) = tx.write_block(second, 1, false, 1).unwrap();
+        let second_block = tx.insert_new_block(second, 1, 1).unwrap();
         tx.commit().unwrap();
 
         let p1 = first_block.disk_path(&first, dir.path().to_path_buf());

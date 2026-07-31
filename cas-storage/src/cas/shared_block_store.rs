@@ -32,18 +32,10 @@ pub struct SharedBlockStore {
     /// Fanout-depth placement for new block files.
     placement: BlockPlacement,
     /// Per-block-hash lock stripes; every `_BLOCKS` mutation runs under one.
-    // TODO(adr-0006): the allow dies when the write path (component 5)
-    // starts taking stripes.
-    #[allow(dead_code)]
     stripes: Stripes,
     /// The atomic temp+fsync+rename writer (open duties already run).
-    // TODO(adr-0006): the allow dies when the write path (component 5)
-    // starts writing through this.
-    #[allow(dead_code)]
     disk_writer: AtomicBlockWriter,
     /// The low-level disk ops the writer drives; swapped by tests.
-    // TODO(adr-0006): the allow dies with component 5.
-    #[allow(dead_code)]
     disk_ops: Arc<dyn BlockDiskOps>,
 }
 
@@ -135,11 +127,24 @@ impl SharedBlockStore {
     }
 
     /// The store's per-block lock stripes.
-    // TODO(adr-0006): the allow dies when the write path (component 5)
-    // starts taking stripes.
-    #[allow(dead_code)]
     pub(super) fn stripes(&self) -> &Stripes {
         &self.stripes
+    }
+
+    /// The store's atomic block file writer.
+    pub(super) fn disk_writer(&self) -> &AtomicBlockWriter {
+        &self.disk_writer
+    }
+
+    /// The low-level disk ops handle (a seam: tests swap in a failer).
+    pub(super) fn disk_ops(&self) -> Arc<dyn BlockDiskOps> {
+        Arc::clone(&self.disk_ops)
+    }
+
+    /// Test-only: substitute the disk ops before the store is shared.
+    #[cfg(test)]
+    pub(super) fn set_disk_ops(&mut self, ops: Arc<dyn BlockDiskOps>) {
+        self.disk_ops = ops;
     }
 
     /// The hash function this store's blocks are addressed by, as recorded in

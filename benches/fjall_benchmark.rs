@@ -208,7 +208,7 @@ fn bench_transaction(c: &mut Criterion) {
             b.iter(|| {
                 let mut tx = store.begin_transaction();
                 let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false, 1)).unwrap();
+                black_box(tx.insert_new_block(block_id, 1024, 1)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
         });
@@ -252,7 +252,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 // Use a transaction
                 let mut tx = store.begin_transaction();
                 let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false, 1)).unwrap();
+                black_box(tx.insert_new_block(block_id, 1024, 1)).unwrap();
                 black_box(tx.commit()).unwrap();
             });
         });

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::buffered_byte_stream::BufferedByteStream;
 use super::byte_stream::AsyncByteStream;
 use super::fs::CasFS;
+use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{BlockId, ContentHash, MetaError, Object, ObjectData};
 use crate::metrics::SharedMetrics;
 use futures::{
@@ -68,6 +69,94 @@ impl Drop for BlockWriteGuard {
     }
 }
 
+/// One block through the ADR 0006 file-first protocol.
+///
+/// Runs on a blocking thread; `_stripe_guard` is the block's stripe, owned
+/// by this function for its whole extent. That single fact carries three
+/// properties at once:
+///
+/// - every fjall commit (and its journal fsync at Fsync durability) runs
+///   off the executor;
+/// - rename + insert are uncancellable as a unit -- cancelling the request
+///   drops nothing mid-protocol, the detached closure runs to completion
+///   and only then releases the stripe;
+/// - the `Send`-soundness rule on `FjallTransaction` holds trivially: each
+///   transaction begins and commits on this one thread, no await anywhere
+///   between (hard rule 3).
+///
+/// Lock order is stripe first, fjall second; fjall is the leaf lock (hard
+/// rule 6), and no fjall guard is held during the disk I/O between the two
+/// transactions.
+///
+/// Residue of a cancelled request: a completed bump (rc over-count) or a
+/// completed insert (record+file with no object) -- leak class for ADR
+/// 0005 to reconcile, never a torn state.
+fn write_one_block(
+    shared: Arc<SharedBlockStore>,
+    metrics: SharedMetrics,
+    _stripe_guard: tokio::sync::OwnedMutexGuard<()>,
+    block_hash: BlockId,
+    bytes: &[u8],
+) -> io::Result<()> {
+    // Dedup check and rc bump: one transactional RMW under the stripe
+    // (hard rule 2). EVERY hit bumps -- the key_has_block skip is gone.
+    let mut store_tx = shared.meta_store().begin_transaction();
+    match store_tx.bump_block_rc(block_hash) {
+        Err(e) => {
+            store_tx.rollback();
+            return Err(e.into());
+        }
+        Ok(Some(_)) => {
+            tracing::debug!(target: "cas_storage::locks", "Committing dedup rc bump");
+            store_tx.commit()?;
+            // Dedup hit: no disk write, no guard was ever Pending.
+            metrics.block_ignored();
+            return Ok(());
+        }
+        // Release the fjall writer before any disk I/O.
+        Ok(None) => store_tx.rollback(),
+    }
+
+    // New block: the file reaches its final path durably BEFORE the record
+    // is committed (hard rule 5). The guard tracks Pending -> Written /
+    // Failed; a panic in here surfaces as Dropped.
+    let write_guard = BlockWriteGuard::new_pending(metrics);
+
+    // Depth: probe the id's dir chain for an orphan to heal in place,
+    // else the placement policy. Only the new-block path pays for this.
+    let depth = shared.placement().choose_depth(&block_hash);
+
+    let attempt = (|| -> io::Result<()> {
+        shared
+            .disk_writer()
+            .write_block(&*shared.disk_ops(), &block_hash, depth, bytes)?;
+
+        let mut store_tx = shared.meta_store().begin_transaction();
+        if let Err(e) = store_tx.insert_new_block(block_hash, bytes.len(), depth) {
+            store_tx.rollback();
+            return Err(e.into());
+        }
+        tracing::debug!(target: "cas_storage::locks", "Committing new block record");
+        store_tx.commit()?;
+        Ok(())
+    })();
+
+    match attempt {
+        Ok(()) => {
+            write_guard.written(bytes.len());
+            Ok(())
+        }
+        Err(e) => {
+            // File-first means there is nothing to compensate: either the
+            // file write failed (no record was attempted) or the record
+            // commit failed (the file at its final path is orphan residue
+            // that a retry heals in place and fsck can collect).
+            write_guard.failed();
+            Err(e)
+        }
+    }
+}
+
 #[tracing::instrument(skip(fs, data), fields(bucket = %bucket_name, key = %key, size, blocks))]
 pub(super) async fn store_object(
     fs: &CasFS,
@@ -75,12 +164,6 @@ pub(super) async fn store_object(
     key: &str,
     data: AsyncByteStream,
 ) -> io::Result<(Vec<BlockId>, ContentHash, u64)> {
-    let old_obj_meta = match fs.get_object_meta(bucket_name, key) {
-        Ok(Some(obj_meta)) => Some(obj_meta),
-        _ => None,
-    };
-    let old_obj_meta = Arc::new(old_obj_meta);
-
     let (tx, rx) = unbounded();
     let mut content_hash = Md5::new();
     let data = BufferedByteStream::new(data);
@@ -98,150 +181,60 @@ pub(super) async fn store_object(
             fs.metrics.bytes_received(bytes.len());
         }
     })
-    .zip(stream::repeat((tx, old_obj_meta)))
+    .zip(stream::repeat(tx))
     .enumerate()
-    .for_each(
-        |(idx, (maybe_chunk, (mut tx, old_obj_meta)))| async move {
-            if let Err(e) = maybe_chunk {
-                if let Err(e) = tx
-                    .send(Err(std::io::Error::new(e.kind(), e.to_string())))
-                    .await
-                {
-                    tracing::error!(error = %e, "Could not convey result");
-                }
-                return;
+    .for_each(|(idx, (maybe_chunk, mut tx))| async move {
+        if let Err(e) = maybe_chunk {
+            if let Err(e) = tx
+                .send(Err(std::io::Error::new(e.kind(), e.to_string())))
+                .await
+            {
+                tracing::error!(error = %e, "Could not convey result");
             }
-            // unwrap is safe as we checked that there is no error above
-            let bytes: Vec<u8> = maybe_chunk.unwrap();
-            // Block addresses come from the store's own hasher, which is
-            // fixed at store creation and read back from the header. MD5
-            // below is the object ETag and a different thing entirely.
-            let block_hash = fs.shared.hasher().hash(&bytes);
-            let data_len = bytes.len();
+            return;
+        }
+        // unwrap is safe as we checked that there is no error above
+        let bytes: Vec<u8> = maybe_chunk.unwrap();
+        // Block addresses come from the store's own hasher, which is
+        // fixed at store creation and read back from the header. MD5
+        // below is the object ETag and a different thing entirely.
+        let block_hash = fs.shared.hasher().hash(&bytes);
 
-            // check if this key already has this block
-            let key_has_block = if let Some(obj) = old_obj_meta.as_ref() {
-                obj.has_block(&block_hash)
-            } else {
-                false
-            };
+        // Stripe first (hard rule 6: fjall is the leaf lock). The owned
+        // guard moves INTO the blocking closure, so cancelling this future
+        // past this point abandons a closure that still runs to completion
+        // and releases the stripe itself.
+        let stripe_guard = fs.shared.stripes().for_hash(&block_hash).lock_owned().await;
 
-            // Choose the fanout depth up front (probe for orphans, then the
-            // placement policy). Only the new-block branch of write_block
-            // uses it -- a dedup hit keeps the recorded depth. The reorder in
-            // ADR 0006's write protocol moves this after the dedup check so
-            // hits skip the probe entirely.
-            let depth = fs.shared.placement().choose_depth(&block_hash);
+        let shared = fs.shared.clone();
+        let metrics = fs.metrics.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            write_one_block(shared, metrics, stripe_guard, block_hash, &bytes)
+        })
+        .await;
 
-            // begin the transaction
-            // there are two main things we need to do here:
-            // 1. write the meta to the database
-            //      - if the block already exists, we don't need to write it to the storage
-            //      - if the block does not exist, we need to write it to the storage
-            // 2. write the actual block to disk
-            //
-            // we commit the meta database transaction BEFORE writing the block to disk
-            // to avoid holding the lock during slow I/O operations.
-            //
-            // IMPORTANT: In multi-user mode, use shared MetaStore for block transactions
-            // to ensure blocks are written to the shared _BLOCKS tree, not user-specific tree
-            let mut store_tx = fs.shared.meta_store().begin_transaction();
-            let write_meta_result = store_tx.write_block(block_hash, data_len, key_has_block, depth);
+        let result = match joined {
+            Ok(res) => res,
+            // The closure panicked; the guard was dropped with it, and
+            // BlockWriteGuard's Drop already counted the block as dropped.
+            Err(join_err) => Err(io::Error::other(format!(
+                "block write task did not complete: {join_err}"
+            ))),
+        };
 
-            let block = match write_meta_result {
-                Err(e) => {
-                    if let Err(e) = tx.unbounded_send(Err(e.into())) {
-                        tracing::error!(error = %e, "Could not send transaction error");
-                    }
-                    return;
+        match result {
+            Ok(()) => {
+                if let Err(e) = tx.unbounded_send(Ok((idx, block_hash))) {
+                    tracing::error!(error = %e, "Could not send block id");
                 }
-                Ok((false, _)) => {
-                    // the block already exists, no need to write it to the storage.
-                    tracing::debug!(target: "cas_storage::locks", "Committing metadata transaction (block exists)");
-                    // A failed commit is a failed PUT, not a panic: the
-                    // refcount bump was not persisted, so nothing needs
-                    // compensation -- report and stop this block.
-                    if let Err(e) = Box::new(store_tx).commit() {
-                        if let Err(e) = tx.unbounded_send(Err(e.into())) {
-                            tracing::error!(error = %e, "Could not send commit error");
-                        }
-                        return;
-                    }
-
-                    // No guard: we never transitioned to Pending.
-                    fs.metrics.block_ignored();
-
-                    if let Err(e) = tx.unbounded_send(Ok((idx, block_hash))) {
-                        tracing::error!(error = %e, "Could not send block id");
-                    }
-                    return;
-                }
-                Ok((true, block)) => {
-                    // COMMIT IMMEDIATELY to release lock
-                    tracing::debug!(target: "cas_storage::locks", "Committing metadata transaction (new block)");
-                    // A failed commit here means no record was persisted and
-                    // no disk write has started (no guard is Pending yet);
-                    // there is nothing to clean up, and unwinding instead
-                    // would kill the connection task with cleanup skipped.
-                    if let Err(e) = Box::new(store_tx).commit() {
-                        if let Err(e) = tx.unbounded_send(Err(e.into())) {
-                            tracing::error!(error = %e, "Could not send commit error");
-                        }
-                        return;
-                    }
-
-                    block
-                }
-            };
-
-            // From here on we have a new block to write to disk. The
-            // guard tracks the Pending -> Written / Failed / Dropped
-            // transition; if we return without resolving it, Drop
-            // reports the block as dropped.
-            let guard = BlockWriteGuard::new_pending(fs.metrics.clone());
-
-            // write the actual block to disk
-            // if the disk operation fails, we must manually rollback (compensating transaction)
-            let block_path = block.disk_path(&block_hash, fs.fs_root().clone());
-
-            // Helper to cleanup on failure
-            let cleanup_on_failure = || {
-                // We need to delete the block we just added.
-                // Since we just added it with rc=1, we can just delete it.
-                // We accept potential data leakage here if this cleanup fails,
-                // as per the design principles (leakage is better than data loss).
-                let tree = fs.shared.block_tree();
-                if let Err(e) = tree.remove(block_hash.as_slice()) {
-                    tracing::warn!(block = %block_hash.to_hex(), error = %e, "Failed to cleanup orphan block metadata");
-                } else {
-                    tracing::debug!(block = %block_hash.to_hex(), "Cleaned up orphan block metadata");
-                }
-            };
-
-            if let Err(e) = fs.async_fs.create_dir_all(block_path.parent().unwrap()) {
-                cleanup_on_failure();
-                if let Err(e) = tx.unbounded_send(Err(e)) {
-                    tracing::error!(error = %e, "Could not send path create error");
-                }
-                guard.failed();
-                return;
             }
-            if let Err(e) = fs.async_fs.write(&block_path, &bytes) {
-                cleanup_on_failure();
+            Err(e) => {
                 if let Err(e) = tx.unbounded_send(Err(e)) {
                     tracing::error!(error = %e, "Could not send block write error");
                 }
-                guard.failed();
-                return;
             }
-
-            guard.written(bytes.len());
-
-            if let Err(e) = tx.unbounded_send(Ok((idx, block_hash))) {
-                tracing::error!(error = %e, "Could not send block id");
-            }
-        },
-    )
+        }
+    })
     .await;
 
     let mut ids = rx.try_collect::<Vec<(usize, BlockId)>>().await?;

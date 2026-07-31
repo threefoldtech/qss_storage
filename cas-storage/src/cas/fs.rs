@@ -2,7 +2,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{io, path::PathBuf};
 
-use super::async_fs::{AsyncFileSystem, RealAsyncFs};
 use super::multipart::MultiPart;
 use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
@@ -17,7 +16,6 @@ use super::byte_stream::AsyncByteStream;
 pub const BLOCK_SIZE: usize = 1 << 20; // Supposedly 1 MiB
 
 pub struct CasFS {
-    pub(super) async_fs: Box<dyn AsyncFileSystem>,
     pub(super) namespace: MetaStore,
     pub(super) shared: Arc<SharedBlockStore>,
     pub(super) metrics: SharedMetrics,
@@ -131,7 +129,6 @@ impl CasFS {
         };
 
         Ok(Self {
-            async_fs: Box::new(RealAsyncFs),
             namespace,
             shared,
             metrics,
@@ -461,57 +458,76 @@ mod tests {
         (fs, dir)
     }
 
+    /// Disk ops whose file writes always fail; everything else is real.
     #[derive(Debug)]
-    struct MockFs {
-        should_fail_write: bool,
-    }
+    struct FailingWriteOps;
 
-    impl MockFs {
-        fn new() -> Self {
-            Self {
-                should_fail_write: false,
-            }
+    impl crate::cas::block_disk::BlockDiskOps for FailingWriteOps {
+        fn create_dir_all(&self, path: &std::path::Path) -> io::Result<()> {
+            crate::cas::block_disk::RealDiskOps.create_dir_all(path)
+        }
+
+        fn write_new_file(&self, _path: &std::path::Path, _contents: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("Mock write failure"))
+        }
+
+        fn fsync_file(&self, path: &std::path::Path, data_only: bool) -> io::Result<()> {
+            crate::cas::block_disk::RealDiskOps.fsync_file(path, data_only)
+        }
+
+        fn fsync_dir(&self, path: &std::path::Path) -> io::Result<()> {
+            crate::cas::block_disk::RealDiskOps.fsync_dir(path)
+        }
+
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+            crate::cas::block_disk::RealDiskOps.rename(from, to)
+        }
+
+        fn remove_file(&self, path: &std::path::Path) -> io::Result<()> {
+            crate::cas::block_disk::RealDiskOps.remove_file(path)
+        }
+
+        fn list_dir(&self, path: &std::path::Path) -> io::Result<Vec<PathBuf>> {
+            crate::cas::block_disk::RealDiskOps.list_dir(path)
+        }
+
+        fn device_of(&self, path: &std::path::Path) -> io::Result<Option<u64>> {
+            crate::cas::block_disk::RealDiskOps.device_of(path)
         }
     }
 
-    impl AsyncFileSystem for MockFs {
-        fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn write(&self, _path: &std::path::Path, _contents: &[u8]) -> std::io::Result<()> {
-            if !self.should_fail_write {
-                Err(std::io::Error::other("Mock write failure"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl CasFS {
-        #[cfg(test)]
-        fn with_mock_fs(mut self) -> (Self, MockFs) {
-            // Changed return type
-            let mock_fs = MockFs::new();
-            self.async_fs = Box::new(mock_fs.clone()); // Implement Clone for MockFs
-            (self, mock_fs)
-        }
-    }
-
-    // Add Clone implementation for MockFs
-    impl Clone for MockFs {
-        fn clone(&self) -> Self {
-            Self {
-                should_fail_write: self.should_fail_write,
-            }
-        }
+    /// A CasFS whose block file writes fail (the mock seam the plan calls
+    /// the injection point -- it must survive every protocol change).
+    fn setup_failing_write_fs(hasher: Hasher) -> (CasFS, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut shared = crate::cas::SharedBlockStore::new(
+            dir.path().join("meta/blocks"),
+            dir.path().join("blocks"),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            Some(HeaderSpec::from(hasher)),
+            None,
+        )
+        .unwrap();
+        shared.set_disk_ops(Arc::new(FailingWriteOps));
+        let fs = CasFS::new(
+            dir.path().join("meta"),
+            Arc::new(shared),
+            METRICS.clone(),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            false,
+        )
+        .unwrap();
+        (fs, dir)
     }
 
     #[tokio::test]
     async fn test_store_object_write_failure() {
-        for (engine, hasher) in matrix() {
-            let (fs, _dir) = setup_test_fs(engine, hasher);
-            let (fs, _mock) = fs.with_mock_fs();
+        for hasher in TEST_WIDTHS {
+            let (fs, _dir) = setup_failing_write_fs(hasher);
             do_test_store_object_write_failure(fs).await;
         }
     }
@@ -532,8 +548,8 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(err.to_string(), "Mock write failure");
 
-        // Verify no blocks were stored in metadata
-        // the block must be rolled back
+        // File-first: a failed disk write means NO record was ever
+        // attempted -- nothing to clean up, nothing left behind.
         let block_tree = fs.shared.block_tree();
         assert_eq!(block_tree.len().unwrap(), 0);
 
@@ -657,17 +673,17 @@ mod tests {
             &bob.shared.stripes().for_hash(&id)
         ));
 
-        let put = |fs: &CasFS, data: Vec<u8>| {
+        let put = |data: Vec<u8>| {
             let len = data.len();
             let stream = AsyncByteStream::new(stream::once(async move { Ok(Bytes::from(data)) }));
             (stream, len)
         };
-        let (stream, len) = put(&alice, data.clone());
+        let (stream, len) = put(data.clone());
         let obj_a = alice
             .store_single_object_and_meta("b", "k", stream, len)
             .await
             .unwrap();
-        let (stream, len) = put(&bob, data.clone());
+        let (stream, len) = put(data.clone());
         let obj_b = bob
             .store_single_object_and_meta("b", "k", stream, len)
             .await
@@ -821,9 +837,11 @@ mod tests {
         }
 
         {
-            // Test using  the same key
-            // Refcount must not be increased
-
+            // Re-PUT with the SAME key: since ADR 0006 every dedup hit
+            // bumps the rc -- the key_has_block skip is gone. The old
+            // object record is overwritten without a decrement, so the
+            // count is deliberately one high: leak class, reconciled by
+            // fsck (ADR 0005); the skip's under-count was loss class.
             let stream =
                 AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_2.clone())) },
@@ -840,11 +858,10 @@ mod tests {
                 .get_block(new_obj.blocks()[0].as_slice())
                 .unwrap()
                 .unwrap();
-            assert_eq!(stored_block.rc(), 1);
+            assert_eq!(stored_block.rc(), 2, "every dedup hit bumps");
         }
         {
-            // Test  using a new key
-            // Refcount must be increased
+            // A new key referencing the same content bumps again.
             let stream =
                 AsyncByteStream::new(stream::once(
                     async move { Ok(Bytes::from(test_data_3.clone())) },
@@ -861,7 +878,7 @@ mod tests {
                 .get_block(new_obj.blocks()[0].as_slice())
                 .unwrap()
                 .unwrap();
-            assert_eq!(stored_block.rc(), 2);
+            assert_eq!(stored_block.rc(), 3);
         }
     }
 
@@ -1016,13 +1033,14 @@ mod tests {
         }
     }
 
-    // Test storing and deleting an object with refcount
-    // - store object
-    //       refcount == 1
-    // - store object again with differrent key
-    //      refcount == 1
-    // - delete the object
-    // - check block/disk/whatever should be gone
+    // Store the same content twice under ONE key, then delete the key.
+    //
+    // Since ADR 0006 the second PUT bumps the rc (the key_has_block skip is
+    // gone), and the overwrite does not decrement the replaced object's
+    // blocks -- so after one DELETE the record survives with rc == 1: a
+    // deliberate leak-class over-count for fsck (ADR 0005) to reconcile.
+    // The pre-0006 behavior (skip the bump so the delete frees the block)
+    // is exactly the under-count that lost data in the multipart trace.
     async fn do_test_store_and_delete_object_with_refcount_same_blocks_samekey(fs: CasFS) {
         let bucket = "test-bucket";
         let key1 = "test/key1";
@@ -1061,19 +1079,23 @@ mod tests {
         // Verify both objects share same blocks
         assert_eq!(obj1.blocks(), obj2.blocks());
         assert_eq!(obj1.hash(), obj2.hash());
-        // Verify blocks  exist with rc=1
+        // Every dedup hit bumps: the re-PUT over the same key raised rc
+        // to 2 even though only one object now references the block.
         let block_tree = fs.shared.block_tree();
         for id in obj2.blocks() {
             let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
-            assert_eq!(block.rc(), 1);
+            assert_eq!(block.rc(), 2, "every dedup hit bumps");
         }
 
         // Delete object
         fs.delete_object(bucket, key1).await.unwrap();
 
-        // Verify blocks are gone
+        // The record survives with rc == 1: the over-count leaks the block
+        // until fsck reconciles it. Loss (a freed live block) can never
+        // come out of an over-count -- that is the trade ADR 0006 made.
         for id in obj1.blocks() {
-            assert!(block_tree.get_block(id.as_slice()).unwrap().is_none());
+            let block = block_tree.get_block(id.as_slice()).unwrap().unwrap();
+            assert_eq!(block.rc(), 1, "leak-class residue, never loss");
         }
     }
 

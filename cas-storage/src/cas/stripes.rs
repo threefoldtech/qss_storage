@@ -28,9 +28,6 @@ pub(crate) const DEFAULT_STRIPE_COUNT: usize = 1024;
 /// to move INTO a `spawn_blocking` closure (hard rule 4: a stripe guard
 /// held by a cancellable future must never span an await whose detached
 /// continuation performs a destructive op).
-// TODO(adr-0006): the allow dies when the write path (component 5) starts
-// taking stripes.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct Stripes {
     locks: Vec<Arc<tokio::sync::Mutex<()>>>,
@@ -52,9 +49,6 @@ impl Stripes {
     /// Index = the id's first two bytes read big-endian, modulo the stripe
     /// count. Block ids are hashes, so the leading bytes are uniform; two
     /// bytes address up to 65536 stripes.
-    // TODO(adr-0006): the allow dies when the write path (component 5)
-    // starts taking stripes.
-    #[allow(dead_code)]
     pub fn for_hash(&self, id: &BlockId) -> Arc<tokio::sync::Mutex<()>> {
         let bytes = id.as_slice();
         // BlockId is 16 or 32 bytes wide by construction, never shorter.

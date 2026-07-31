@@ -38,18 +38,12 @@ pub(super) const TMP_DIR_NAME: &str = ".tmp";
 /// retry of the same block, or the retry could rename a half-written file
 /// into place. `O_CREAT|O_EXCL` turns any collision into a loud error
 /// instead of silent inode sharing.
-// TODO(adr-0006): the allow dies when the write path (component 5) writes
-// through AtomicBlockWriter.
-#[allow(dead_code)]
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// The low-level disk operations the atomic writer performs.
 ///
 /// This is the injection seam the old `AsyncFileSystem` trait used to be:
 /// tests substitute an implementation that records calls or fails them.
-// TODO(adr-0006): the allow dies when the write path (component 5) writes
-// through AtomicBlockWriter.
-#[allow(dead_code)]
 pub(super) trait BlockDiskOps: Send + Sync + std::fmt::Debug {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
@@ -142,9 +136,6 @@ impl BlockDiskOps for RealDiskOps {
 ///
 /// One per store (it lives on `SharedBlockStore`); the known-durable cache
 /// and the temp dir are store-wide state.
-// TODO(adr-0006): the allow dies when the write path (component 5) writes
-// through AtomicBlockWriter.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct AtomicBlockWriter {
     root: PathBuf,
@@ -156,9 +147,6 @@ pub(super) struct AtomicBlockWriter {
     known_durable: Mutex<HashSet<PathBuf>>,
 }
 
-// TODO(adr-0006): the allow dies when the write path (component 5) writes
-// through AtomicBlockWriter.
-#[allow(dead_code)]
 impl AtomicBlockWriter {
     /// Store-open duties, then the writer.
     ///
@@ -292,6 +280,9 @@ impl AtomicBlockWriter {
 
     /// Unlinks the block file for `id` at `depth`. A file that is already
     /// gone is success -- unlink is the idempotent tail of DELETE.
+    // TODO(adr-0006): the allow dies when the delete path (component 6)
+    // unlinks through this.
+    #[allow(dead_code)]
     pub fn unlink_block(&self, ops: &dyn BlockDiskOps, id: &BlockId, depth: u8) -> io::Result<()> {
         ops.remove_file(&block_disk_path(id, depth, self.root.clone()))
     }
