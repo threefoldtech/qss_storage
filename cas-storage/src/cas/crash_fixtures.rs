@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use crate::metastore::{BlockId, block_disk_path};
+use crate::metastore::{Block, BlockId, block_disk_path};
 
 /// Residue class 1: an orphan block file without a record -- the crash
 /// window between the rename and the record commit, or a cancelled PUT
@@ -53,6 +53,27 @@ pub(crate) fn plant_dangling_record(
     tx.insert_new_block(id, 1234, depth).unwrap();
     tx.commit().unwrap();
     // No file is written: that is the point.
+}
+
+/// Residue class 5: a degraded record -- what fsck's repair leaves behind
+/// for a block whose bytes are unrecoverable (ADR 0005). `rc` accounts for
+/// the holders that still reference the id, and `size` is the block's real
+/// size, since the record's own size field is what a heal must agree with.
+/// The write path treats it as absent for dedup, so the next PUT of the
+/// same content rewrites the file and clears the flag.
+pub(crate) fn plant_degraded_record(
+    shared: &super::shared_block_store::SharedBlockStore,
+    id: BlockId,
+    depth: u8,
+    rc: usize,
+    size: usize,
+) {
+    let mut block = Block::from_parts(size, depth, rc, 0);
+    block.set_degraded(true);
+    let mut tx = shared.meta_store().begin_transaction();
+    tx.put_block_record(id, &block).unwrap();
+    tx.commit().unwrap();
+    // No file either: degraded means the bytes are gone.
 }
 
 #[cfg(test)]
@@ -197,6 +218,31 @@ mod tests {
         assert!(
             !block.disk_path(&id, fs.fs_root().clone()).exists(),
             "a dangling record has no file"
+        );
+    }
+
+    /// Degraded record: flagged, still counting its holders, no file. The
+    /// state fsck's repair produces and the write path heals.
+    #[test]
+    fn degraded_record_is_flagged_and_fileless() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = fixture_store(dir.path());
+        let id = some_id(0x44);
+
+        plant_degraded_record(&shared, id, 2, 3, 4096);
+
+        let block = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .expect("the record exists");
+        assert!(block.is_degraded(), "the flag is what makes it degraded");
+        assert_eq!(block.rc(), 3, "the holders stay accounted for");
+        assert_eq!(block.size(), 4096);
+        assert_eq!(block.depth(), 2);
+        assert!(
+            !block.disk_path(&id, fs.fs_root().clone()).exists(),
+            "a degraded record has no file"
         );
     }
 }

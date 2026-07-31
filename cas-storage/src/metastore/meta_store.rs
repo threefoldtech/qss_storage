@@ -483,6 +483,11 @@ impl Transaction {
     /// read with a blind write. Every dedup hit bumps: the old
     /// `key_has_block` skip undercounted references and is gone (ADR 0006).
     ///
+    /// A record flagged degraded reports as absent (`None`): its file is
+    /// gone, so deduplicating against it would commit another damaged
+    /// object (ADR 0005). The caller falls through to the insert path,
+    /// which heals the record instead.
+    ///
     /// The caller must hold the block's stripe (hard rule 1).
     pub fn bump_block_rc(&mut self, block_hash: BlockId) -> Result<Option<Block>, MetaError> {
         match self
@@ -492,6 +497,14 @@ impl Transaction {
             None => Ok(None),
             Some(block_data) => {
                 let mut block = Block::try_from(&*block_data as &[u8])?;
+                if block.is_degraded() {
+                    tracing::debug!(
+                        block_hash = %block_hash.to_hex(),
+                        rc = block.rc(),
+                        "Block record is degraded: absent for dedup, heal on insert"
+                    );
+                    return Ok(None);
+                }
                 let old_rc = block.rc();
                 block.increment_refcount();
                 tracing::debug!(
@@ -537,6 +550,11 @@ impl Transaction {
     /// stripe hold and the same blocking closure (hard rule 4) -- a
     /// cancellable await between decrement and unlink is how a detached
     /// unlink once deleted a freshly rewritten block.
+    ///
+    /// A degraded record (ADR 0005) needs no special case: it accounts for
+    /// real holders, so it decrements like any other, and the unlink that
+    /// follows its last reference tolerates ENOENT -- having no file is
+    /// exactly what degraded means.
     pub fn decrement_block_rc(&mut self, block_hash: BlockId) -> Result<BlockDecrement, MetaError> {
         let Some(raw) = self
             .backend
@@ -569,33 +587,94 @@ impl Transaction {
         Ok(BlockDecrement::Decremented(block))
     }
 
-    /// The new-block half of the ADR 0006 write protocol: insert a fresh
-    /// record (rc = 1) for `block_hash` at the given fanout depth.
+    /// The new-block half of the ADR 0006 write protocol: write the record
+    /// for `block_hash`, whose file is now durable at `depth`.
     ///
     /// Callable only after the block's file is durable at its final path
     /// (hard rule 5) and only while holding the block's stripe (hard
-    /// rule 1) -- under the stripe no re-check is needed: only stripe
-    /// holders insert, and [`bump_block_rc`](Self::bump_block_rc) just said
-    /// there is no record.
+    /// rule 1). Under the stripe there are exactly two states to meet,
+    /// because only stripe holders write block records and
+    /// [`bump_block_rc`](Self::bump_block_rc) has just reported this one
+    /// absent-or-degraded:
+    ///
+    /// - no record: insert a fresh one at rc = 1;
+    /// - a degraded record (ADR 0005): the file we just wrote is the heal.
+    ///   Clear the flag, take the depth the file actually landed at -- the
+    ///   heal's placement need not match the depth the dead record named,
+    ///   and the record must follow the file -- and add our own reference
+    ///   to the holders it was keeping accounted for.
     pub fn insert_new_block(
         &mut self,
         block_hash: BlockId,
         data_len: usize,
         depth: u8,
     ) -> Result<Block, MetaError> {
-        let block = Block::new(data_len, depth);
+        let present = match self
+            .backend
+            .get(DEFAULT_BLOCK_TREE, block_hash.as_slice())?
+        {
+            Some(raw) => Some(Block::try_from(&*raw)?),
+            None => None,
+        };
 
-        tracing::debug!(
-            block_hash = %block_hash.to_hex(),
-            data_len = data_len,
-            depth = depth,
-            "Creating new block with rc=1"
-        );
+        let block = match present {
+            None => {
+                tracing::debug!(
+                    block_hash = %block_hash.to_hex(),
+                    data_len = data_len,
+                    depth = depth,
+                    "Creating new block with rc=1"
+                );
+                Block::new(data_len, depth)
+            }
+            Some(mut present) => {
+                debug_assert!(
+                    present.is_degraded(),
+                    "a live record under our own stripe hold: the bump would have taken it"
+                );
+                debug_assert_eq!(
+                    present.size(),
+                    data_len,
+                    "same block id, same content, same size"
+                );
+                tracing::debug!(
+                    block_hash = %block_hash.to_hex(),
+                    rc = present.rc(),
+                    old_depth = present.depth(),
+                    depth = depth,
+                    "Healing degraded block: clearing the flag and adding our reference"
+                );
+                // Only the degraded bit moves; the reserved bits are not
+                // this build's to interpret, so they are carried over.
+                present.set_degraded(false);
+                Block::from_parts(data_len, depth, present.rc() + 1, present.flags())
+            }
+        };
 
         self.backend
             .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())?;
 
         Ok(block)
+    }
+
+    /// Writes `block`'s record for `block_hash` verbatim, replacing whatever
+    /// is there.
+    ///
+    /// The raw record write fsck's repair actions and the crash fixtures
+    /// need: rc, depth and flags are whatever the caller states, so none of
+    /// the protocol's accounting rules apply. Daemon paths use the striped
+    /// read-modify-writes above instead.
+    ///
+    /// Test-gated until fsck's repair actions land (ADR 0005 component 5);
+    /// today the crash fixtures are its only caller.
+    #[cfg(test)]
+    pub(crate) fn put_block_record(
+        &mut self,
+        block_hash: BlockId,
+        block: &Block,
+    ) -> Result<(), MetaError> {
+        self.backend
+            .insert(DEFAULT_BLOCK_TREE, block_hash.as_slice(), block.to_vec())
     }
 }
 
@@ -651,6 +730,13 @@ mod tests {
         (MetaStore::new(store, None), dir)
     }
 
+    /// A record fsck marked degraded: holders still counted, bytes gone.
+    fn degraded_record(size: usize, depth: u8, rc: usize) -> Block {
+        let mut block = Block::from_parts(size, depth, rc, 0);
+        block.set_degraded(true);
+        block
+    }
+
     /// A new block records the depth the caller chose; the derived disk path
     /// follows it.
     #[test]
@@ -692,6 +778,64 @@ mod tests {
 
         assert_eq!(block.rc(), 2);
         assert_eq!(block.depth(), 2, "dedup must not move the block");
+    }
+
+    /// A degraded record is absent for dedup: the bump reports a miss and
+    /// mutates nothing, so the caller writes the file and heals it.
+    #[test]
+    fn bump_block_rc_treats_a_degraded_record_as_absent() {
+        let (meta, _dir) = test_store();
+        let hash = BlockId::from([0xadu8; BLOCKID_SIZE]);
+
+        let mut tx = meta.begin_transaction();
+        tx.put_block_record(hash, &degraded_record(42, 2, 3))
+            .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = meta.begin_transaction();
+        assert!(tx.bump_block_rc(hash).unwrap().is_none());
+        tx.commit().unwrap();
+
+        let block = meta
+            .get_block_tree()
+            .unwrap()
+            .get_block(hash.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.rc(), 3, "a reported miss must not bump");
+        assert!(block.is_degraded());
+    }
+
+    /// The insert path heals a degraded record: the flag clears, the record
+    /// follows the file to the depth it was written at, and the writer's own
+    /// reference is added to the holders already counted.
+    #[test]
+    fn insert_new_block_heals_a_degraded_record() {
+        let (meta, _dir) = test_store();
+        let hash = BlockId::from([0xaeu8; BLOCKID_SIZE]);
+
+        let mut tx = meta.begin_transaction();
+        tx.put_block_record(hash, &degraded_record(42, 1, 4))
+            .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = meta.begin_transaction();
+        let healed = tx.insert_new_block(hash, 42, 3).unwrap();
+        tx.commit().unwrap();
+
+        assert!(!healed.is_degraded());
+        assert_eq!(healed.rc(), 5, "four holders plus the healing writer");
+        assert_eq!(healed.depth(), 3, "the record follows the new file");
+
+        let stored = meta
+            .get_block_tree()
+            .unwrap()
+            .get_block(hash.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.rc(), 5);
+        assert_eq!(stored.depth(), 3);
+        assert!(!stored.is_degraded());
     }
 
     /// A bump inside a rolled-back transaction leaves the record untouched:

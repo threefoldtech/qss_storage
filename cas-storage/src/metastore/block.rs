@@ -145,6 +145,13 @@ pub fn block_disk_path(id: &BlockId, depth: u8, mut root: PathBuf) -> PathBuf {
     root
 }
 
+/// Flags bit 0: the block's data is known lost or corrupt (ADR 0005).
+///
+/// The record survives a degraded block so the holders' accounting stays
+/// honest; the write path's dedup RMW treats it as absent, so the next PUT of
+/// the same content rewrites the file and clears the bit.
+const FLAG_DEGRADED: u8 = 0b0000_0001;
+
 /// `Block` represents metadata about a stored data block in the content-addressable storage system.
 ///
 /// Each Block contains:
@@ -152,6 +159,7 @@ pub fn block_disk_path(id: &BlockId, depth: u8, mut root: PathBuf) -> PathBuf {
 /// - The fanout depth its file was placed at (the path itself is derived:
 ///   see [`block_disk_path`])
 /// - A reference count (rc) tracking how many objects reference this block
+/// - A flags byte, of which only [`FLAG_DEGRADED`] is defined
 #[derive(Debug)]
 pub struct Block {
     /// Size of the block data in bytes
@@ -161,24 +169,30 @@ pub struct Block {
     depth: u8,
     /// Reference count - how many objects reference this block
     rc: usize,
+    /// Record flags. Bit 0 is [`FLAG_DEGRADED`]; the rest are reserved and
+    /// written zero, and round-trip untouched rather than being rejected.
+    flags: u8,
 }
 
-/// Serializes a Block (format v2):
+/// Serializes a Block (format v3):
 ///
 /// ```text
-/// size u64 | depth u8 | rc u64
+/// size u64 | depth u8 | rc u64 | flags u8
 /// ```
 ///
 /// Format v1 stored a variable-length path allocated from the `_PATHS` tree;
 /// ADR 0006 replaced that with the derived path scheme, and the stored path
-/// bytes with the one-byte depth. The store header version gates the break.
+/// bytes with the one-byte depth. ADR 0005 appended the flags byte for the
+/// degraded bit. The store header version gates each break: a v2 record is 17
+/// bytes and fails the exact-length check here.
 impl From<&Block> for Vec<u8> {
     fn from(b: &Block) -> Self {
-        let mut out = Vec::with_capacity(8 + 1 + 8);
+        let mut out = Vec::with_capacity(8 + 1 + 8 + 1);
 
         put_len(&mut out, b.size);
         out.push(b.depth);
         put_len(&mut out, b.rc);
+        out.push(b.flags);
         out
     }
 }
@@ -192,9 +206,15 @@ impl TryFrom<&[u8]> for Block {
         let size = r.len("size")?;
         let depth = r.u8("depth")?;
         let rc = r.len("rc")?;
+        let flags = r.u8("flags")?;
         r.finish()?;
 
-        Ok(Block { size, depth, rc })
+        Ok(Block {
+            size,
+            depth,
+            rc,
+            flags,
+        })
     }
 }
 
@@ -209,7 +229,27 @@ impl Block {
     /// # Returns
     /// A new Block instance with reference count set to 1
     pub fn new(size: usize, depth: u8) -> Self {
-        Self { size, depth, rc: 1 }
+        Self {
+            size,
+            depth,
+            rc: 1,
+            flags: 0,
+        }
+    }
+
+    /// Builds a record from its exact stored fields, bypassing every
+    /// accounting rule the other constructors carry.
+    ///
+    /// Crate-internal: fsck's repair actions and the crash fixtures need to
+    /// state a record's rc, depth and flags outright. Daemon paths must not
+    /// use this -- their rc changes are read-modify-writes under the stripe.
+    pub(crate) fn from_parts(size: usize, depth: u8, rc: usize, flags: u8) -> Self {
+        Self {
+            size,
+            depth,
+            rc,
+            flags,
+        }
     }
 
     /// Returns the size of the block data in bytes
@@ -238,6 +278,33 @@ impl Block {
     /// Returns the current reference count of the block
     pub fn rc(&self) -> usize {
         self.rc
+    }
+
+    /// Whether the block is flagged degraded: its data is gone or corrupt
+    /// (ADR 0005), and the record is kept only so the holders that still
+    /// reference the id stay accounted for.
+    ///
+    /// A degraded record is absent for dedup purposes -- see
+    /// `Transaction::bump_block_rc`.
+    pub fn is_degraded(&self) -> bool {
+        self.flags & FLAG_DEGRADED != 0
+    }
+
+    /// The raw flags byte, for a caller rebuilding a record around it.
+    pub(crate) fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Sets or clears the degraded bit, leaving the reserved bits alone.
+    ///
+    /// Crate-internal: fsck's repair sets it, the write path's heal branch
+    /// clears it, and nothing else has business moving it.
+    pub(crate) fn set_degraded(&mut self, degraded: bool) {
+        if degraded {
+            self.flags |= FLAG_DEGRADED;
+        } else {
+            self.flags &= !FLAG_DEGRADED;
+        }
     }
 
     /// Increments the reference count of the block
@@ -344,7 +411,7 @@ mod tests {
         assert_eq!(wide.to_hex().len(), MAX_BLOCKID_SIZE * 2);
     }
 
-    /// Block at fanout depth 2 (format v2).
+    /// Block at fanout depth 2 (format v3).
     #[rustfmt::skip]
     const GOLDEN_DEPTH_2: &[u8] = &[
         // size = 4096
@@ -353,6 +420,8 @@ mod tests {
         0x02,
         // rc = 3
         0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // flags = 0
+        0x00,
     ];
 
     /// Block at the deepest fanout a 32 byte id allows.
@@ -364,6 +433,21 @@ mod tests {
         0x20,
         // rc = 10
         0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // flags = 0
+        0x00,
+    ];
+
+    /// A degraded record: the ADR 0005 flag, with two holders still counted.
+    #[rustfmt::skip]
+    const GOLDEN_DEGRADED: &[u8] = &[
+        // size = 512
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // depth = 1
+        0x01,
+        // rc = 2
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // flags = degraded
+        0x01,
     ];
 
     fn golden_blocks() -> Vec<(&'static str, Block, &'static [u8])> {
@@ -374,6 +458,7 @@ mod tests {
                     size: 4096,
                     depth: 2,
                     rc: 3,
+                    flags: 0,
                 },
                 GOLDEN_DEPTH_2,
             ),
@@ -383,21 +468,33 @@ mod tests {
                     size: 0x0102_0304,
                     depth: MAX_BLOCKID_SIZE as u8,
                     rc: 10,
+                    flags: 0,
                 },
                 GOLDEN_DEPTH_MAX,
+            ),
+            (
+                "degraded",
+                Block {
+                    size: 512,
+                    depth: 1,
+                    rc: 2,
+                    flags: FLAG_DEGRADED,
+                },
+                GOLDEN_DEGRADED,
             ),
         ]
     }
 
-    /// Format v2 pin: serialization must produce exactly these bytes.
+    /// Format v3 pin: serialization must produce exactly these bytes.
     #[test]
     fn golden_serialization() {
         for (name, block, expected) in golden_blocks() {
             assert_eq!(block.to_vec(), expected, "golden mismatch for {name}");
+            assert_eq!(expected.len(), 18, "v3 records are 18 bytes ({name})");
         }
     }
 
-    /// Format v2 pin: the same bytes must decode to the same fields.
+    /// Format v3 pin: the same bytes must decode to the same fields.
     #[test]
     fn golden_deserialization() {
         for (name, block, expected) in golden_blocks() {
@@ -405,13 +502,55 @@ mod tests {
             assert_eq!(decoded.size(), block.size(), "{name} size");
             assert_eq!(decoded.depth(), block.depth(), "{name} depth");
             assert_eq!(decoded.rc(), block.rc(), "{name} rc");
+            assert_eq!(
+                decoded.is_degraded(),
+                block.is_degraded(),
+                "{name} degraded"
+            );
         }
+    }
+
+    /// The degraded bit survives a round trip and can be cleared again; a
+    /// fresh record never carries it.
+    #[test]
+    fn degraded_flag_round_trips() {
+        let mut block = Block::new(4096, 2);
+        assert!(!block.is_degraded(), "a new record is never degraded");
+
+        block.set_degraded(true);
+        assert!(block.is_degraded());
+        let decoded = Block::try_from(block.to_vec().as_slice()).unwrap();
+        assert!(decoded.is_degraded());
+        assert_eq!(
+            decoded.rc(),
+            1,
+            "the flag does not disturb the other fields"
+        );
+        assert_eq!(decoded.depth(), 2);
+        assert_eq!(decoded.size(), 4096);
+
+        block.set_degraded(false);
+        assert!(!block.is_degraded());
+        assert_eq!(block.to_vec(), Block::new(4096, 2).to_vec());
+    }
+
+    /// The reserved bits are not this build's to interpret: they decode
+    /// without complaint and are written back as they were read.
+    #[test]
+    fn reserved_flag_bits_round_trip_untouched() {
+        let mut raw = GOLDEN_DEGRADED.to_vec();
+        raw[17] = 0b1000_0011;
+
+        let decoded = Block::try_from(raw.as_slice()).unwrap();
+        assert!(decoded.is_degraded());
+        assert_eq!(decoded.to_vec(), raw);
     }
 
     #[test]
     fn malformed_block_records() {
-        // Truncated at every field boundary.
-        for cut in [0usize, 1, 7, 8, 9, 16] {
+        // Truncated at every field boundary, the v2 record's 17 bytes
+        // included: the format break is a decode failure, not a misread.
+        for cut in [0usize, 1, 7, 8, 9, 16, 17] {
             assert!(
                 matches!(
                     Block::try_from(&GOLDEN_DEPTH_2[..cut]),

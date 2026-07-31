@@ -309,6 +309,65 @@ async fn concurrent_double_delete_decrements_once() {
     );
 }
 
+/// K concurrent PUTs onto a degraded record (ADR 0005): the degraded flag
+/// makes the record absent for dedup, so the writers race to be the one
+/// that heals it. Whoever wins writes the file and clears the flag; the
+/// rest dedup-bump the healed record. At quiesce the flag is clear, the
+/// file is present and hash-valid at the depth the record now names, and
+/// rc is exactly the planted holders plus one per PUT -- one heal, K-1
+/// bumps, never a second heal that would restart the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_record_heals_once_under_concurrent_puts() {
+    /// Concurrent writers of the same content.
+    const K: usize = 8;
+    /// Holders the degraded record still accounts for.
+    const N: usize = 3;
+
+    let dir = tempdir().unwrap();
+    let (shared, namespaces) = store_with_namespaces(dir.path(), None, K);
+    for fs in &namespaces {
+        fs.create_bucket("b").unwrap();
+    }
+
+    for iteration in 0..STORM_ITERATIONS {
+        // Fresh content per iteration: each one is a fresh race.
+        let data = format!("degraded heal {iteration} ")
+            .repeat(64)
+            .into_bytes();
+        let id = shared.hasher().hash(&data);
+        super::crash_fixtures::plant_degraded_record(&shared, id, 1, N, data.len());
+
+        let mut tasks = Vec::new();
+        for (i, fs) in namespaces.iter().enumerate() {
+            let fs = fs.clone();
+            let data = data.clone();
+            tasks.push(tokio::spawn(async move {
+                put(&fs, "b", &format!("k-{iteration}-{i}"), data).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let block = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .expect("the record survives the heal");
+        assert!(!block.is_degraded(), "the heal must clear the flag");
+        assert_eq!(block.rc(), N + K, "one heal plus K-1 dedup bumps");
+
+        let path = block.disk_path(&id, namespaces[0].fs_root().clone());
+        let bytes = std::fs::read(&path).expect("the healed record must have its file");
+        assert_eq!(bytes.len(), data.len(), "complete file, never partial");
+        assert_eq!(
+            shared.hasher().hash(&bytes),
+            id,
+            "the healed file is the block it is named after"
+        );
+    }
+}
+
 /// Ops whose exclusive-create write signals entry and then waits for a
 /// release, so a test can cancel the awaiting future while the blocking
 /// closure is provably mid-protocol.
