@@ -3,8 +3,8 @@
 **Status**: Proposed (revised 2026-07-30 after adversarial code review;
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
-refutation; decided 2026-07-31: deterministic paths, key_has_block skip
-dropped, fjall_notx scoped out of loss-never)
+refutation; decided 2026-07-31: full-id adaptive-depth paths,
+key_has_block skip dropped, fjall_notx scoped out of loss-never)
 **Date**: 2026-07-30
 
 ---
@@ -106,8 +106,9 @@ Proposed, pending review: invert the write ordering and change the locking
 model, exploiting the property content addressing makes available --
 
 > **Block files are immutable and content-addressed. Two writers of the
-> same block write identical bytes. Given a deterministic path (below),
-> file creation is idempotent and commutative.**
+> same block write identical bytes, and a file's name identifies its
+> block (below), so a path can only ever hold one block's bytes: file
+> creation is idempotent and commutative.**
 
 File writes then need no metadata lock; they need per-block mutual
 exclusion against unlink, and all-or-nothing visibility. One invariant
@@ -117,31 +118,48 @@ makes the whole protocol compose:
 > under `stripe(hash)`.** While a stripe is held, that block's record and
 > file are frozen for everyone else.
 
-### Path scheme: hash-derived deterministic paths (DECIDED 2026-07-31)
+### Path scheme: full-id filenames, adaptive fanout depth (DECIDED 2026-07-31)
 
-Block disk paths become a pure function of the BlockId: two single-byte
-fanout levels, then the full id --
+A block file is named by its full id and placed under a fanout depth
+chosen at write time:
 
 ```text
-blocks/<hex b0>/<hex b1>/<full 32-char hex id>
+blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=3
 ```
 
-"Same block => same path" then holds by construction, which is what the
-protocol's idempotent-rename, orphan-heal, and re-check arguments rest
-on. The `_PATHS` tree, the per-record stored path field, and the
-shortest-free-prefix allocator (`meta_store.rs:663-727`) are all
-removed; `delete_object`'s path-map maintenance (`delete_path.rs:19-25`)
-disappears with them, and the whole class of freed-prefix-reuse races
-(a different hash claiming a dead record's prefix and having its live
-file unlinked by a pending delete) becomes structurally impossible.
+Directory names are single hex bytes of the id (2 chars); the filename
+is the full lowercase hex of the id (32 chars for 16-byte ids, 64 for
+32-byte). Dir names and file names can never collide; the old `_xx`
+underscore convention dies. The record stores `d` (one byte, replacing
+the stored path bytes), so `disk_path(id, depth)` is pure and GET and
+DELETE never probe.
 
-**No upgrade path is needed**: no deployed store carries data, so the
-deterministic layout simply *is* the layout -- no format bump, no
-migration machinery, no dual-path lookup. Fsck (ADR 0005) and every tool
-assume the deterministic layout only.
+The load-bearing property is that **a file's name identifies its
+block**: two different hashes can never collide on a path, so the
+depth choice is a *placement policy* with no correctness content -- any
+depth is correct. That is what makes file creation idempotent and
+commutative, keeps orphan heal sound (an insert probes the bounded
+candidate depths first and, on finding a file named `<id>`, reuses that
+depth and renames over it -- complete or corrupt alike), and makes the
+freed-prefix-reuse loss race (a different hash claiming a dead record's
+path) structurally impossible. The `_PATHS` tree and the
+shortest-free-prefix allocator (`meta_store.rs:663-727`) are removed;
+`delete_object`'s path-map maintenance (`delete_path.rs:19-25`)
+disappears with them.
 
-(The rejected alternative -- keeping `_PATHS` with added discipline --
-is recorded in Alternatives Considered.)
+The adaptive depth preserves the current design's virtue -- small
+stores stay shallow and directory sizes stay bounded for the VFS --
+without its defect (names that only a `_PATHS` lookup could attribute
+to a block). Placement default: shallowest depth whose target directory
+is below an occupancy threshold; `d <= 3` supports multi-billion-block
+stores at a few thousand entries per directory.
+
+**No upgrade path is needed**: no deployed store carries data, so this
+layout simply *is* the layout -- no format bump, no migration
+machinery. Fsck (ADR 0005) and every tool assume it.
+
+(Rejected alternatives -- `_PATHS` with added discipline, and the
+fixed two-level draft -- are recorded in Alternatives Considered.)
 
 ### The protocol
 
@@ -250,10 +268,10 @@ file or an unlinked live block.
 The dedup path's record-vanished tail: a PUT holds `stripe(h)`, its in-tx
 re-read finds the record gone (a DELETE's striped decrement won the race
 before we acquired the stripe -- once we hold it, nothing mutates). The
-PUT falls through to the full insert path: a redundant identical write
-plus rename-over, unconditionally correct and simple. With deterministic
-paths the file it renames over sits at the same address the vanished
-record named -- byte-identical either way.
+PUT falls through to the full insert path, unconditionally correct and
+simple: the vanished record's file was unlinked under the same stripe
+hold that removed the record, so the insert probes, finds nothing, and
+writes fresh.
 
 ### Cancellation (new)
 
@@ -393,7 +411,7 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
      `delete_path.rs:18`, which today kills the connection task *after*
      metadata removal, leaking the remaining blocks). `_PATHS`
      maintenance (today `delete_path.rs:19-25`) retires with the
-     deterministic layout.
+     full-id layout.
      `bucket_delete` keeps its inherited ordering (bucket meta removed
      before object teardown, `delete_path.rs:33-34`); its mid-loop
      failure residue (invisible half-deleted bucket) goes to ADR 0005's
@@ -457,10 +475,20 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
   section (freed earlier, a different hash claims the prefix and the
   pending unlink destroys its live file); dedup re-inserts reusing the
   vanished record's path.
-- **Why rejected**: every rule exists only to simulate what hash-derived
-  paths give structurally, and it adds a crash-residue class. With no
-  deployed data there is no migration cost to trade against; shorter
-  paths were the only benefit.
+- **Why rejected**: every rule exists only to simulate what
+  self-identifying file names give structurally, and it adds a
+  crash-residue class. With no deployed data there is no migration cost
+  to trade against, and the decided scheme keeps the adaptive fanout;
+  shorter file names were the only remaining benefit.
+
+### Fixed two-level fanout (first deterministic draft, superseded)
+- **The idea**: `blocks/<b0>/<b1>/<full-hex id>`, depth always 2 -- the
+  path fully derivable from the id alone, no stored field, no probing.
+- **Why superseded**: the adaptive-depth scheme keeps small stores
+  shallow and directory sizes adaptively bounded (the current design's
+  VFS virtue) at the cost of a one-byte depth field in the record and a
+  bounded (<= 3 stats) probe on insert. Both are sound; the owner chose
+  adaptive.
 
 ### O_TMPFILE + linkat (moved here from the open decisions: rejected)
 - **The idea**: anonymous temp inodes, no temp names, no `.tmp` sweep.
@@ -598,10 +626,11 @@ survives for test injection only; its implementation moves to
 ## Implementation Plan
 
 ### Decisions locked (previously open)
-- **Path scheme**: hash-derived deterministic paths, decided 2026-07-31.
-  No migration -- no deployed store carries data; `_PATHS`, the stored
-  path field, and the prefix allocator are removed wholesale and
-  `disk_path` becomes a pure function of `BlockId`.
+- **Path scheme**: full-id filenames at adaptive fanout depth, decided
+  2026-07-31 (owner's scheme; supersedes the fixed two-level draft).
+  `_PATHS` and the prefix allocator are removed; the record's path
+  field becomes a one-byte depth; a file's name identifies its block.
+  No migration -- no deployed store carries data.
 - **key_has_block**: skip dropped, decided 2026-07-31 -- every dedup hit
   bumps rc under the stripe. Converts the silent loss-class under-count
   (multipart double-occurrence, stale-snapshot skip) into the existing
@@ -655,9 +684,9 @@ Then: stripe module + placement (with owned-guard API); atomic file
 writer with the full durability chain and open-time checks; write_path
 reorder (guard states unchanged, cleanup deleted, skip dropped);
 delete_path split with guard-in-closure and panic removal; `.tmp` cleanup
-on open; the deterministic path layout (remove `_PATHS`, the stored path
-field, and the allocator; `disk_path` becomes a pure function of
-`BlockId`); rename `AsyncFileSystem`.
+on open; the path layout (remove `_PATHS` and the allocator; the path
+field becomes a one-byte depth; full-id filenames with insert-time
+probe); rename `AsyncFileSystem`.
 
 Tests: race stress -- PUT-vs-DELETE same block, dedup-bump-vs-delete,
 double-DELETE same key, PUT-vs-PUT same block on both backends;
@@ -680,10 +709,6 @@ Review asks:
 ## Open Questions
 
 **Behavior definers**
-- [ ] Disk layout shape under the deterministic decision: the two-level
-      fanout with full-hex filenames is specified above but the owner
-      has a pending reservation (2026-07-31) -- confirm the shape (or an
-      alternative pure function of the BlockId) before implementation.
 - [ ] Should the stripe also serialize verify-on-read's re-hash against
       concurrent writes, or is read-side locking still rejected? (Review
       note: rename-over installs byte-identical content, so a heal race

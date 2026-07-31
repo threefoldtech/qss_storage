@@ -2,18 +2,18 @@
 
 **Implements**: `docs/adr/0006-block-write-protocol.md` as decided
 2026-07-31 (file-first block writes, per-block striped locking,
-deterministic paths). The ADR is the authority on *why*; this plan is
+full-id adaptive-depth paths). The ADR is the authority on *why*; this
+plan is
 the component-level *what*. Written to be executed in a fresh session
 with no other context.
 
 **Decisions already made -- do not reopen** (rationale in the ADR):
-- Path scheme: hash-derived deterministic paths. No migration exists or
-  is needed (no deployed store carries data). `_PATHS` is removed
-  wholesale. **OWNER RESERVATION PENDING (2026-07-31)**: the concrete
-  disk layout shape (two-level fanout, full-hex filenames) is under
-  review by the owner -- re-confirm before starting Component 2. The
-  protocol requires only that the path be a pure function of the
-  BlockId; the fanout shape is negotiable.
+- Path scheme (owner's, confirmed 2026-07-31): full-id filenames at
+  adaptive fanout depth -- `blocks/<b0>/../<b(d-1)>/<full-hex id>`,
+  `d` in 1..=3 chosen by placement policy at write time; the record
+  stores `d`. A file's name identifies its block, so any depth is
+  correct. `_PATHS` and the allocator are removed. No migration exists
+  or is needed (no deployed store carries data).
 - `key_has_block` skip: dropped. Every dedup hit bumps rc under the
   stripe.
 - `fjall_notx`: scoped out of the loss-never guarantee. No key-stripe.
@@ -76,18 +76,38 @@ half-full buffer emits a block larger than `BLOCK_SIZE` (1 MiB,
 Acceptance: existing tests green; new regression test; no `unwrap` on
 any commit path in `write_path.rs`.
 
-## Component 2: Deterministic block paths
-
-Disk path becomes a pure function of the id:
+## Component 2: Block path layout (full-id names, adaptive depth)
 
 ```text
-blocks/<hex b0>/<hex b1>/<full-hex id>
+blocks/<hex b0>/.../<hex b(d-1)>/<full-hex id>        d in 1..=3
 ```
 
-where `b0`, `b1` are the first two bytes of the `BlockId` and the file
-name is the full-width lowercase hex of the id (32 chars for the
-default 16-byte ids, 64 for 32-byte -- `BLOCKID_SIZE`/`MAX_BLOCKID_SIZE`,
-`cas-storage/src/metastore/block.rs:14-17`).
+Directory names are single hex bytes of the id (2 chars each, taken
+from the id's leading bytes); the filename is the full-width lowercase
+hex of the id (32 chars for the default 16-byte ids, 64 for 32-byte --
+`BLOCKID_SIZE`/`MAX_BLOCKID_SIZE`,
+`cas-storage/src/metastore/block.rs:14-17`). Dir names (2 chars) and
+file names (>= 32 chars) can never collide; the `_xx` underscore
+convention dies.
+
+The load-bearing property: a file's name identifies its block, so two
+hashes can never collide on a path and the depth choice has no
+correctness content -- any depth is correct. Depth is performance
+placement only.
+
+- **Record change**: replace the stored path `Vec<u8>` with
+  `depth: u8` (`block.rs:137` and the codec). `disk_path(id, depth,
+  root)` is a pure function (`block.rs:216-227` rewritten). GET and
+  DELETE use the recorded depth -- they never probe.
+- **Placement policy** (performance-only): choose the shallowest depth
+  whose target directory's approximate occupancy is below a threshold
+  (default 4096 entries). In-memory lazy counters; approximation is
+  harmless because placement carries no correctness. `d <= 3` supports
+  multi-billion-block stores at a few thousand entries per directory.
+- **Insert-time probe**: before writing the temp file, stat the
+  candidate paths for depths 1..=3; if a file named `<id>` exists at
+  some depth d0, choose d0 (the rename then heals the orphan in place,
+  complete or corrupt alike). Otherwise use the policy depth.
 
 Remove:
 - the `_PATHS` tree and everything that touches it: the
@@ -95,17 +115,16 @@ Remove:
   (`cas-storage/src/metastore/meta_store.rs:663-727`), the path-map
   maintenance in `delete_path.rs:19-25`, `path_tree()` accessors
   (`fs.rs`, `shared_block_store.rs`);
-- the stored path field in the `Block` record and its codec
-  (`block.rs:137` and the encode/decode); `disk_path` takes only the
-  id and the blocks root (`block.rs:216-227` rewritten);
-- any API parameter that existed only to thread paths around.
+- any API parameter that existed only to thread path bytes around.
 
 No migration: the record format change ships as-is. Check
 `store_header.rs` for a format constant; if one exists, bump it so an
 old store fails loudly at open instead of misreading records.
 
 Acceptance: `grep -r _PATHS cas-storage/ s3cas/` returns nothing;
-PUT/GET/DELETE round-trips green on both backends.
+PUT/GET/DELETE round-trips green on both backends; a hand-planted
+orphan file at depth 1 is healed in place by a retried PUT (record
+stores depth 1); GET resolves via the recorded depth only.
 
 ## Component 3: Stripe set
 
@@ -196,10 +215,13 @@ spawn_blocking(move ||  {          # closure owns `guard`
         tx.commit()?               # dedup hit: no file I/O
         return Bumped
     drop(tx)
-    write temp; fsync; fsync dirs; rename; fsync parent   # component 4
+    d = probe depths 1..=3 for a file named h,        # component 2:
+        else placement-policy depth                   # heal-in-place
+    write temp; fsync; fsync dirs;
+    rename to disk_path(h, d); fsync parent           # component 4
     tx = begin_transaction()
-    tx.insert_block(h, rc=1)       # no re-check needed: only
-    tx.commit()?                   # stripe-holders insert, we hold it
+    tx.insert_block(h, rc=1, depth=d)  # no re-check needed: only
+    tx.commit()?                       # stripe-holders insert, we hold it
     return Written
 })                                 # guard drops inside the closure
 ```
@@ -255,7 +277,7 @@ delete_object(bucket, key):
                 None => { drop(tx) }            # already gone
                 Some(rec) if rec.rc == 1 => {
                     tx.remove_block(h); tx.commit()?;
-                    remove_file(disk_path(h))   # ENOENT == Ok
+                    remove_file(disk_path(h, rec.depth))  # ENOENT == Ok
                 }
                 Some(rec) => { rec.rc -= 1; tx.insert(rec); tx.commit()? }
         })
@@ -317,7 +339,9 @@ Cancellation fixtures:
   block (guard-in-closure property).
 
 Crash-window fixture helpers for ADR 0005 (construct, assert, leave for
-fsck tests): orphan file without record; `.tmp` residue; Buffer-mode
+fsck tests): orphan file without record; orphan at a non-policy depth
+(depth-change residue -- a file named `<id>` at depth d1 while the live
+record says d2, or no record at all); `.tmp` residue; Buffer-mode
 dangling record (record without file).
 
 Durability: the component-4 fsync-set assertions per level.
@@ -331,7 +355,7 @@ count K to observe the `(K-1)/N` stripe-collision tail).
 ## Sequencing
 
 1. Component 1 (prerequisites) -- one commit, independently green.
-2. Component 2 (deterministic paths) -- touches codec + all path call
+2. Component 2 (path layout) -- touches codec + all path call
    sites; big but mechanical; green tests before proceeding.
 3. Component 3 (stripes + blocks-root move to SharedBlockStore).
 4. Component 4 (atomic writer + open-time duties).
