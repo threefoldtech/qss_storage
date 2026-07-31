@@ -1,6 +1,9 @@
 # fsck: Offline Reconciliation and Scrub for the Block Store
 
-**Status**: Proposed
+**Status**: Accepted and IMPLEMENTED (2026-07-31). Landed on
+`development` as the commit series `b9a98d2..a432bc2` (components 1-7 of
+`docs/plans/adr-0005-implementation.md`, one commit per component; the
+as-built deviations are folded in below, marked "(as built)").
 **Date**: 2026-07-30
 **Updated**: 2026-07-31 (revised against the as-built ADR 0006 file-first
 protocol and the ADR 0007 backend removal; the original draft predates
