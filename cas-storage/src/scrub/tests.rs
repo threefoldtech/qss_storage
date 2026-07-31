@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
 use crate::cas::crash_fixtures::{plant_degraded_record, plant_orphan_file};
-use crate::cas::{AsyncByteStream, CasFS, SharedBlockStore, StorageEngine};
+use crate::cas::{AsyncByteStream, BLOCKS_DB_DIR_NAME, CasFS, SharedBlockStore, StorageEngine};
 use crate::metastore::{
     BlockId, ContentHash, DEFAULT_BLOCK_TREE, Durability, MAX_BLOCKID_SIZE, ObjectData,
     block_disk_path,
@@ -500,7 +500,7 @@ fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
         None,
     )
     .unwrap();
-    let blocks_db = root.join("blocks").join("db");
+    let blocks_db = root.join("blocks").join(BLOCKS_DB_DIR_NAME);
     assert!(blocks_db.is_dir(), "the premise: the DB is under blocks/");
 
     let ctx = ScrubContext::new(fs.namespace_meta_store(), fs.shared_block_store())
@@ -519,6 +519,83 @@ fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
     assert!(
         !walk_disk(&blind).unwrap().foreign.is_empty(),
         "without a meta root there is nothing to compare against"
+    );
+}
+
+/// A block whose hash begins with 0xdb fans out to `blocks/db` -- the name
+/// the shared database itself used to squat, which forced the walk to skip
+/// that whole subtree: one block in 256 invisible to every pass. The
+/// database lives at `blocks/.db` now, and `db` is a fanout directory like
+/// any other.
+#[test]
+fn the_db_fanout_directory_is_walked_like_any_other() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let fs = CasFS::single_namespace(
+        root.clone(),
+        root.clone(),
+        SharedMetrics::default(),
+        StorageEngine::Fjall,
+        Some(1),
+        Some(Durability::Buffer),
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+
+    let id = synthetic_id(0xdb);
+    plant_orphan_file(fs.fs_root(), &id, 1, b"lives in the db fanout dir");
+
+    let ctx = ScrubContext::new(fs.namespace_meta_store(), fs.shared_block_store())
+        .with_meta_root(root.clone());
+    let walk = walk_disk(&ctx).unwrap();
+    assert!(
+        walk.files.iter().any(|f| f.id == id),
+        "the 0xdb block must be visible to the walk: {:?}",
+        walk.files
+    );
+    assert!(
+        walk.foreign.is_empty(),
+        "nothing planted here is foreign: {:?}",
+        walk.foreign
+    );
+}
+
+/// A store from before the `.db` rename still has its database at
+/// `blocks/db`. Opening it must refuse with the migration spelled out --
+/// not mint a fresh empty database at `.db` and silently shadow every
+/// record of the old store.
+#[test]
+fn a_legacy_blocks_db_is_refused_not_shadowed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let legacy = root.join("blocks").join("db");
+    std::fs::create_dir_all(&legacy).unwrap();
+    // fjall's own file, never a block name: what marks the dir a database.
+    std::fs::write(legacy.join("version"), b"2").unwrap();
+
+    let Err(err) = CasFS::single_namespace(
+        root.clone(),
+        root.clone(),
+        SharedMetrics::default(),
+        StorageEngine::Fjall,
+        Some(1),
+        Some(Durability::Buffer),
+        None,
+        false,
+        None,
+    ) else {
+        panic!("a legacy store must be refused");
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("legacy blocks database"),
+        "the refusal must say what this is: {msg}"
+    );
+    assert!(
+        !root.join("blocks").join(BLOCKS_DB_DIR_NAME).exists(),
+        "the refusal must not have created a shadowing database"
     );
 }
 

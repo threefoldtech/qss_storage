@@ -40,6 +40,15 @@ pub(crate) const TMP_DIR_NAME: &str = ".tmp";
 /// destination.
 pub(crate) const QUARANTINE_DIR_NAME: &str = ".quarantine";
 
+/// Name of the shared blocks database directory under the blocks root.
+///
+/// Dot-prefixed like the other reserved names so it can never be a fanout
+/// directory, whose names are two hex characters. The old bare "db" was
+/// also the 0xdb fanout slot: blocks whose hash began with 0xdb landed
+/// inside the database directory, and the scrub had to skip that whole
+/// subtree -- one block in 256 invisible to every fsck pass.
+pub const BLOCKS_DB_DIR_NAME: &str = ".db";
+
 /// Process-wide temp-name nonce. Uniqueness per ATTEMPT is load-bearing: a
 /// cancelled attempt's detached writer must never share a temp inode with a
 /// retry of the same block, or the retry could rename a half-written file

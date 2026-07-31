@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::cas::block_disk::{QUARANTINE_DIR_NAME, TMP_DIR_NAME};
+use crate::cas::block_disk::{BLOCKS_DB_DIR_NAME, QUARANTINE_DIR_NAME, TMP_DIR_NAME};
 use crate::metastore::BlockId;
 
 use super::ScrubContext;
@@ -132,7 +132,9 @@ fn walk_dir(
             continue;
         };
 
-        if at_root && (name == TMP_DIR_NAME || name == QUARANTINE_DIR_NAME) {
+        if at_root
+            && (name == TMP_DIR_NAME || name == QUARANTINE_DIR_NAME || name == BLOCKS_DB_DIR_NAME)
+        {
             continue;
         }
 

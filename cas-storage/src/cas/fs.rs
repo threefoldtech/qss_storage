@@ -148,7 +148,7 @@ impl CasFS {
     /// tests, third-party library users who only need one namespace).
     ///
     /// Builds a dedicated `SharedBlockStore` with its blocks DB at
-    /// `meta_path/blocks/db/` and its block data files at `root/blocks/`,
+    /// `meta_path/blocks/.db/` and its block data files at `root/blocks/`,
     /// and returns a `CasFS` whose namespace metadata lives at
     /// `meta_path/db/`.
     ///

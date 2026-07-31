@@ -8,10 +8,10 @@
 //! - `<meta_root>/db` -- the *namespace* DB. `CasFS::new` pushes `db` onto the
 //!   namespace metadata path, so this is where the bucket trees live: one tree
 //!   per bucket, one key per object.
-//! - `<meta_root>/blocks/db` -- the *blocks* DB, built by
-//!   `SharedBlockStore::new` from `meta_path.join("blocks")` with `db` pushed
-//!   on top. It holds `_BLOCKS` and `_MULTIPART_PARTS`, shared by
-//!   every namespace.
+//! - `<meta_root>/blocks/.db` -- the *blocks* DB, built by
+//!   `SharedBlockStore::new` from `meta_path.join("blocks")` with `.db`
+//!   pushed on top (dot-prefixed: bare `db` was also the 0xdb fanout name).
+//!   It holds `_BLOCKS` and `_MULTIPART_PARTS`, shared by every namespace.
 //!
 //! So `num-keys <bucket>` counts keys in a bucket tree and must open the
 //! namespace DB; `disk-space` asks fjall how much disk a database occupies,
@@ -39,7 +39,9 @@ fn namespace_db(meta_root: &Path) -> PathBuf {
 /// Path of the shared block metadata DB under a `--meta-root`, the way
 /// `CasFS::single_namespace` plus `SharedBlockStore::new` build it.
 fn blocks_db(meta_root: &Path) -> PathBuf {
-    meta_root.join("blocks").join("db")
+    meta_root
+        .join("blocks")
+        .join(cas_storage::BLOCKS_DB_DIR_NAME)
 }
 
 /// Refuses a `--meta-root` that is not already a store.
@@ -130,7 +132,7 @@ pub fn num_keys(meta_root: PathBuf, store: &StoreOptions, bucket_name: &str) -> 
 pub struct DiskSpace {
     /// Bytes used by the namespace DB (`<meta_root>/db`).
     pub namespace: u64,
-    /// Bytes used by the shared block DB (`<meta_root>/blocks/db`), `None`
+    /// Bytes used by the shared block DB (`<meta_root>/blocks/.db`), `None`
     /// when the store has none -- a respd-style store is a single database.
     pub blocks: Option<u64>,
 }

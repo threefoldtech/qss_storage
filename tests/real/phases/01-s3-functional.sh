@@ -280,25 +280,20 @@ rm -f "$body"
 
 # --- the on-disk layout ------------------------------------------------
 
-# The block fanout directory is the first byte of the hash in hex, so one of
-# the 256 names it can take is "db" -- which is also the name of the shared
-# blocks database directory. Blocks whose hash starts with 0xdb are written
-# inside it, next to fjall's lock and version files. Roughly one block in
-# 256 lands there.
-#
-# Why this is graded as a failure and not a curiosity: fsck's disk sweep
-# skips the store's own database paths by design (docs/fsck.md, "the store's
-# own files are not foreign"), so those blocks are invisible to the passes
-# that would notice them missing; and a database that ever tidies its own
-# directory would be deleting live block data.
+# The shared blocks database lives at blocks/.db, dot-prefixed exactly so
+# it can never collide with a fanout directory, whose names are two hex
+# characters. It used to live at bare blocks/db -- also the 0xdb fanout
+# slot -- and roughly one block in 256 landed inside the database
+# directory, invisible to fsck's disk sweep. A hex-named file inside
+# blocks/.db means that collision is back in some new form.
 collided=$(qssrt_block_files_in_db_dir "$QSSRT_S3_STORE" | wc -l)
 record "block-files-inside-the-blocks-db-directory" "$collided"
 if [ "$collided" = 0 ]; then
     check_pass "no block file lands inside the blocks database directory" \
-        "$(qssrt_block_file_count "$QSSRT_S3_STORE") block files, none under blocks/db"
+        "$(qssrt_block_file_count "$QSSRT_S3_STORE") block files, none under blocks/.db"
 else
     check_fail "no block file lands inside the blocks database directory" \
-        "$collided block file(s) written into blocks/db, e.g. $(qssrt_block_files_in_db_dir "$QSSRT_S3_STORE" | head -n 1): the 0xdb fanout name collides with the shared database's own directory"
+        "$collided block file(s) written into blocks/.db, e.g. $(qssrt_block_files_in_db_dir "$QSSRT_S3_STORE" | head -n 1): a block landed inside the database directory"
 fi
 
 # --- metrics stay alive ------------------------------------------------

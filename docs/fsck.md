@@ -66,7 +66,7 @@ uses. The layout they name:
 ```
 <meta_root>/db/              namespace DB: the bucket (object) trees
 <meta_root>/store_header.bin sidecar copy of its header
-<meta_root>/blocks/db/       shared blocks DB: _BLOCKS, _MULTIPART_PARTS
+<meta_root>/blocks/.db/      shared blocks DB: _BLOCKS, _MULTIPART_PARTS
 <meta_root>/blocks/store_header.bin
 <fs_root>/blocks/            block data files (fanout dirs, full-hex names)
 <fs_root>/blocks/.tmp/       write staging, purged at open
@@ -369,12 +369,24 @@ unreferenced garbage. Destination: `<fs_root>/blocks/.quarantine/`.
 ### The store's own files are not foreign
 
 In the default single-root layout (`--meta-root . --fs-root .`) the shared
-blocks database and its header sidecar live at `<meta_root>/blocks/db` and
+blocks database and its header sidecar live at `<meta_root>/blocks/.db` and
 `<meta_root>/blocks/store_header.bin` -- which is *inside* `<fs_root>/blocks`,
 the tree the disk walk walks. The walker skips the store's own paths,
 declared by the opener (the binary knows which paths it opened; the library
-does not guess). Without that, every run would report the live database as
-a foreign file, and `--repair` would rename it into quarantine.
+does not guess), and `.db` is additionally skipped by name at the top
+level, like `.tmp` and `.quarantine`. Without that, every run would report
+the live database as a foreign file, and `--repair` would rename it into
+quarantine.
+
+The dot in `.db` is load-bearing: the database used to live at bare
+`blocks/db`, which is also the fanout directory for every block whose hash
+starts with 0xdb. Those blocks landed inside the database directory, and
+because the walker skipped it wholesale, one block in 256 was invisible to
+every pass -- never re-hashed by the corruption scrub, never reclaimed by
+the disk sweep. A dot-prefixed name can never be a fanout label, so the
+two namespaces no longer meet. A store from before the rename is refused
+at open with the migration spelled out, rather than silently shadowed by
+a fresh empty database.
 
 ## The degraded flag
 

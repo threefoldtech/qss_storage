@@ -109,9 +109,12 @@ rail_check_store_root() {
 # means this is not our directory, and --fresh refuses it.
 QSSRT_STORE_CHILDREN=(s3 resp)
 
-# Is a store present at `path` (both databases)?
+# Is a store present at `path` (both databases)? Accepts the current
+# layout (blocks/.db) and the pre-rename one (bare blocks/db), which
+# --fresh can still meet on disk and must recognise to wipe.
 rail_store_exists() {
-    [ -d "$1/db" ] && [ -d "$1/blocks/db" ]
+    [ -d "$1/db" ] || return 1
+    [ -d "$1/blocks/.db" ] || [ -d "$1/blocks/db" ]
 }
 
 # Does the store root hold anything at all?
@@ -163,7 +166,7 @@ rail_fresh() {
     if [ -d "$root/s3" ] && [ -n "$(ls -A "$root/s3" 2>/dev/null)" ] &&
         ! rail_store_exists "$root/s3"; then
         check_fail "--fresh refuses a directory that is not a qss store" \
-            "$root/s3 has no db/ and blocks/db/; wipe it by hand if you meant to"
+            "$root/s3 has no db/ and blocks/.db/; wipe it by hand if you meant to"
         return 1
     fi
 

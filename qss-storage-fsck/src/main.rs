@@ -93,7 +93,12 @@ struct Cli {
 /// The two databases a `--meta-root` holds, the way `CasFS::single_namespace`
 /// builds them: the namespace DB and the shared blocks DB.
 fn store_databases(meta_root: &Path) -> [PathBuf; 2] {
-    [meta_root.join("db"), meta_root.join("blocks").join("db")]
+    [
+        meta_root.join("db"),
+        meta_root
+            .join("blocks")
+            .join(cas_storage::BLOCKS_DB_DIR_NAME),
+    ]
 }
 
 /// Refuses a path that is not already a store.
@@ -255,6 +260,6 @@ mod tests {
 
         let dbs = store_databases(dir.path());
         assert!(dbs[0].ends_with("db"));
-        assert!(dbs[1].ends_with("blocks/db"));
+        assert!(dbs[1].ends_with("blocks/.db"));
     }
 }

@@ -122,6 +122,8 @@ pub use metastore::{
 pub use cas::{
     // Core storage
     AsyncByteStream,
+    // Streaming and utilities
+    BLOCKS_DB_DIR_NAME,
     CasFS,
     SharedBlockStore,
     StorageEngine,
@@ -130,7 +132,6 @@ pub use cas::{
     SweepStats,
     // The outcome of complete's atomic upload-plus-parts claim
     UploadClaim,
-    // Streaming and utilities
     block_stream::{BlockCorruption, BlockStream},
     // Multipart support
     multipart::{MultiPart, MultiPartTree},

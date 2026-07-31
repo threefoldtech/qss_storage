@@ -163,27 +163,32 @@ hex64a=$(printf 'ab%062d' 0 | tr '0' 'a')
 hex64b=$(printf 'ab%062d' 0 | tr '0' 'b')
 hex64db=$(printf 'db%062d' 0 | tr '0' 'c')
 fake=$(mktemp -d)
-mkdir -p "$fake/blocks/ab" "$fake/blocks/db" "$fake/blocks/.tmp" \
-    "$fake/blocks/.quarantine"
+mkdir -p "$fake/blocks/ab" "$fake/blocks/db" "$fake/blocks/.db" \
+    "$fake/blocks/.tmp" "$fake/blocks/.quarantine"
 : >"$fake/blocks/ab/$hex64a"
 : >"$fake/blocks/ab/$hex64b"
-: >"$fake/blocks/db/000001.sst"
-: >"$fake/blocks/db/lock"
-: >"$fake/blocks/db/version"
+: >"$fake/blocks/.db/000001.sst"
+: >"$fake/blocks/.db/lock"
+: >"$fake/blocks/.db/version"
 : >"$fake/blocks/.tmp/staged"
 : >"$fake/blocks/.quarantine/$hex64a"
 : >"$fake/blocks/store_header.bin"
 st_eq 'block counting ignores the database and the staging areas' 2 \
     "$(qssrt_block_file_count "$fake")"
 
-# A block whose hash starts with 0xdb lands inside the blocks database's own
-# directory, because the fanout name and the database directory name are
-# both "db". It is still a block file and still has to be counted.
+# The database lives at .db, so "db" is an ordinary fanout directory: a
+# block whose hash starts with 0xdb counts like any other.
 : >"$fake/blocks/db/$hex64db"
-st_eq 'a 0xdb block inside the database directory is still counted' 3 \
+st_eq 'a 0xdb block in the db fanout directory is counted' 3 \
     "$(qssrt_block_file_count "$fake")"
-st_eq 'the collision is reported on its own' 1 \
+
+# A hex-named file inside blocks/.db would mean the old collision is back
+# in some new form: the detector phase 1 grades with must see it.
+: >"$fake/blocks/.db/$hex64db"
+st_eq 'a block file inside the database directory is reported' 1 \
     "$(qssrt_block_files_in_db_dir "$fake" | wc -l)"
+st_eq 'the misplaced file is not counted as a live block' 3 \
+    "$(qssrt_block_file_count "$fake")"
 rm -rf "$fake"
 
 # --- the --fresh guards ------------------------------------------------

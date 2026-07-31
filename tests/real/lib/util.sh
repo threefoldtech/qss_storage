@@ -103,21 +103,15 @@ qssrt_du_bytes() {
 # Live block files under a store's blocks root: one fanout level, full-hex
 # names.
 #
-# Matched by SHAPE rather than by pruning the store's own directories, and
-# that is not fussiness. The fanout directory is the first byte of the block
-# hash in hex, so one of the 256 possible fanout names is "db" -- which is
-# also the name of the shared blocks database directory. Blocks whose hash
-# starts with 0xdb are therefore written INSIDE `blocks/db`, alongside
-# fjall's `lock` and `version` files. Pruning `blocks/db` would silently
-# undercount about one block in 256, which is exactly the kind of quiet
-# wrongness a measurement harness must not have. Phase 1 reports the
-# collision itself as a finding; this function just counts honestly.
-#
-# A block file is a depth-2 file whose parent is a two-hex-character
+# Matched by SHAPE rather than by pruning the store's own directories. A
+# block file is a depth-2 file whose parent is a two-hex-character
 # directory and whose own name is the full hash in hex (32 or 64
-# characters, per the store's width). fjall's own files (0.jnl, keyspaces,
-# lock, version) do not match; neither does anything in .tmp or
-# .quarantine, which are not two-hex-character directories.
+# characters, per the store's width). The store's own entries under
+# blocks/ are dot-prefixed (.db, .tmp, .quarantine) or store_header.bin,
+# none of which have two-hex names, so the shape rule excludes them for
+# free. The database used to live at bare "db" -- also the 0xdb fanout
+# name -- and blocks landed inside it; that collision is fixed, and
+# blocks/db is now the 0xdb fanout directory, nothing else.
 qssrt_block_files() {
     local blocks="$1/blocks"
     [ -d "$blocks" ] || return 0
@@ -127,12 +121,13 @@ qssrt_block_files() {
         -print 2>/dev/null
 }
 
-# Block files that landed inside the shared database's own directory,
-# because their hash begins with 0xdb.
+# Block files that landed inside the shared database's own directory
+# (blocks/.db). The rename ended the name collision, so anything
+# hex-shaped in there is a regression; phase 1 grades it as one.
 qssrt_block_files_in_db_dir() {
     local blocks="$1/blocks"
-    [ -d "$blocks/db" ] || return 0
-    find "$blocks/db" -mindepth 1 -maxdepth 1 -type f \
+    [ -d "$blocks/.db" ] || return 0
+    find "$blocks/.db" -mindepth 1 -maxdepth 1 -type f \
         -regextype posix-extended \
         -regex '.*/([0-9a-f]{32}|[0-9a-f]{64})' \
         -print 2>/dev/null

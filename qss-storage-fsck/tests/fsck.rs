@@ -120,7 +120,7 @@ async fn a_clean_store_exits_zero() {
     assert_eq!(code(&out), CLEAN, "{}", stdout(&out));
     assert!(stdout(&out).contains("no findings"), "{}", stdout(&out));
     assert!(
-        dir.path().join("blocks").join("db").is_dir(),
+        dir.path().join("blocks").join(".db").is_dir(),
         "the tool must not have touched its own database"
     );
 }
@@ -377,7 +377,7 @@ async fn repair_converges_and_the_next_run_is_clean() {
             .join("NOTES")
             .is_file()
     );
-    assert!(dir.path().join("blocks").join("db").is_dir());
+    assert!(dir.path().join("blocks").join(".db").is_dir());
 
     // And again: nothing left to do.
     let again = fsck(dir.path(), &["--repair"]);

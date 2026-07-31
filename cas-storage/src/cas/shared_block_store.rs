@@ -7,7 +7,7 @@ use crate::metastore::{
     MetaTreeExt, StoreHeader, UPLOADS_TREE,
 };
 
-use super::block_disk::{AtomicBlockWriter, BlockDiskOps, RealDiskOps};
+use super::block_disk::{AtomicBlockWriter, BLOCKS_DB_DIR_NAME, BlockDiskOps, RealDiskOps};
 use super::placement::BlockPlacement;
 use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
 use super::{StorageEngine, multipart::MultiPartTree};
@@ -51,7 +51,7 @@ impl SharedBlockStore {
     /// than mis-addressed later.
     ///
     /// # Arguments
-    /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/db)
+    /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/.db)
     /// * `blocks_root` - Root directory for the block data files, shared by
     ///   every namespace of this store
     /// * `storage_engine` - Storage engine
@@ -75,7 +75,26 @@ impl SharedBlockStore {
         spec: Option<HeaderSpec>,
         stripe_count: Option<usize>,
     ) -> Result<Self, MetaError> {
-        path.push("db");
+        // A store from before the .db rename has its database at
+        // <blocks>/db, a name that doubles as the 0xdb fanout slot.
+        // Opening would mint a fresh empty database at .db and silently
+        // shadow every record of the old store, so it is refused with the
+        // migration spelled out. The `version` file is fjall's own and
+        // never a block name, so it tells a legacy database apart from a
+        // legitimate 0xdb fanout directory.
+        let legacy = path.join("db");
+        if legacy.join("version").is_file() && !path.join(BLOCKS_DB_DIR_NAME).exists() {
+            return Err(MetaError::OtherDBError(format!(
+                "legacy blocks database at {}: this build keeps it at {} -- \
+                 stop every daemon, move fjall's own files (everything NOT \
+                 named as full-hex block or two-hex directory) there, and \
+                 leave any hex-named entries where they are",
+                legacy.display(),
+                path.join(BLOCKS_DB_DIR_NAME).display(),
+            )));
+        }
+
+        path.push(BLOCKS_DB_DIR_NAME);
 
         // Canonicalize path to eliminate getcwd() syscalls in async operations
         // This is critical for performance as it avoids repeated getcwd() on every file op

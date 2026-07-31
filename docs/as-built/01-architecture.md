@@ -75,7 +75,8 @@ coordinating daemon.
 - `inspect num-keys | disk-space | header` -- read-only metadata queries.
   `num-keys` reads the namespace DB (`<meta_root>/db`); `disk-space` and
   `header` report on both that and the shared block DB
-  (`<meta_root>/blocks/db`).
+  (`<meta_root>/blocks/.db`, dot-prefixed so it can never collide with the
+  0xdb fanout directory).
 - `check` -- integrity checking (`s3cas/src/check.rs`): every block file
   re-hashed with the store's hasher, the assembled object re-hashed with MD5
   against its ETag.
