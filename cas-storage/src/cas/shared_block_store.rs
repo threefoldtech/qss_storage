@@ -101,7 +101,7 @@ impl SharedBlockStore {
         };
 
         let block_tree = meta_store.get_block_tree()?;
-        let multipart_tree_base = meta_store.get_tree(MULTIPART_PARTS_TREE)?;
+        let multipart_tree_base = meta_store.get_tree_ext(MULTIPART_PARTS_TREE)?;
         let multipart_tree = MultiPartTree::new(multipart_tree_base);
         let uploads_tree = meta_store.get_tree_ext(UPLOADS_TREE)?;
 

@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use crate::metastore::{
-    BaseMetaTree, BlockId, CONTENT_HASH_SIZE, ContentHash, FsError, MetaError,
+    BlockId, CONTENT_HASH_SIZE, ContentHash, FsError, MetaError, MetaTreeExt,
     codec::{Reader, id_list_len, put_id_list, put_len},
 };
 
@@ -159,19 +159,71 @@ impl TryFrom<&[u8]> for MultiPart {
     }
 }
 
+/// Storage key of one part of a multipart upload, in `_MULTIPART_PARTS`:
+///
+/// ```text
+/// bucket_len u64 | bucket | key_len u64 | key | upload_id_len u64 |
+/// upload_id | part_number u64 BE
+/// ```
+///
+/// Length-prefixed rather than joined with `-`, because bucket names and
+/// keys may contain any separator one might pick: the prefixes make the
+/// encoding injective, so two different uploads can never collide on one
+/// key, and no upload's key can start with another's prefix (the
+/// `upload_id_len` field forces the triples to match).
+///
+/// The `part_number` tail is UNSIGNED BIG-ENDIAN, and that is the only field
+/// whose byte order is load-bearing: it makes the store's own key order the
+/// numeric part order, so every part of one upload lies contiguously under
+/// [`part_prefix`] and enumerating them is a plain forward scan
+/// ([`MultiPartTree::parts_of`], ADR 0003). Little-endian would scatter part
+/// 256 among the low numbers; the length fields keep the codec's
+/// little-endian house rule because nothing orders by them. S3 part numbers
+/// run 1..=10000, so the unsigned cast never meets a negative in practice --
+/// one would merely sort after every real part, not collide with it.
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn part_key(bucket: &str, key: &str, upload_id: &str, part_number: i64) -> Vec<u8> {
+    let mut out = part_prefix(bucket, key, upload_id);
+    out.extend_from_slice(&(part_number as u64).to_be_bytes());
+    out
+}
+
+/// The byte prefix every part of one upload shares: [`part_key`] without its
+/// `part_number` tail.
+///
+/// This is what a per-upload scan positions on. Nothing parses these bytes
+/// back -- point reads rebuild the key they wrote and scans decode record
+/// VALUES (hard rule 4) -- so the encoding only has to be injective and
+/// order-preserving in the tail, which it is.
+pub(crate) fn part_prefix(bucket: &str, key: &str, upload_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + bucket.len() + 8 + key.len() + 8 + upload_id.len());
+    put_len(&mut out, bucket.len());
+    out.extend_from_slice(bucket.as_bytes());
+    put_len(&mut out, key.len());
+    out.extend_from_slice(key.as_bytes());
+    put_len(&mut out, upload_id.len());
+    out.extend_from_slice(upload_id.as_bytes());
+    out
+}
+
 pub struct MultiPartTree {
-    tree: Arc<dyn BaseMetaTree>,
+    tree: Arc<dyn MetaTreeExt + Send + Sync>,
 }
 // Implement Debug manually
 impl std::fmt::Debug for MultiPartTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MultiPartTree")
-            .field("tree", &"<BaseMetaTree>")
+            .field("tree", &"<MetaTreeExt>")
             .finish()
     }
 }
 impl MultiPartTree {
-    pub fn new(tree: Arc<dyn BaseMetaTree>) -> Self {
+    /// Wraps the `_MULTIPART_PARTS` tree.
+    ///
+    /// The extended handle rather than the base one: per-upload enumeration
+    /// ([`Self::parts_of`]) is a range scan, and scans live on
+    /// [`MetaTreeExt`].
+    pub fn new(tree: Arc<dyn MetaTreeExt + Send + Sync>) -> Self {
         Self { tree }
     }
 
@@ -192,12 +244,51 @@ impl MultiPartTree {
         let mp = MultiPart::try_from(value.as_ref())?;
         Ok(Some(mp))
     }
+
+    /// Every part record carrying `prefix` -- one upload's parts, in
+    /// ascending part_number order (the big-endian tail of [`part_key`] is
+    /// what makes key order numeric order).
+    ///
+    /// The scan starts strictly after `prefix` itself and stops at the first
+    /// key that does not carry it. Nothing is skipped by starting there,
+    /// because every part key is the prefix plus an 8 byte tail and so sorts
+    /// after it; stopping at the first non-match is exact, because the store
+    /// iterates in key order and the encoding is prefix-injective.
+    ///
+    /// Records are decoded from VALUES, never from keys (hard rule 4). A
+    /// legacy dash-format record is therefore unreachable here -- no prefix
+    /// matches it -- which is precisely what leaves it to the GC's
+    /// value-driven orphan sweep (ADR 0003: the first sweep IS the
+    /// migration).
+    pub fn parts_of(
+        &self,
+        prefix: &[u8],
+    ) -> Box<dyn Iterator<Item = Result<MultiPart, MetaError>> + Send> {
+        let prefix = prefix.to_vec();
+        Box::new(
+            self.tree
+                .iter_kv(Some(prefix.clone()))
+                .take_while(move |item| match item {
+                    Ok((key, _)) => key.starts_with(&prefix),
+                    // A store error must reach the caller, not silently end
+                    // the scan short of the upload's remaining parts.
+                    Err(_) => true,
+                })
+                .map(|item| {
+                    let (_, raw) = item?;
+                    MultiPart::try_from(&*raw).map_err(MetaError::from)
+                }),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metastore::{BLOCKID_SIZE, MAX_BLOCKID_SIZE};
+    use crate::metastore::{
+        BLOCKID_SIZE, FjallStore, MAX_BLOCKID_SIZE, MULTIPART_PARTS_TREE, MetaStore,
+    };
+    use tempfile::{TempDir, tempdir};
 
     /// Part record with one 16 byte block id (format v1).
     #[rustfmt::skip]
@@ -469,5 +560,157 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The parts tree, plus the raw handle underneath it for planting
+    /// records the typed surface can no longer write.
+    fn test_tree() -> (MultiPartTree, Arc<dyn MetaTreeExt + Send + Sync>, TempDir) {
+        let dir = tempdir().unwrap();
+        let meta = MetaStore::new(
+            FjallStore::new(dir.path().to_path_buf(), Some(1), None),
+            None,
+        );
+        let raw = meta.get_tree_ext(MULTIPART_PARTS_TREE).unwrap();
+        (MultiPartTree::new(Arc::clone(&raw)), raw, dir)
+    }
+
+    fn part(bucket: &str, key: &str, upload_id: &str, part_number: i64) -> MultiPart {
+        MultiPart::new(
+            1024,
+            part_number,
+            bucket.to_string(),
+            key.to_string(),
+            upload_id.to_string(),
+            ContentHash([0x11; CONTENT_HASH_SIZE]),
+            vec![BlockId::from([0x22; BLOCKID_SIZE])],
+        )
+    }
+
+    fn insert(tree: &MultiPartTree, bucket: &str, key: &str, upload_id: &str, part_number: i64) {
+        tree.insert(
+            &part_key(bucket, key, upload_id, part_number),
+            part(bucket, key, upload_id, part_number),
+        )
+        .unwrap();
+    }
+
+    fn part_numbers(tree: &MultiPartTree, prefix: &[u8]) -> Vec<i64> {
+        tree.parts_of(prefix)
+            .map(|part| part.unwrap().part_number())
+            .collect()
+    }
+
+    /// The ambiguity the dash-joined keys had: with a separator, a bucket,
+    /// key or upload id containing it makes two different parts share one
+    /// key. Length prefixes make every triple its own key, and keep one
+    /// upload's prefix from reaching into another's.
+    #[test]
+    fn part_keys_are_unambiguous() {
+        // The pair that collided under `{bucket}-{key}-{upload}-{n}`.
+        assert_ne!(part_key("a-b", "c", "u", 1), part_key("a", "b-c", "u", 1));
+        assert_ne!(part_key("a", "b-u", "x", 1), part_key("a", "b", "u-x", 1));
+
+        // The same triple always encodes to the same bytes: point reads
+        // depend on rebuilding exactly what was written.
+        assert_eq!(part_key("b", "k", "u1", 3), part_key("b", "k", "u1", 3));
+        assert_ne!(part_key("b", "k", "u1", 3), part_key("b", "k", "u1", 4));
+
+        // A part key is its upload's prefix plus the 8 byte tail.
+        let prefix = part_prefix("b", "k", "u1");
+        let key = part_key("b", "k", "u1", 7);
+        assert!(key.starts_with(&prefix));
+        assert_eq!(key.len(), prefix.len() + 8);
+        assert_eq!(key[prefix.len()..], 7u64.to_be_bytes());
+
+        // No other upload's key carries this prefix -- not even one whose id
+        // extends it, which a bare concatenation would have let through.
+        for foreign in [
+            part_key("b", "k", "u10", 7),
+            part_key("b", "k1", "u1", 7),
+            part_key("b1", "k", "u1", 7),
+        ] {
+            assert!(!foreign.starts_with(&prefix));
+        }
+    }
+
+    /// A prefix scan returns exactly one upload's parts, in ascending
+    /// part_number order, whatever order they were written in.
+    #[test]
+    fn prefix_scan_yields_one_uploads_parts_in_order() {
+        let (tree, _raw, _dir) = test_tree();
+
+        for number in [3, 1, 2] {
+            insert(&tree, "b", "k", "u1", number);
+        }
+        // Neighbours that must not appear: same key different upload, same
+        // upload id under another key, another bucket.
+        insert(&tree, "b", "k", "u2", 1);
+        insert(&tree, "b", "k2", "u1", 1);
+        insert(&tree, "b2", "k", "u1", 1);
+
+        assert_eq!(part_numbers(&tree, &part_prefix("b", "k", "u1")), [1, 2, 3]);
+        assert_eq!(part_numbers(&tree, &part_prefix("b", "k", "u2")), [1]);
+        assert!(
+            tree.parts_of(&part_prefix("b", "k", "gone"))
+                .next()
+                .is_none(),
+            "an upload with no parts scans empty"
+        );
+
+        // The scan decodes values, so every record really is this upload's.
+        for part in tree.parts_of(&part_prefix("b", "k", "u1")) {
+            let part = part.unwrap();
+            assert_eq!(
+                (part.bucket(), part.key(), part.upload_id()),
+                ("b", "k", "u1")
+            );
+        }
+    }
+
+    /// The tail is unsigned big-endian, so key order IS numeric order across
+    /// a byte boundary. Little-endian would sort 256 before 255.
+    #[test]
+    fn part_number_order_survives_the_byte_boundary() {
+        let (tree, _raw, _dir) = test_tree();
+
+        for number in [257, 255, 1, 256] {
+            insert(&tree, "b", "k", "u1", number);
+        }
+
+        assert_eq!(
+            part_numbers(&tree, &part_prefix("b", "k", "u1")),
+            [1, 255, 256, 257]
+        );
+    }
+
+    /// Hard rule 4: a legacy dash-keyed record is invisible to every prefix
+    /// scan -- no key format bridges the two -- while staying perfectly
+    /// visible to the value-driven walk that the GC's orphan sweep and fsck
+    /// use. That gap IS the migration: the sweep reaps it.
+    #[test]
+    fn a_legacy_dash_keyed_record_is_invisible_to_prefix_scans() {
+        let (tree, raw, _dir) = test_tree();
+
+        raw.insert(b"b-k-u1-1", part("b", "k", "u1", 1).to_vec())
+            .unwrap();
+        insert(&tree, "b", "k", "u1", 2);
+
+        assert_eq!(
+            part_numbers(&tree, &part_prefix("b", "k", "u1")),
+            [2],
+            "only the re-keyed part is reachable by prefix"
+        );
+
+        // Both records are still there, and the value walk sees both.
+        assert_eq!(raw.len().unwrap(), 2);
+        let mut walked: Vec<i64> = raw
+            .iter_all()
+            .map(|item| {
+                let (_, value) = item.unwrap();
+                MultiPart::try_from(&*value).unwrap().part_number()
+            })
+            .collect();
+        walked.sort_unstable();
+        assert_eq!(walked, [1, 2], "the value-driven walk still reaches both");
     }
 }

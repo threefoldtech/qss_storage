@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{io, path::PathBuf};
 
-use super::multipart::MultiPart;
+use super::multipart::{MultiPart, part_key};
 use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
@@ -73,11 +73,6 @@ impl std::fmt::Display for StorageEngine {
 }
 
 pub type ObjectPaths = (Object, Vec<(PathBuf, usize)>);
-
-/// Storage key of one part of a multipart upload.
-fn part_key(bucket: &str, key: &str, upload_id: &str, part_number: i64) -> String {
-    format!("{bucket}-{key}-{upload_id}-{part_number}")
-}
 
 impl CasFS {
     /// Build a `CasFS` for one namespace, sharing a block/multipart store
@@ -341,15 +336,18 @@ impl CasFS {
         let storage_key = part_key(&bucket, &key, &upload_id, part_number);
 
         tracing::debug!(
-            "CasFS: insert_multipart_part storage_key={}, size={}, blocks={}",
-            storage_key,
-            size,
-            blocks.len()
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            size = size,
+            blocks = blocks.len(),
+            "CasFS: insert_multipart_part"
         );
 
         let mp = MultiPart::new(size, part_number, bucket, key, upload_id, hash, blocks);
 
-        mp_map.insert(storage_key.as_bytes(), mp)?;
+        mp_map.insert(&storage_key, mp)?;
         Ok(())
     }
 
@@ -361,17 +359,26 @@ impl CasFS {
         part_number: i64,
     ) -> Result<Option<MultiPart>, MetaError> {
         let mp_map = self.shared.multipart_tree();
-        let part_key = part_key(bucket, key, upload_id, part_number);
+        let storage_key = part_key(bucket, key, upload_id, part_number);
 
-        tracing::debug!("CasFS: get_multipart_part storage_key={}", part_key);
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            "CasFS: get_multipart_part"
+        );
 
-        let result = mp_map.get_multipart_part(part_key.as_bytes());
+        let result = mp_map.get_multipart_part(&storage_key);
 
         if let Ok(Some(ref mp)) = result {
             tracing::debug!(
-                "CasFS: get_multipart_part found storage_key={}, blocks={}",
-                part_key,
-                mp.blocks().len()
+                bucket = %bucket,
+                key = %key,
+                upload_id = %upload_id,
+                part_number = part_number,
+                blocks = mp.blocks().len(),
+                "CasFS: get_multipart_part found"
             );
         }
 
@@ -386,11 +393,17 @@ impl CasFS {
         part_number: i64,
     ) -> Result<(), MetaError> {
         let mp_map = self.shared.multipart_tree();
-        let part_key = part_key(bucket, key, upload_id, part_number);
+        let storage_key = part_key(bucket, key, upload_id, part_number);
 
-        tracing::debug!("CasFS: remove_multipart_part storage_key={}", part_key);
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            "CasFS: remove_multipart_part"
+        );
 
-        mp_map.remove(part_key.as_bytes())
+        mp_map.remove(&storage_key)
     }
 
     pub fn key_exists(&self, bucket: &str, key: &str) -> Result<bool, MetaError> {
