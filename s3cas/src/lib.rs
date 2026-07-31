@@ -6,7 +6,6 @@ pub mod inspect;
 pub mod metrics;
 pub mod retrieve;
 pub mod s3fs;
-pub mod store_options;
 
 // Re-export cas-storage so downstream code can use `s3cas::cas_storage::*`
 // or `s3cas::cas::*` / `s3cas::metastore::*` as before.

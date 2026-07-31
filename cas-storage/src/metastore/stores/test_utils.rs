@@ -7,6 +7,7 @@ use crate::metastore::{
 pub trait TestStore {
     fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError>;
     fn get_bucket_ext(&self, name: &str) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, MetaError>;
+    fn list_trees(&self) -> Result<Vec<String>, MetaError>;
     // ---- tfstor-extension: BEGIN ----
     fn num_keys(&self, name: &str) -> Result<usize, MetaError>;
     // ---- tfstor-extension: END ----
@@ -42,6 +43,10 @@ macro_rules! backend_test_battery {
                 <$store as $crate::metastore::Store>::tree_ext_open(self, name)
             }
 
+            fn list_trees(&self) -> Result<Vec<String>, $crate::metastore::MetaError> {
+                <$store as $crate::metastore::Store>::list_trees(self)
+            }
+
             fn num_keys(&self, name: &str) -> Result<usize, $crate::metastore::MetaError> {
                 <$store as $crate::metastore::Store>::num_keys(self, name)
             }
@@ -57,6 +62,12 @@ macro_rules! backend_test_battery {
         fn test_range_filter() {
             let (store, _dir) = ($setup)();
             $crate::metastore::stores::test_utils::test_range_filter(&store);
+        }
+
+        #[test]
+        fn test_list_trees() {
+            let (store, _dir) = ($setup)();
+            $crate::metastore::stores::test_utils::test_list_trees(&store);
         }
 
         // ---- tfstor-extension: BEGIN ----
@@ -98,6 +109,24 @@ pub fn test_num_keys(store: &impl TestStore) {
     assert_eq!(store.num_keys("test-num-keys-empty").unwrap(), 0);
 }
 // ---- tfstor-extension: END ----
+
+/// The enumeration ADR 0005's closed-holder-set rule rests on: every tree
+/// that exists must be listed, whether or not anything else knows about it.
+pub fn test_list_trees(store: &impl TestStore) {
+    assert!(
+        store.list_trees().unwrap().is_empty(),
+        "a store with no trees lists none"
+    );
+
+    // A tree exists from the moment it is opened, reserved names included.
+    for name in ["alpha", "beta", "_RESERVED"] {
+        store.tree_open(name).unwrap();
+    }
+
+    let mut trees = store.list_trees().unwrap();
+    trees.sort();
+    assert_eq!(trees, vec!["_RESERVED", "alpha", "beta"]);
+}
 
 pub fn test_get_bucket_keys(store: &impl TestStore) {
     let bucket_name = "testbucketkeys";

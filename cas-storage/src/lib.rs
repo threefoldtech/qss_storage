@@ -75,6 +75,7 @@ pub mod config;
 pub mod hasher;
 pub mod metastore;
 pub mod metrics;
+pub mod store_options;
 
 // Re-export the block hasher (used by both the cas and metastore layers)
 pub use hasher::{Hasher, HasherError};
@@ -83,6 +84,9 @@ pub use hasher::{Hasher, HasherError};
 pub use config::{
     ConfigError, HashConfig, MetricsConfig, QssStorageConfig, RespConfig, S3Config, StoreConfig,
 };
+
+// Re-export the resolved store settings every binary opens its store with
+pub use store_options::StoreOptions;
 
 // Re-export main types from metastore
 pub use metastore::{

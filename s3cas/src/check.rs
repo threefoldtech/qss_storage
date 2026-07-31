@@ -21,13 +21,13 @@ use futures::StreamExt;
 use md5::{Digest, Md5};
 
 use crate::metrics::SharedMetrics;
-use crate::store_options::StoreOptions;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
 use cas_storage::ContentHash;
 use cas_storage::Hasher;
 use cas_storage::RangeRequest;
 use cas_storage::StorageEngine;
+use cas_storage::StoreOptions;
 use cas_storage::metastore::{BlockId, Object};
 
 #[derive(Parser, Debug)]

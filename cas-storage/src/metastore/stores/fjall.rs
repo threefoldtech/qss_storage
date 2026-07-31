@@ -152,6 +152,18 @@ impl Store for FjallStore {
         Ok(self.db.db.keyspace_exists(name))
     }
 
+    // The database's own keyspace registry is the authority, not the
+    // partition cache: a tree this process never opened is still a tree.
+    fn list_trees(&self) -> Result<Vec<String>, MetaError> {
+        Ok(self
+            .db
+            .db
+            .list_keyspace_names()
+            .iter()
+            .map(ToString::to_string)
+            .collect())
+    }
+
     fn tree_delete(&self, name: &str) -> Result<(), MetaError> {
         let partition = self.get_partition(name)?;
         // Drop the cached handle first: after the delete it refers to a

@@ -1,16 +1,17 @@
 //! Store settings resolved from CLI flags, the config file, and the built-in
 //! defaults -- in that order of precedence.
 //!
-//! Every s3cas subcommand opens a store, and all of them have to agree on how:
-//! a tool that opens the store with a different backend or a different inline
-//! threshold than the server wrote it with reads the wrong thing. So the
-//! resolution lives here once, and `server`, `inspect`, `retrieve` and `check`
-//! all call it.
+//! Every tool that opens a store has to agree on how: one that opens the store
+//! with a different backend or a different inline threshold than the server
+//! wrote it with reads the wrong thing. So the resolution lives here once, in
+//! the library, and every binary -- s3cas's subcommands and fsck alike --
+//! calls it. The flag definitions themselves stay with each binary's clap
+//! parser; only the merge is shared.
 
-use cas_storage::config::{
+use crate::config::{
     ConfigError, DEFAULT_DURABILITY, DEFAULT_METADATA_DB, DEFAULT_VERIFY_ON_READ, StoreConfig,
 };
-use cas_storage::{Durability, Hasher, HeaderSpec, StorageEngine};
+use crate::{Durability, Hasher, HeaderSpec, StorageEngine};
 
 /// How this process opens (and, if it does not exist yet, creates) its store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +71,7 @@ mod tests {
     use super::*;
 
     fn store_config(toml: &str) -> StoreConfig {
-        cas_storage::config::parse(toml, std::path::Path::new("test.toml"))
+        crate::config::parse(toml, std::path::Path::new("test.toml"))
             .expect("test config must parse")
             .store
     }
@@ -122,7 +123,7 @@ mod tests {
     #[test]
     fn a_bad_hash_section_is_refused() {
         let store = StoreConfig {
-            hash: cas_storage::config::HashConfig {
+            hash: crate::config::HashConfig {
                 algo: None,
                 width: Some(24),
             },

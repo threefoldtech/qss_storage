@@ -136,6 +136,18 @@ pub trait Store: Send + Sync + Debug + 'static {
     /// * `Result<bool, MetaError>` - True if the tree exists, false otherwise, or an error
     fn tree_exists(&self, name: &str) -> Result<bool, MetaError>;
 
+    /// Lists the name of every tree in the store, reserved `_`-prefixed
+    /// trees included, in no particular order.
+    ///
+    /// This is what makes the closed-holder-set rule of ADR 0005
+    /// enforceable: fsck enumerates reference holders from the store's own
+    /// trees rather than from the `_BUCKETS` rows, because a half-deleted
+    /// bucket's object tree still holds refcounts after its row is gone.
+    ///
+    /// # Returns
+    /// * `Result<Vec<String>, MetaError>` - Every tree name, or an error
+    fn list_trees(&self) -> Result<Vec<String>, MetaError>;
+
     /// Deletes the tree with the given name.
     ///
     /// # Arguments

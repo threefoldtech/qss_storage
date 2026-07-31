@@ -7,11 +7,11 @@ use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::metrics::SharedMetrics;
-use crate::store_options::StoreOptions;
 use cas_storage::BlockStream;
 use cas_storage::CasFS;
 use cas_storage::RangeRequest;
 use cas_storage::StorageEngine;
+use cas_storage::StoreOptions;
 
 #[derive(Parser, Debug)]
 pub struct RetrieveConfig {

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::hasher::Hasher;
 use crate::metastore::{
-    BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
+    BlockTree, Durability, FjallStore, HeaderSpec, MULTIPART_PARTS_TREE, MetaError, MetaStore,
+    StoreHeader,
 };
 
 use super::block_disk::{AtomicBlockWriter, BlockDiskOps, RealDiskOps};
@@ -98,7 +99,7 @@ impl SharedBlockStore {
         };
 
         let block_tree = meta_store.get_block_tree()?;
-        let multipart_tree_base = meta_store.get_tree("_MULTIPART_PARTS")?;
+        let multipart_tree_base = meta_store.get_tree(MULTIPART_PARTS_TREE)?;
         let multipart_tree = MultiPartTree::new(multipart_tree_base);
 
         Ok(Self {

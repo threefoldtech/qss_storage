@@ -22,6 +22,15 @@ pub struct MetaStore {
 const DEFAULT_BUCKET_TREE: &str = "_BUCKETS";
 const DEFAULT_BLOCK_TREE: &str = "_BLOCKS";
 
+/// Tree holding the in-flight multipart part records, in the shared blocks
+/// DB next to `_BLOCKS`.
+///
+/// Public because it is a reference holder: ADR 0005's recount must walk it
+/// unconditionally (a live upload's parts are the only thing referencing its
+/// blocks until the upload completes), so the name is part of the store's
+/// contract rather than a literal each caller spells for itself.
+pub const MULTIPART_PARTS_TREE: &str = "_MULTIPART_PARTS";
+
 impl MetaStore {
     /// Creates a new MetaStore instance with the given store implementation.
     ///
@@ -174,6 +183,21 @@ impl MetaStore {
     /// A tree instance or an error
     pub fn get_tree(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         self.store.tree_open(name)
+    }
+
+    /// Returns the name of every tree in the store, reserved `_`-prefixed
+    /// trees included.
+    ///
+    /// The store itself is the authority on which trees exist. ADR 0005's
+    /// holder enumeration starts here rather than at [`Self::list_buckets`],
+    /// because a bucket whose teardown crashed after its `_BUCKETS` row was
+    /// removed still has an object tree, and that tree still holds block
+    /// references.
+    ///
+    /// # Returns
+    /// Every tree name, in no particular order, or an error
+    pub fn list_trees(&self) -> Result<Vec<String>, MetaError> {
+        self.store.list_trees()
     }
 
     /// Checks if a bucket with the given name exists.
@@ -870,7 +894,12 @@ mod tests {
     fn insert_bucket_refuses_reserved_names() {
         let (meta, _dir) = test_store();
 
-        for name in ["_STORE_HEADER", "_BLOCKS", "_MULTIPART_PARTS", "_"] {
+        for name in [
+            store_header::STORE_HEADER_TREE,
+            DEFAULT_BLOCK_TREE,
+            MULTIPART_PARTS_TREE,
+            "_",
+        ] {
             let raw = BucketMeta::new(name.to_string()).to_vec();
             match meta.insert_bucket(name, raw).unwrap_err() {
                 MetaError::ReservedBucketName(refused) => assert_eq!(refused, name),
@@ -889,6 +918,55 @@ mod tests {
         let raw = BucketMeta::new("photos".to_string()).to_vec();
         meta.insert_bucket("photos", raw).unwrap();
         assert!(meta.bucket_exists("photos").unwrap());
+    }
+
+    /// The holder enumeration ADR 0005 recounts from: every bucket tree and
+    /// every reserved tree the store keeps must be named, because a bucket
+    /// whose `_BUCKETS` row is gone still holds block references through its
+    /// object tree.
+    #[test]
+    fn list_trees_names_bucket_and_reserved_trees() {
+        let dir = tempdir().unwrap();
+        let (meta, _header) =
+            MetaStore::open_or_create(dir.path().join("db"), Some(1), HeaderSpec::default(), |p| {
+                FjallStore::new(p, Some(1), None)
+            })
+            .unwrap();
+
+        for name in ["photos", "videos"] {
+            meta.insert_bucket(name, BucketMeta::new(name.to_string()).to_vec())
+                .unwrap();
+        }
+        // The shared trees exist from the moment they are opened.
+        meta.get_block_tree().unwrap();
+        meta.get_tree(MULTIPART_PARTS_TREE).unwrap();
+
+        let trees = meta.list_trees().unwrap();
+        for expected in [
+            "photos",
+            "videos",
+            store_header::STORE_HEADER_TREE,
+            DEFAULT_BUCKET_TREE,
+            DEFAULT_BLOCK_TREE,
+            MULTIPART_PARTS_TREE,
+        ] {
+            assert!(
+                trees.iter().any(|name| name == expected),
+                "{expected} missing from {trees:?}"
+            );
+        }
+
+        // A half-deleted bucket -- its row removed, its tree left behind --
+        // is exactly what the listing must keep showing.
+        let buckets = meta.get_allbuckets_tree().unwrap();
+        buckets.remove(b"videos").unwrap();
+        assert!(
+            meta.list_trees()
+                .unwrap()
+                .iter()
+                .any(|name| name == "videos"),
+            "the tree outlives its _BUCKETS row"
+        );
     }
 
     /// Two hashes sharing a leading byte can both live at depth 1: their

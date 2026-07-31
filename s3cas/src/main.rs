@@ -8,6 +8,7 @@ use prometheus::Encoder;
 use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
+use cas_storage::StoreOptions;
 use cas_storage::config::{
     self, DEFAULT_METRICS_HOST, DEFAULT_METRICS_PORT, DEFAULT_S3_HOST, DEFAULT_S3_PORT,
     QssStorageConfig,
@@ -17,7 +18,6 @@ use s3cas::check::{CheckConfig, check_integrity};
 use s3cas::inspect::{disk_space, headers, num_keys};
 use s3cas::metastore::Durability;
 use s3cas::retrieve::{RetrieveConfig, retrieve};
-use s3cas::store_options::StoreOptions;
 
 /// Help text for every `--config` flag in this binary.
 const CONFIG_HELP: &str = "Path to qss_storage.toml (default: ./qss_storage.toml, then \

@@ -27,9 +27,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::store_options::StoreOptions;
 use cas_storage::metastore::store_header::{STORE_HEADER_MAGIC, StoreInit, classify_db_dir};
-use cas_storage::{FjallStore, MetaStore, StorageEngine, StoreHeader};
+use cas_storage::{FjallStore, MetaStore, StorageEngine, StoreHeader, StoreOptions};
 
 /// Path of the namespace metadata DB under a `--meta-root`, the way
 /// `CasFS::new` builds it.
