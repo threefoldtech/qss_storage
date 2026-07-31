@@ -3,7 +3,7 @@
 **Status**: Proposed (revised 2026-07-30 after adversarial code review;
 13-agent verification pass, all Context claims below carry file:line
 evidence; all six adversarially re-derived claims survived skeptic
-refutation)
+refutation; path scheme decided 2026-07-31: deterministic)
 **Date**: 2026-07-30
 
 ---
@@ -116,33 +116,31 @@ makes the whole protocol compose:
 > under `stripe(hash)`.** While a stripe is held, that block's record and
 > file are frozen for everyone else.
 
-### Path scheme (forced decision, new)
+### Path scheme: hash-derived deterministic paths (DECIDED 2026-07-31)
 
-Two ways to make "same block => same path" true:
+Block disk paths become a pure function of the BlockId: two single-byte
+fanout levels, then the full id --
 
-- **(a) Keep `_PATHS`, add discipline.** Requires three rules the review
-  derived as necessary: (i) a PUT's path allocation happens in a small
-  claim-tx *before* the disk write (the rename target must exist before
-  the rename; today it is allocated inside the record-insert tx, which the
-  file-first ordering makes circular) -- crash residue is a claimed path
-  entry with no record and no file, a new sweep class for ADR 0005;
-  (ii) path entries of zeroed blocks are freed only inside the striped
-  delete section, after the re-check and together with the unlink -- freed
-  earlier, a different hash can claim the prefix, rename its live file to
-  the *same disk path*, and the pending unlink destroys it (loss);
-  (iii) a dedup PUT that finds the record vanished under its stripe
-  re-inserts rc=1 *reusing the vanished record's path* (the file provably
-  still sits there; see Race analysis).
-- **(b) Hash-derived deterministic paths.** Full-width fanout derived from
-  the BlockId. The premise holds by construction; the claim-tx, the
-  freeing rules, and the path-reuse rule all disappear, and `_PATHS`
-  retires. Cost: an on-disk layout change (format bump via ADR 0002's
-  header machinery) and a migration story for existing stores; deeper
-  directory fanout.
+```text
+blocks/<hex b0>/<hex b1>/<full 32-char hex id>
+```
 
-**Recommendation: (b).** Every subtle rule in (a) exists only to simulate
-what (b) gives structurally, and (a) adds a new crash-residue class.
-Review ask 1.
+"Same block => same path" then holds by construction, which is what the
+protocol's idempotent-rename, orphan-heal, and re-check arguments rest
+on. The `_PATHS` tree, the per-record stored path field, and the
+shortest-free-prefix allocator (`meta_store.rs:663-727`) are all
+removed; `delete_object`'s path-map maintenance (`delete_path.rs:19-25`)
+disappears with them, and the whole class of freed-prefix-reuse races
+(a different hash claiming a dead record's prefix and having its live
+file unlinked by a pending delete) becomes structurally impossible.
+
+**No upgrade path is needed**: no deployed store carries data, so the
+deterministic layout simply *is* the layout -- no format bump, no
+migration machinery, no dual-path lookup. Fsck (ADR 0005) and every tool
+assume the deterministic layout only.
+
+(The rejected alternative -- keeping `_PATHS` with added discipline --
+is recorded in Alternatives Considered.)
 
 ### The protocol
 
@@ -185,9 +183,7 @@ one namespace-DB tx: read AND remove the object record   # atomic pair
 for each block in the removed object's list:
     lock stripe(hash)          # guard moves INTO the blocking closure
         short fjall tx: read rc inside tx; decrement;
-                        if rc reaches 0: remove record
-                        (option (a): remove its _PATHS entry here too)
-                        commit
+                        if rc reaches 0: remove record; commit
         if removed: unlink file    # ENOENT tolerated; never abort loop
     unlock
 ```
@@ -234,9 +230,7 @@ backends identically and makes the safety argument uniform.
 - The unlink re-check may be a plain (non-tx) read: while the stripe is
   held, the only writers that could make an absent record present are
   PUTs of the same block, and they are blocked on this stripe. Removals
-  by others cannot turn absent into present. (Do not "optimize" path
-  freeing out of the striped section under option (a) -- the re-check's
-  sufficiency depends on it.)
+  by others cannot turn absent into present.
 
 ### Race analysis
 
@@ -253,14 +247,11 @@ file or an unlinked live block.
 
 The dedup path's record-vanished tail: a PUT holds `stripe(h)`, its in-tx
 re-read finds the record gone (a DELETE's striped decrement won the race
-before we acquired the stripe -- once we hold it, nothing mutates).
-Record-present-at-acquisition implies file-present-while-held: files are
-unlinked only under the stripe with the record absent, so under option (a)
-the PUT may insert rc=1 reusing the vanished record's path without
-rewriting bytes; under option (b), falling through to the full insert path
-(redundant identical write, rename-over) is unconditionally correct and
-simpler. The ADR picks: fall through (b-style) unless profiling says
-otherwise.
+before we acquired the stripe -- once we hold it, nothing mutates). The
+PUT falls through to the full insert path: a redundant identical write
+plus rename-over, unconditionally correct and simple. With deterministic
+paths the file it renames over sits at the same address the vanished
+record named -- byte-identical either way.
 
 ### Cancellation (new)
 
@@ -315,10 +306,8 @@ was imprecise):
 2. file without record (orphan) -> ADR 0005 orphan sweep, or healed by
    rename-over on re-upload;
 3. record+file without a referencing object (rc over-count) -> ADR 0005
-   refcount reconciliation (recount from live objects);
-4. (option (a) only) claimed `_PATHS` entry without record or file ->
-   new ADR 0005 sweep class.
-All four are invisible leakage. None is client-visible loss.
+   refcount reconciliation (recount from live objects).
+All three are invisible leakage. None is client-visible loss.
 
 ### key_has_block and same-key overwrite (forced decision, new)
 
@@ -400,9 +389,9 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
      blocking closure. Unlink tolerates ENOENT and never aborts the loop
      (replaces the `.expect("Could not delete file")` panic at
      `delete_path.rs:18`, which today kills the connection task *after*
-     metadata removal, leaking the remaining blocks). `_PATHS` entry
-     removal (today `delete_path.rs:19-25`) lives inside the striped
-     section under option (a), or retires under option (b).
+     metadata removal, leaking the remaining blocks). `_PATHS`
+     maintenance (today `delete_path.rs:19-25`) retires with the
+     deterministic layout.
      `bucket_delete` keeps its inherited ordering (bucket meta removed
      before object teardown, `delete_path.rs:33-34`); its mid-loop
      failure residue (invisible half-deleted bucket) goes to ADR 0005's
@@ -457,6 +446,20 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
   bottleneck nobody has measured. The short-tx design keeps guard hold
   times in microseconds.
 
+### Keeping the _PATHS prefix allocation (rejected with the path decision)
+- **The idea**: retain the per-insert shortest-free-prefix paths and make
+  the protocol safe around them with three added rules: a claim-tx
+  allocating the path *before* the disk write (new crash residue: a
+  claimed entry with no record and no file, a new ADR 0005 sweep class);
+  path entries of zeroed blocks freed only inside the striped delete
+  section (freed earlier, a different hash claims the prefix and the
+  pending unlink destroys its live file); dedup re-inserts reusing the
+  vanished record's path.
+- **Why rejected**: every rule exists only to simulate what hash-derived
+  paths give structurally, and it adds a crash-residue class. With no
+  deployed data there is no migration cost to trade against; shorter
+  paths were the only benefit.
+
 ### O_TMPFILE + linkat (moved here from the open decisions: rejected)
 - **The idea**: anonymous temp inodes, no temp names, no `.tmp` sweep.
 - **Why rejected**: `linkat` fails `EEXIST` on an existing target and
@@ -474,7 +477,7 @@ follow-up work recorded in ADR 0005/0003 scope, not smuggled in here.
 
 ### Positive
 - All five defects close at once; every failure mode degrades to
-  invisible *leakage* (the four residue classes in Cancellation, each
+  invisible *leakage* (the three residue classes in Cancellation, each
   with a collector), never a client-visible dangling record, partial
   read, or phantom-durable record -- with the Buffer power-loss caveat
   stated in Invariants.
@@ -588,7 +591,11 @@ survives for test injection only; its implementation moves to
 
 ## Implementation Plan
 
-### Decisions locked by the review (previously open)
+### Decisions locked (previously open)
+- **Path scheme**: hash-derived deterministic paths, decided 2026-07-31.
+  No migration -- no deployed store carries data; `_PATHS`, the stored
+  path field, and the prefix allocator are removed wholesale and
+  `disk_path` becomes a pure function of `BlockId`.
 - **Stripe placement on `SharedBlockStore`**: confirmed (review ask 1 of
   the previous revision), with the two new preconditions in component 1
   (no double-open via `single_namespace`; blocks root bound to the shared
@@ -632,27 +639,26 @@ Then: stripe module + placement (with owned-guard API); atomic file
 writer with the full durability chain and open-time checks; write_path
 reorder (guard states unchanged, cleanup deleted, skip dropped);
 delete_path split with guard-in-closure and panic removal; `.tmp` cleanup
-on open; path-scheme decision and, if (b), the layout migration; rename
-`AsyncFileSystem`.
+on open; the deterministic path layout (remove `_PATHS`, the stored path
+field, and the allocator; `disk_path` becomes a pure function of
+`BlockId`); rename `AsyncFileSystem`.
 
 Tests: race stress -- PUT-vs-DELETE same block, dedup-bump-vs-delete,
 double-DELETE same key, PUT-vs-PUT same block on both backends;
 cancellation fixtures -- detached-rename-after-drop (orphan only),
 guarded unlink (no detached destructive op); crash-window fixtures for
-ADR 0005 (orphan, temp residue, Buffer dangling record, and claimed-path
-residue if option (a)); fsync gating per durability level; rc-exactness
+ADR 0005 (orphan, temp residue, Buffer dangling record); fsync gating
+per durability level; rc-exactness
 tests must account for the pre-existing key-overwrite leak (or land the
 overwrite-decrement follow-up first); an end-to-end concurrent-PUT
 benchmark to quantify the executor win and measure `(K-1)/N` in practice.
 
 Review asks:
-1. Path scheme: hash-derived deterministic paths (b, recommended, layout
-   migration) or `_PATHS` with the three discipline rules (a)?
-2. `key_has_block`: agree to drop the skip (loss-class under-count
+1. `key_has_block`: agree to drop the skip (loss-class under-count
    becomes leak-class over-count, reconciled by 0005 recount)?
-3. notx: add a key-stripe for object deletes, or scope `fjall_notx` out
+2. notx: add a key-stripe for object deletes, or scope `fjall_notx` out
    of the loss-never guarantee?
-4. Land before ADR 0005? The review strengthens "before": two of today's
+3. Land before ADR 0005? The review strengthens "before": two of today's
    loss races (defects 1 and 5) are states fsck cannot even detect (an rc
    undercount looks consistent), so reconciliation cannot substitute for
    this fix.
@@ -667,5 +673,3 @@ Review asks:
       note: rename-over installs byte-identical content, so a heal race
       cannot fail verification; the remaining argument for read-side
       locking is thin.)
-- [ ] If path scheme (b): migration mechanics for existing stores --
-      eager rewrite at open vs lazy move-on-read vs dual-path lookup.
