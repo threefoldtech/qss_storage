@@ -16,4 +16,9 @@ mod read_path;
 mod stripes;
 mod write_path;
 
+#[cfg(test)]
+mod crash_fixtures;
+#[cfg(test)]
+mod race_tests;
+
 pub use byte_stream::AsyncByteStream;

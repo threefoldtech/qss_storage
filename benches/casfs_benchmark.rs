@@ -238,11 +238,79 @@ fn bench_hash_width(c: &mut Criterion) {
     }
 }
 
+/// Concurrent PUTs of DISTINCT blocks at writer counts K (ADR 0006).
+///
+/// This is the scenario the file-first redesign changes: disk writes and
+/// fjall commits now run in spawn_blocking closures under per-block
+/// stripes, so K writers of distinct blocks proceed in parallel instead
+/// of serializing behind a worker-parking sync write. Varying K exposes
+/// the `(K-1)/N` stripe-collision tail (N = 1024 stripes by default):
+/// wall time per batch should scale sublinearly in K until the blocking
+/// pool or the disk saturates.
+///
+/// Payloads are stamped per task and per iteration so no two writers ever
+/// share a block -- a shared block would measure the dedup path and the
+/// stripe SERIALIZATION instead of the parallel write path.
+fn bench_concurrent_puts(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    const OBJECT_SIZE: usize = 65536;
+
+    let mut group = c.benchmark_group("concurrent_puts");
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(20);
+
+    for k in [1usize, 4, 16, 64] {
+        let (fs, _dir) = setup_casfs();
+        let fs = std::sync::Arc::new(fs);
+        let bucket_name = "test-bucket";
+        create_test_bucket(&fs, bucket_name);
+
+        // K objects per iteration = one "batch"; throughput in bytes makes
+        // the K runs comparable.
+        group.throughput(criterion::Throughput::Bytes((OBJECT_SIZE * k) as u64));
+        group.bench_function(BenchmarkId::new("distinct_blocks", k), |b| {
+            let payload = create_random_data(OBJECT_SIZE);
+            let mut round: u64 = 0;
+            b.iter(|| {
+                round += 1;
+                rt.block_on(async {
+                    let mut tasks = Vec::with_capacity(k);
+                    for task_no in 0..k {
+                        let fs = fs.clone();
+                        let mut payload = payload.clone();
+                        tasks.push(tokio::spawn(async move {
+                            // Unique bytes per task and round: never dedup.
+                            payload[..8].copy_from_slice(&round.to_le_bytes());
+                            payload[8..16].copy_from_slice(&(task_no as u64).to_le_bytes());
+                            let key = format!("k{k}-r{round}-t{task_no}");
+                            let stream = vec_to_bytestream(payload);
+                            fs.store_single_object_and_meta(
+                                "test-bucket",
+                                &key,
+                                stream,
+                                OBJECT_SIZE,
+                            )
+                            .await
+                            .unwrap();
+                        }));
+                    }
+                    for t in tasks {
+                        black_box(t.await.unwrap());
+                    }
+                })
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_store_methods,
     bench_inlined_object_sizes,
     bench_store_methods_overhead,
-    bench_hash_width
+    bench_hash_width,
+    bench_concurrent_puts
 );
 criterion_main!(benches);
