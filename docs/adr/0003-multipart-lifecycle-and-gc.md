@@ -1,6 +1,10 @@
 # Multipart Upload Lifecycle Completion and Stale-Upload GC
 
-**Status**: Proposed
+**Status**: Accepted and IMPLEMENTED (2026-08-01). Landed on
+`development` as the commit series `cdb03a0..3a29395` (components 1-7 of
+`docs/plans/adr-0003-implementation.md` plus the claim-window amendment
+`cf64fc6`, one commit per component; as-built deviations are folded in
+below, marked "(as built)").
 **Date**: 2026-07-30
 **Updated**: 2026-07-31 (revised against the as-built ADR 0005/0006/0007
 world; the original draft predates the striped write/delete protocol,
@@ -80,7 +84,7 @@ operator page this ADR produced).
 
 ## Decision
 
-Proposed, pending review:
+Accepted and implemented as follows:
 
 1. **An `_UPLOADS` tree** in the shared blocks DB (sibling of
    `_MULTIPART_PARTS`, opened in `SharedBlockStore::new`).
