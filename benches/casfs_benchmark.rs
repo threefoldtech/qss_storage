@@ -295,7 +295,9 @@ fn bench_concurrent_puts(c: &mut Criterion) {
                         }));
                     }
                     for t in tasks {
-                        black_box(t.await.unwrap());
+                        // The join yields (); the awaited work is the
+                        // measurement, so there is no value to black-box.
+                        t.await.unwrap();
                     }
                 })
             })

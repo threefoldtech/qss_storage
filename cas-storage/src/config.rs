@@ -662,9 +662,10 @@ admin_password = "hunter2"
             let text = format!("[store]\ndurability = \"{durability}\"\n");
             assert_eq!(parse_str(&text).unwrap().store.durability, Some(durability));
         }
-        for engine in [StorageEngine::Fjall] {
-            let text = format!("[store]\nmetadata_db = \"{engine}\"\n");
-            assert_eq!(parse_str(&text).unwrap().store.metadata_db, Some(engine));
-        }
+        // One engine since ADR 0007 removed the other; make this a loop
+        // again when a second variant lands.
+        let engine = StorageEngine::Fjall;
+        let text = format!("[store]\nmetadata_db = \"{engine}\"\n");
+        assert_eq!(parse_str(&text).unwrap().store.metadata_db, Some(engine));
     }
 }
