@@ -29,7 +29,7 @@ use anyhow::{Result, bail};
 
 use crate::store_options::StoreOptions;
 use cas_storage::metastore::store_header::{STORE_HEADER_MAGIC, StoreInit, classify_db_dir};
-use cas_storage::{FjallStore, FjallStoreNotx, MetaStore, StorageEngine, StoreHeader};
+use cas_storage::{FjallStore, MetaStore, StorageEngine, StoreHeader};
 
 /// Path of the namespace metadata DB under a `--meta-root`, the way
 /// `CasFS::new` builds it.
@@ -71,9 +71,6 @@ fn open_existing(db_path: PathBuf, store: &StoreOptions) -> Result<(MetaStore, S
             MetaStore::open_or_create(db_path, inline, spec, |p| {
                 FjallStore::new(p, inline, durability)
             })?
-        }
-        StorageEngine::FjallNotx => {
-            MetaStore::open_or_create(db_path, inline, spec, |p| FjallStoreNotx::new(p, inline))?
         }
     };
     Ok(opened)

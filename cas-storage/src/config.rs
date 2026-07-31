@@ -371,7 +371,7 @@ mod tests {
 [store]
 durability = "fdatasync"
 inline_metadata_size = 4096
-metadata_db = "fjall_notx"
+metadata_db = "fjall"
 verify_on_read = true
 
 [store.hash]
@@ -405,7 +405,7 @@ admin_password = "hunter2"
 
         assert_eq!(config.store.durability, Some(Durability::Fdatasync));
         assert_eq!(config.store.inline_metadata_size, Some(4096));
-        assert_eq!(config.store.metadata_db, Some(StorageEngine::FjallNotx));
+        assert_eq!(config.store.metadata_db, Some(StorageEngine::Fjall));
         assert_eq!(config.store.verify_on_read, Some(true));
         assert_eq!(config.store.hash.algo.as_deref(), Some("blake3"));
         assert_eq!(config.store.hash.width, Some(16));
@@ -531,8 +531,21 @@ admin_password = "hunter2"
         let msg = err.to_string();
         assert!(msg.contains("unknown storage engine: sled"), "{msg}");
         assert!(
-            msg.contains("fjall_notx"),
+            msg.contains("fjall"),
             "message must list the options: {msg}"
+        );
+    }
+
+    /// The backend was removed by ADR 0007; the config value must fail loudly
+    /// and the message must carry the migration path, not just "unknown".
+    #[test]
+    fn removed_fjall_notx_is_rejected_with_the_migration_path() {
+        let err = parse_str("[store]\nmetadata_db = \"fjall_notx\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("removed"), "message must say removed: {msg}");
+        assert!(
+            msg.contains("durability") && msg.contains("buffer"),
+            "message must name the migration path: {msg}"
         );
     }
 
@@ -649,7 +662,7 @@ admin_password = "hunter2"
             let text = format!("[store]\ndurability = \"{durability}\"\n");
             assert_eq!(parse_str(&text).unwrap().store.durability, Some(durability));
         }
-        for engine in [StorageEngine::Fjall, StorageEngine::FjallNotx] {
+        for engine in [StorageEngine::Fjall] {
             let text = format!("[store]\nmetadata_db = \"{engine}\"\n");
             assert_eq!(parse_str(&text).unwrap().store.metadata_db, Some(engine));
         }

@@ -88,12 +88,12 @@ mod tests {
     #[test]
     fn config_beats_the_defaults() {
         let store = store_config(
-            "[store]\ndurability = \"buffer\"\nmetadata_db = \"fjall_notx\"\n\
+            "[store]\ndurability = \"buffer\"\nmetadata_db = \"fjall\"\n\
              inline_metadata_size = 512\nverify_on_read = true\n\n\
              [store.hash]\nwidth = 16\n",
         );
         let opts = StoreOptions::resolve(None, None, None, &store).unwrap();
-        assert_eq!(opts.metadata_db, StorageEngine::FjallNotx);
+        assert_eq!(opts.metadata_db, StorageEngine::Fjall);
         assert_eq!(opts.durability, Durability::Buffer);
         assert_eq!(opts.inline_metadata_size, Some(512));
         assert!(opts.verify_on_read);
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn cli_beats_the_config() {
         let store = store_config(
-            "[store]\ndurability = \"buffer\"\nmetadata_db = \"fjall_notx\"\n\
+            "[store]\ndurability = \"buffer\"\nmetadata_db = \"fjall\"\n\
              inline_metadata_size = 512\n",
         );
         let opts = StoreOptions::resolve(

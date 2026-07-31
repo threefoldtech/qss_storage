@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use crate::hasher::Hasher;
 use crate::metastore::{
-    BaseMetaTree, BlockTree, Durability, FjallStore, FjallStoreNotx, HeaderSpec, MetaError,
-    MetaStore, StoreHeader,
+    BaseMetaTree, BlockTree, Durability, FjallStore, HeaderSpec, MetaError, MetaStore, StoreHeader,
 };
 
 use super::{StorageEngine, multipart::MultiPartTree};
@@ -32,7 +31,7 @@ impl SharedBlockStore {
     ///
     /// # Arguments
     /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/db)
-    /// * `storage_engine` - Storage engine (Fjall or FjallNotx)
+    /// * `storage_engine` - Storage engine
     /// * `inlined_metadata_size` - Maximum size for inlined metadata
     /// * `durability` - Durability level for transactions
     /// * `spec` - Hash written into the header of a *new* store; ignored when
@@ -56,19 +55,6 @@ impl SharedBlockStore {
             StorageEngine::Fjall => {
                 MetaStore::open_or_create(path, inlined_metadata_size, spec, |p| {
                     FjallStore::new(p, inlined_metadata_size, durability)
-                })?
-            }
-            StorageEngine::FjallNotx => {
-                tracing::warn!(
-                    "Using fjall_notx for shared block metadata in multi-user mode. \
-                     Note: fjall_notx has weaker consistency guarantees: \
-                     (1) transactions are not atomic - blocks visible before commit, \
-                     (2) rollback uses best-effort cleanup, not true rollback, \
-                     (3) durability parameter is ignored. \
-                     For production multi-user deployments, consider using 'fjall' instead."
-                );
-                MetaStore::open_or_create(path, inlined_metadata_size, spec, |p| {
-                    FjallStoreNotx::new(p, inlined_metadata_size)
                 })?
             }
         };

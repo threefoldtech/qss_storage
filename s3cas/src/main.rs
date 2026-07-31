@@ -72,7 +72,7 @@ pub struct ServerConfig {
     #[arg(long, display_order = 1000)]
     secret_key: Option<String>,
 
-    #[arg(long, help = "Metadata DB  (fjall, fjall_notx); default fjall")]
+    #[arg(long, help = "Metadata DB (fjall); default fjall")]
     metadata_db: Option<StorageEngine>,
 
     #[arg(
@@ -169,7 +169,7 @@ pub enum Command {
         #[arg(long, default_value = ".")]
         meta_root: PathBuf,
 
-        #[arg(long, help = "Metadata DB  (fjall, fjall_notx); default fjall")]
+        #[arg(long, help = "Metadata DB (fjall); default fjall")]
         metadata_db: Option<StorageEngine>,
 
         #[command(subcommand)]

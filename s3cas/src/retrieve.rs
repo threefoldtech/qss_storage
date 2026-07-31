@@ -28,7 +28,7 @@ pub struct RetrieveConfig {
     #[arg(long, default_value = ".")]
     pub fs_root: PathBuf,
 
-    #[arg(long, help = "Metadata DB  (fjall, fjall_notx); default fjall")]
+    #[arg(long, help = "Metadata DB (fjall); default fjall")]
     pub metadata_db: Option<StorageEngine>,
 
     #[arg(required = true, help = "Bucket name")]

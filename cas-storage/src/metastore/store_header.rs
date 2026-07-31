@@ -380,7 +380,7 @@ pub(crate) fn write_sidecar(db_path: &Path, header: &StoreHeader) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metastore::{FjallStore, FjallStoreNotx, MetaStore};
+    use crate::metastore::{FjallStore, MetaStore};
     use std::path::PathBuf;
     use tempfile::{TempDir, tempdir};
 
@@ -532,10 +532,6 @@ mod tests {
         FjallStore::new(path, Some(1), None)
     }
 
-    fn fjall_notx(path: PathBuf) -> FjallStoreNotx {
-        FjallStoreNotx::new(path, Some(1))
-    }
-
     /// Creating a store writes a header; reopening the same directory reads
     /// exactly that header back.
     fn create_then_reopen<S: Store + 'static>(build: impl Fn(PathBuf) -> S) {
@@ -559,11 +555,6 @@ mod tests {
     #[test]
     fn create_then_reopen_fjall() {
         create_then_reopen(fjall);
-    }
-
-    #[test]
-    fn create_then_reopen_fjall_notx() {
-        create_then_reopen(fjall_notx);
     }
 
     /// The width is taken from the header on open, not from the spec the

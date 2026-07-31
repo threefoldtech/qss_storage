@@ -192,8 +192,6 @@ async fn test_put_delete_object() -> Result<()> {
     let test_cases = [
         (s3cas::cas::StorageEngine::Fjall, Some(1)),
         (s3cas::cas::StorageEngine::Fjall, Some(10240000)),
-        (s3cas::cas::StorageEngine::FjallNotx, Some(1)),
-        (s3cas::cas::StorageEngine::FjallNotx, Some(10240000)),
     ];
 
     for (engine, size) in test_cases {
@@ -315,7 +313,7 @@ async fn do_test_put_delete_object(
 }
 
 use s3cas::cas::StorageEngine;
-const METADATA_DBS: [StorageEngine; 2] = [StorageEngine::Fjall, StorageEngine::FjallNotx];
+const METADATA_DBS: [StorageEngine; 1] = [StorageEngine::Fjall];
 #[tokio::test]
 #[tracing::instrument]
 async fn test_list_bucket() -> Result<()> {

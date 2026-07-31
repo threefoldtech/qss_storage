@@ -1,9 +1,8 @@
-//! Comparative benchmarks for the two fjall metadata backends.
+//! Benchmarks for the fjall metadata backend.
 //!
-//! `FjallStore` is transactional (fjall's single-writer transactional
-//! database), `FjallStoreNotx` is not (rollback is implemented in our own
-//! code). Both are driven through the same `MetaStore` facade, so every
-//! scenario below measures the backend and nothing else.
+//! `FjallStore` (fjall's single-writer transactional database) is driven
+//! through the `MetaStore` facade, so every scenario below measures the
+//! backend and nothing else.
 //!
 //! No block hashing happens here -- the block ids are made up, not computed --
 //! so the address width has no effect on these numbers. The width comparison
@@ -12,8 +11,7 @@
 //! there is no store format to validate when the point is the backend.
 
 use cas_storage::{
-    Block, BlockId, BucketMeta, ContentHash, FjallStore, FjallStoreNotx, MetaStore, Object,
-    ObjectData,
+    Block, BlockId, BucketMeta, ContentHash, FjallStore, MetaStore, Object, ObjectData,
 };
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::RngExt;
@@ -28,16 +26,6 @@ fn setup_fjall_store() -> (MetaStore, TempDir) {
         dir.path().to_path_buf(),
         Some(1024), // Use a reasonable inline metadata size for benchmarking
         None,       // Use default durability
-    );
-    (MetaStore::new(store, Some(1024)), dir)
-}
-
-// Helper function to create a temporary MetaStore backed by FjallStoreNotx
-fn setup_fjall_notx_store() -> (MetaStore, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let store = FjallStoreNotx::new(
-        dir.path().to_path_buf(),
-        Some(1024), // Use a reasonable inline metadata size for benchmarking
     );
     (MetaStore::new(store, Some(1024)), dir)
 }
@@ -104,18 +92,6 @@ fn bench_insert_bucket(c: &mut Criterion) {
         });
     }
 
-    // Benchmark FjallStoreNotx
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-        group.bench_function(BenchmarkId::new("FjallStoreNotx", "insert_bucket"), |b| {
-            b.iter(|| {
-                let bucket_name = format!("bucket-{}", rand::rng().random::<u32>());
-                let bucket_data = create_test_bucket(&bucket_name);
-                black_box(store.insert_bucket(&bucket_name, bucket_data)).unwrap();
-            });
-        });
-    }
-
     group.finish();
 }
 
@@ -144,24 +120,6 @@ fn bench_insert_meta(c: &mut Criterion) {
         });
     }
 
-    // Benchmark FjallStoreNotx with small object
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-        let bucket_name = "test-bucket";
-        let bucket_data = create_test_bucket(bucket_name);
-        store.insert_bucket(bucket_name, bucket_data).unwrap();
-
-        group.bench_function(
-            BenchmarkId::new("FjallStoreNotx", "insert_small_object"),
-            |b| {
-                b.iter(|| {
-                    let key = format!("key-{}", rand::rng().random::<u32>());
-                    black_box(store.insert_meta(bucket_name, &key, small_object.clone())).unwrap();
-                });
-            },
-        );
-    }
-
     // Benchmark FjallStore with medium object
     {
         let (store, _dir) = setup_fjall_store();
@@ -171,24 +129,6 @@ fn bench_insert_meta(c: &mut Criterion) {
 
         group.bench_function(
             BenchmarkId::new("FjallStore", "insert_medium_object"),
-            |b| {
-                b.iter(|| {
-                    let key = format!("key-{}", rand::rng().random::<u32>());
-                    black_box(store.insert_meta(bucket_name, &key, medium_object.clone())).unwrap();
-                });
-            },
-        );
-    }
-
-    // Benchmark FjallStoreNotx with medium object
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-        let bucket_name = "test-bucket";
-        let bucket_data = create_test_bucket(bucket_name);
-        store.insert_bucket(bucket_name, bucket_data).unwrap();
-
-        group.bench_function(
-            BenchmarkId::new("FjallStoreNotx", "insert_medium_object"),
             |b| {
                 b.iter(|| {
                     let key = format!("key-{}", rand::rng().random::<u32>());
@@ -227,28 +167,6 @@ fn bench_get_meta(c: &mut Criterion) {
         });
     }
 
-    // Benchmark FjallStoreNotx
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-        let bucket_name = "test-bucket";
-        let bucket_data = create_test_bucket(bucket_name);
-        store.insert_bucket(bucket_name, bucket_data).unwrap();
-
-        // Insert some test objects
-        for i in 0..100 {
-            let key = format!("key-{i}");
-            let obj = create_test_object(1024);
-            store.insert_meta(bucket_name, &key, obj).unwrap();
-        }
-
-        group.bench_function(BenchmarkId::new("FjallStoreNotx", "get_meta"), |b| {
-            b.iter(|| {
-                let key = format!("key-{}", rand::rng().random::<u8>() % 100);
-                black_box(store.get_meta(bucket_name, &key)).unwrap();
-            });
-        });
-    }
-
     group.finish();
 }
 
@@ -268,24 +186,6 @@ fn bench_list_buckets(c: &mut Criterion) {
         }
 
         group.bench_function(BenchmarkId::new("FjallStore", "list_buckets"), |b| {
-            b.iter(|| {
-                black_box(store.list_buckets()).unwrap();
-            });
-        });
-    }
-
-    // Benchmark FjallStoreNotx
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-
-        // Create some test buckets
-        for i in 0..50 {
-            let bucket_name = format!("bucket-{i}");
-            let bucket_data = create_test_bucket(&bucket_name);
-            store.insert_bucket(&bucket_name, bucket_data).unwrap();
-        }
-
-        group.bench_function(BenchmarkId::new("FjallStoreNotx", "list_buckets"), |b| {
             b.iter(|| {
                 black_box(store.list_buckets()).unwrap();
             });
@@ -316,23 +216,6 @@ fn bench_transaction(c: &mut Criterion) {
         });
     }
 
-    // Benchmark FjallStoreNotx transaction
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-        let bucket_name = "test-bucket";
-        let bucket_data = create_test_bucket(bucket_name);
-        store.insert_bucket(bucket_name, bucket_data).unwrap();
-
-        group.bench_function(BenchmarkId::new("FjallStoreNotx", "transaction"), |b| {
-            b.iter(|| {
-                let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false)).unwrap();
-                black_box(tx.commit()).unwrap();
-            });
-        });
-    }
-
     group.finish();
 }
 
@@ -346,42 +229,6 @@ fn bench_mixed_workload(c: &mut Criterion) {
         let (store, _dir) = setup_fjall_store();
 
         group.bench_function(BenchmarkId::new("FjallStore", "mixed_workload"), |b| {
-            b.iter(|| {
-                // Create a bucket
-                let bucket_name = format!("bucket-{}", rand::rng().random::<u16>());
-                let bucket_data = create_test_bucket(&bucket_name);
-                store.insert_bucket(&bucket_name, bucket_data).unwrap();
-
-                // Insert some objects
-                for i in 0..10 {
-                    let key = format!("key-{i}");
-                    let obj = create_test_object(1024 * (i + 1));
-                    store.insert_meta(&bucket_name, &key, obj).unwrap();
-                }
-
-                // Read some objects
-                for i in 0..5 {
-                    let key = format!("key-{i}");
-                    black_box(store.get_meta(&bucket_name, &key)).unwrap();
-                }
-
-                // List buckets
-                black_box(store.list_buckets()).unwrap();
-
-                // Use a transaction
-                let mut tx = store.begin_transaction();
-                let (block_id, _) = create_test_block(rand::rng().random::<u8>(), 1024);
-                black_box(tx.write_block(block_id, 1024, false)).unwrap();
-                black_box(tx.commit()).unwrap();
-            });
-        });
-    }
-
-    // Benchmark FjallStoreNotx with mixed workload
-    {
-        let (store, _dir) = setup_fjall_notx_store();
-
-        group.bench_function(BenchmarkId::new("FjallStoreNotx", "mixed_workload"), |b| {
             b.iter(|| {
                 // Create a bucket
                 let bucket_name = format!("bucket-{}", rand::rng().random::<u16>());

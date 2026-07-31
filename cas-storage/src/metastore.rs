@@ -16,5 +16,5 @@ pub use errors::{FsError, MetaError};
 pub use meta_store::*;
 pub use object::{Object, ObjectData, ObjectType};
 pub use store_header::{HeaderSpec, StoreHeader, StoreHeaderError, StoreInit};
-pub use stores::{FjallStore, FjallStoreNotx};
+pub use stores::FjallStore;
 pub use traits::*;

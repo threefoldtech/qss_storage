@@ -8,8 +8,8 @@ use super::shared_block_store::SharedBlockStore;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
-    BaseMetaTree, BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore,
-    FjallStoreNotx, HeaderSpec, MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
+    BaseMetaTree, BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore, HeaderSpec,
+    MetaError, MetaStore, MetaTreeExt, Object, ObjectData,
 };
 
 use super::byte_stream::AsyncByteStream;
@@ -28,16 +28,16 @@ pub struct CasFS {
 /// Which metadata database backend a store uses.
 ///
 /// Deserialized through [`FromStr`] (`try_from = "String"`) so the config file
-/// spelling is exactly the CLI flag spelling: `fjall` or `fjall_notx`.
+/// spelling is exactly the CLI flag spelling: `fjall`.
+///
+/// A single variant since ADR 0007 removed the non-transactional backend;
+/// the enum survives as the config/CLI surface, and [`FromStr`] rejects the
+/// removed value with the migration path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub enum StorageEngine {
     // fjall with transactions support
     Fjall,
-
-    // fjall without transactions support.
-    // we implement the rollback logic in our own code
-    FjallNotx,
 }
 
 impl FromStr for StorageEngine {
@@ -46,10 +46,12 @@ impl FromStr for StorageEngine {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fjall" => Ok(StorageEngine::Fjall),
-            "fjall_notx" => Ok(StorageEngine::FjallNotx),
-            _ => Err(format!(
-                "unknown storage engine: {s} (expected fjall or fjall_notx)"
-            )),
+            "fjall_notx" => Err(
+                "the fjall_notx backend was removed (ADR 0007); use fjall with \
+                 durability = \"buffer\" for the fast tier"
+                    .to_string(),
+            ),
+            _ => Err(format!("unknown storage engine: {s} (expected fjall)")),
         }
     }
 }
@@ -68,7 +70,6 @@ impl std::fmt::Display for StorageEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let name = match self {
             StorageEngine::Fjall => "fjall",
-            StorageEngine::FjallNotx => "fjall_notx",
         };
         f.write_str(name)
     }
@@ -131,11 +132,6 @@ impl CasFS {
             StorageEngine::Fjall => {
                 MetaStore::open_or_create(namespace_meta_path, inlined_metadata_size, spec, |p| {
                     FjallStore::new(p, inlined_metadata_size, durability)
-                })?
-            }
-            StorageEngine::FjallNotx => {
-                MetaStore::open_or_create(namespace_meta_path, inlined_metadata_size, spec, |p| {
-                    FjallStoreNotx::new(p, inlined_metadata_size)
                 })?
             }
         };
@@ -417,7 +413,7 @@ mod tests {
     use std::sync::LazyLock;
     use tempfile::tempdir;
 
-    const TEST_ENGINES: [StorageEngine; 2] = [StorageEngine::Fjall, StorageEngine::FjallNotx];
+    const TEST_ENGINES: [StorageEngine; 1] = [StorageEngine::Fjall];
 
     /// Both block address widths a store can be created with. Blocks written
     /// under one are not addressable under the other, so every behaviour below

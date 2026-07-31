@@ -34,8 +34,9 @@ durability = "fsync"
 # Default: unset for s3cas, 1 for respd
 #inline_metadata_size = 1
 
-# Metadata database backend: "fjall" (transactional) or "fjall_notx"
-# (non-transactional, rollback handled in our code).
+# Metadata database backend. "fjall" is the only backend; the former
+# "fjall_notx" was removed (ADR 0007) -- for a fast-and-loose tier use
+# durability = "buffer" instead.
 # respd ignores this key: it is fjall-only.
 # Default: "fjall"
 metadata_db = "fjall"

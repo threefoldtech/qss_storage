@@ -9,7 +9,7 @@
 //!   (the object ETag stays MD5, as S3 requires)
 //! - **Block Deduplication**: Duplicate blocks stored only once with reference counting
 //! - **Multi-User Support**: Shared block storage with isolated metadata per user
-//! - **Pluggable Backends**: Support for Fjall (transactional) and FjallNotx (non-transactional)
+//! - **Transactional Metadata**: Fjall-backed metadata store with real transactions
 //! - **Inline Data**: Small objects can be stored directly in metadata
 //! - **Streaming I/O**: Efficient streaming reads and writes
 //!
@@ -94,7 +94,6 @@ pub use metastore::{
     // Storage backends
     Durability,
     FjallStore,
-    FjallStoreNotx,
     // Store header (format versioning)
     HeaderSpec,
     MetaError,

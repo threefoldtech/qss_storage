@@ -19,15 +19,15 @@ fn get_shared_metrics() -> SharedMetrics {
     SharedMetrics::default()
 }
 
-// Helper function to create a temporary CasFS with FjallNoTx, addressing
-// blocks with `hasher`.
+// Helper function to create a temporary CasFS, addressing blocks with
+// `hasher`.
 fn setup_casfs_with(hasher: Hasher) -> (CasFS, TempDir) {
     let dir = TempDir::new().unwrap();
     let root_path = dir.path().to_path_buf();
     let meta_path = root_path.clone();
 
     let metrics = get_shared_metrics();
-    let storage_engine = StorageEngine::FjallNotx;
+    let storage_engine = StorageEngine::Fjall;
     let inlined_metadata_size = Some(1024); // Use a reasonable inline metadata size for benchmarking
     let durability = Some(Durability::Buffer); // Use buffer durability for benchmarking
 
