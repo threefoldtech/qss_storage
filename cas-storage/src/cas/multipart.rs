@@ -567,7 +567,7 @@ mod tests {
     fn test_tree() -> (MultiPartTree, Arc<dyn MetaTreeExt + Send + Sync>, TempDir) {
         let dir = tempdir().unwrap();
         let meta = MetaStore::new(
-            FjallStore::new(dir.path().to_path_buf(), Some(1), None),
+            FjallStore::new(dir.path().to_path_buf(), Some(1), None).unwrap(),
             None,
         );
         let raw = meta.get_tree_ext(MULTIPART_PARTS_TREE).unwrap();

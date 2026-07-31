@@ -151,22 +151,18 @@ fn a_path_with_no_store_exits_three() {
 /// depends on that being true from the other side -- they all close their store
 /// before running the tool -- and until now nothing checked it.
 ///
-/// What was measured, rather than assumed:
+/// What was measured, rather than assumed: fjall really does refuse the second
+/// open (`fjall::Error::Locked`). It is `std::fs::File::try_lock`, which is
+/// `flock` on Linux, and flock associates the lock with the *open file
+/// description* -- so a second open contends even from within one process. The
+/// cross-process form is still the one pinned here, because that is the
+/// deployment the docs describe and it also covers the exit-code contract the
+/// same-process form cannot see.
 ///
-/// - fjall really does refuse the second open (`fjall::Error::Locked`). It is
-///   `std::fs::File::try_lock`, which is `flock` on Linux, and flock associates
-///   the lock with the *open file description* -- so a second open contends
-///   even from within one process. The cross-process form is still the one
-///   pinned here, because that is the deployment the docs describe and it also
-///   covers the exit-code contract the same-process form cannot see.
-/// - The refusal currently arrives as a PANIC, not as the documented exit 3:
-///   `FjallStore::new` returns `Self` and `.unwrap()`s the open, so contention
-///   aborts the process with 101. The safety property is intact (fsck never
-///   reports on a store it could not open) but `docs/fsck.md`'s "fails at the
-///   open (exit 3)" is not what happens. Hence the assertion below is "did not
-///   produce a verdict" rather than `== COULD_NOT_RUN`: it holds for 101 today
-///   and for 3 once the open is made fallible, so fixing that does not have to
-///   come back through this test.
+/// That contract was not always true. The refusal used to arrive as a panic
+/// (exit 101), because `FjallStore::new` `.unwrap()`ed the open; the store open
+/// is fallible now, contention surfaces as `MetaError::StoreLocked`, and
+/// `docs/fsck.md`'s "fails at the open (exit 3)" is what actually happens.
 #[tokio::test]
 async fn a_store_held_open_shuts_the_tool_out() {
     let dir = healthy_store().await;
@@ -178,20 +174,25 @@ async fn a_store_held_open_shuts_the_tool_out() {
     let exit = code(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // Not a verdict about the store: 0/1/2 all mean "fsck walked it and
-    // decided", which it must never do while someone else has it open.
-    assert!(
-        exit != CLEAN && exit != WARN && exit != CRITICAL,
-        "fsck reported a verdict ({exit}) on a store held open elsewhere: {stderr}"
+    // Could-not-run, specifically: 0/1/2 all mean "fsck walked the store and
+    // decided", which it must never do while someone else has it open, and
+    // anything else (101) means it crashed rather than reported.
+    assert_eq!(
+        exit, COULD_NOT_RUN,
+        "a locked store is could-not-run, not a verdict and not a crash: {stderr}"
     );
 
-    // And it has to say so. "Locked" is fjall's own word for the contention;
-    // the failure mode this guards against is a message that blames something
-    // else -- a missing store, a corrupt header -- and sends the operator
-    // after the wrong problem.
+    // And it has to say so, in the operator's terms. The failure mode this
+    // guards against is a message that blames something else -- a missing
+    // store, a corrupt header -- and sends the operator after the wrong
+    // problem.
     assert!(
-        stderr.contains("Locked"),
+        stderr.contains("locked by another process"),
         "the failure must name the lock contention, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a running daemon is routine, not a crash: {stderr}"
     );
 
     // Nothing on stdout: a report emitted here would be a report about a store

@@ -548,13 +548,13 @@ mod tests {
 
     // ---- store-level tests ----
 
-    fn fjall(path: PathBuf) -> FjallStore {
+    fn fjall(path: PathBuf) -> Result<FjallStore, MetaError> {
         FjallStore::new(path, Some(1), None)
     }
 
     /// Creating a store writes a header; reopening the same directory reads
     /// exactly that header back.
-    fn create_then_reopen<S: Store + 'static>(build: impl Fn(PathBuf) -> S) {
+    fn create_then_reopen<S: Store + 'static>(build: impl Fn(PathBuf) -> Result<S, MetaError>) {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db");
 
@@ -618,7 +618,7 @@ mod tests {
     /// directory behind, and returns the path it lives at.
     fn unheadered_store(dir: &TempDir) -> PathBuf {
         let db = dir.path().join("db");
-        let store = fjall(db.clone());
+        let store = fjall(db.clone()).unwrap();
         // Give the store some content, so that it is a real pre-QSST store and
         // not just an empty directory.
         store
@@ -646,7 +646,7 @@ mod tests {
     /// Overwrites the header record of an existing store with `raw`, the way a
     /// corrupted or foreign header would look on disk.
     fn doctor_header(db: &Path, raw: Vec<u8>) {
-        let store = fjall(db.to_path_buf());
+        let store = fjall(db.to_path_buf()).unwrap();
         store
             .tree_open(STORE_HEADER_TREE)
             .unwrap()

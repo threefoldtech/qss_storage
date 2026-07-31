@@ -61,6 +61,11 @@ impl SharedBlockStore {
     ///   an existing store is opened. `None` takes [`HeaderSpec::default`].
     /// * `stripe_count` - Number of block lock stripes; `None` takes
     ///   [`DEFAULT_STRIPE_COUNT`]. Sizing rule in `cas::stripes`.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::StoreLocked`] if another process holds the blocks DB, and
+    /// [`MetaError::Header`] if its header is missing or unacceptable.
     pub fn new(
         mut path: PathBuf,
         mut blocks_root: PathBuf,

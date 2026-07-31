@@ -26,7 +26,8 @@ fn setup_fjall_store() -> (MetaStore, TempDir) {
         dir.path().to_path_buf(),
         Some(1024), // Use a reasonable inline metadata size for benchmarking
         None,       // Use default durability
-    );
+    )
+    .unwrap();
     (MetaStore::new(store, Some(1024)), dir)
 }
 

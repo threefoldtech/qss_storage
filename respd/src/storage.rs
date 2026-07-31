@@ -34,6 +34,11 @@ impl Storage {
     ///
     /// [`MetaError::Header`] if the directory holds a store this build will
     /// not open; the message names the store and the reason.
+    ///
+    /// [`MetaError::StoreLocked`] if another process already has the data
+    /// directory open -- a second respd on the same `--data-dir`. Both errors
+    /// reach `main`, which reports them and exits nonzero rather than
+    /// panicking.
     pub fn new(
         data_dir: PathBuf,
         inlined_metadata_size: Option<usize>,

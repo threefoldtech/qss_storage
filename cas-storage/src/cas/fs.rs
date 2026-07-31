@@ -103,6 +103,10 @@ impl CasFS {
     /// [`MetaError::Header`] if the namespace DB exists but its header is
     /// missing or unacceptable; see [`MetaStore::open_or_create`].
     ///
+    /// [`MetaError::StoreLocked`] if another process already holds the
+    /// namespace DB. Routine rather than exceptional -- it is what an offline
+    /// tool meets when the daemon is running -- so it is a value, not a panic.
+    ///
     /// `verify_on_read` turns on block verification on read; see
     /// [`CasFS::verify_on_read`] for what it does and does not cover. It is a
     /// constructor parameter until the config file gives it a home.

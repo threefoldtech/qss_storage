@@ -64,16 +64,35 @@ impl std::fmt::Debug for FjallStore {
 }
 
 impl FjallStore {
+    /// Opens (creating if absent) the fjall database at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::StoreLocked`] if another process already holds the
+    /// database's lock -- fjall takes an exclusive lock on the directory, so
+    /// this is the routine answer whenever the daemon is running and an
+    /// offline tool is pointed at its store. Any other open failure becomes
+    /// [`MetaError::OtherDBError`].
+    ///
+    /// This used to `.unwrap()`. Lock contention is an expected condition, not
+    /// a bug, and the tools' exit-code contracts (fsck's exit 3) depend on it
+    /// arriving as a value.
     pub fn new(
         path: PathBuf,
         inlined_metadata_size: Option<usize>,
         durability: Option<Durability>,
-    ) -> Self {
+    ) -> Result<Self, MetaError> {
         tracing::debug!("Opening fjall store at {:?}", path);
 
         let db = fjall::SingleWriterTxDatabase::builder(&path)
             .open()
-            .unwrap();
+            .map_err(|e| match e {
+                fjall::Error::Locked => MetaError::StoreLocked(path.display().to_string()),
+                other => MetaError::OtherDBError(format!(
+                    "cannot open metadata store at {}: {other}",
+                    path.display()
+                )),
+            })?;
 
         // The mapping follows the POSIX names: fsync flushes data and
         // metadata (fjall SyncAll, strongest), fdatasync flushes data only
@@ -85,14 +104,14 @@ impl FjallStore {
             Durability::Fdatasync => fjall::PersistMode::SyncData,
         };
 
-        Self {
+        Ok(Self {
             db: TxDb {
                 db: Arc::new(db),
                 durability,
             },
             inlined_metadata_size: inlined_metadata_size.unwrap_or(DEFAULT_INLINED_METADATA_SIZE),
             partition_cache: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub fn db(&self) -> &TxDb {
@@ -578,7 +597,55 @@ mod tests {
 
     crate::metastore::stores::test_utils::backend_test_battery!(FjallStore, || {
         let dir = tempdir().unwrap();
-        let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None);
+        let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None).unwrap();
         (store, dir)
     });
+
+    /// Lock contention is a value, not a panic.
+    ///
+    /// fjall locks the database directory with `std::fs::File::try_lock`,
+    /// which is `flock` on Linux -- the lock belongs to the open file
+    /// description, so a second open contends even from inside one process.
+    /// That is what makes this testable here rather than only across
+    /// processes.
+    ///
+    /// This open used to `.unwrap()`. The tools' exit-code contracts depend on
+    /// the error arriving as a value: fsck answers a locked store with exit 3
+    /// (`docs/fsck.md`, ADR 0005), and it cannot do that from a panic.
+    #[test]
+    fn a_second_open_reports_the_lock_instead_of_panicking() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let _held = FjallStore::new(path.clone(), Some(1), None).expect("the first open must win");
+
+        let err = FjallStore::new(path.clone(), Some(1), None)
+            .expect_err("a second open of a held database must fail");
+
+        assert!(
+            matches!(err, MetaError::StoreLocked(ref p) if p == &path.display().to_string()),
+            "expected StoreLocked naming {}, got {err:?}",
+            path.display()
+        );
+
+        // The message is what an operator reads off a terminal, so it has to
+        // say what to do about it rather than just name a condition.
+        let msg = err.to_string();
+        assert!(msg.contains("locked by another process"), "{msg}");
+        assert!(msg.contains("daemon"), "{msg}");
+    }
+
+    /// Dropping the holder releases the lock, so the refusal above is about
+    /// contention and not about the store being permanently unusable.
+    #[test]
+    fn the_lock_is_released_when_the_store_is_dropped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let held = FjallStore::new(path.clone(), Some(1), None).unwrap();
+        assert!(FjallStore::new(path.clone(), Some(1), None).is_err());
+
+        drop(held);
+        FjallStore::new(path, Some(1), None).expect("the lock must be released on drop");
+    }
 }

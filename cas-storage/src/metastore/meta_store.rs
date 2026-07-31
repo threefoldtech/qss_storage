@@ -88,6 +88,10 @@ impl MetaStore {
     ///
     /// # Errors
     ///
+    /// Whatever `build` returns -- [`MetaError::StoreLocked`] when another
+    /// process holds the database, which is the routine case for an offline
+    /// tool run against a live daemon.
+    ///
     /// [`MetaError::Header`] if the store has no header (it predates the
     /// format), or one this build refuses: foreign magic, an unsupported
     /// version, or a hash it does not have. There is no fallback; see
@@ -96,11 +100,11 @@ impl MetaStore {
         db_path: PathBuf,
         inlined_metadata_size: Option<usize>,
         spec: HeaderSpec,
-        build: impl FnOnce(PathBuf) -> S,
+        build: impl FnOnce(PathBuf) -> Result<S, MetaError>,
     ) -> Result<(Self, StoreHeader), MetaError> {
         let init = store_header::classify_db_dir(&db_path)?;
 
-        let meta = Self::new(build(db_path.clone()), inlined_metadata_size);
+        let meta = Self::new(build(db_path.clone())?, inlined_metadata_size);
 
         let header = match init {
             StoreInit::Create => {
@@ -870,7 +874,7 @@ mod tests {
 
     fn test_store() -> (MetaStore, TempDir) {
         let dir = tempdir().unwrap();
-        let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None);
+        let store = FjallStore::new(dir.path().to_path_buf(), Some(1), None).unwrap();
         (MetaStore::new(store, None), dir)
     }
 

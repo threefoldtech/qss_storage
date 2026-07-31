@@ -97,6 +97,13 @@ pub enum MetaError {
     },
     /// A bucket name that the store reserves for itself was requested.
     ReservedBucketName(String),
+    /// Another process already holds the store's lock.
+    ///
+    /// Routine rather than exceptional: fjall takes an exclusive lock on the
+    /// database directory, so this is what an offline tool meets whenever the
+    /// daemon is up. It used to be a panic; the whole point of the variant is
+    /// that "someone else is using it" is an answer, not a crash.
+    StoreLocked(String),
 }
 
 impl MetaError {
@@ -143,6 +150,10 @@ impl fmt::Display for MetaError {
             MetaError::ReservedBucketName(ref name) => write!(
                 f,
                 "bucket name \"{name}\" is reserved: names starting with '_' belong to the store's internal trees"
+            ),
+            MetaError::StoreLocked(ref path) => write!(
+                f,
+                "store at {path} is locked by another process (is the daemon running?)"
             ),
         }
     }
