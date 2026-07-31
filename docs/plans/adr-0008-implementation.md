@@ -1,5 +1,23 @@
 # ADR 0008 Implementation Plan: overwrite releases the replaced blocks
 
+**Status**: EXECUTED 2026-07-31 except component 5, which is blocked on a
+missing `copy_object` and is left open for the owner. The series runs
+from `ee9c691` (this plan) through `4e04728` (the docs) plus this
+status stamp, one commit per component, each gate-green (fmt, check
+--all-targets, clippy --all-targets, full workspace tests).
+
+**Deviations from the plan as written**, both recorded when they were
+taken:
+
+1. Component 4's *test* half landed inside component 2's commit rather
+   than its own. The wiring is what invalidates those assertions, so a
+   separate commit would have left the tree red in between and the gate
+   rule forbids that. Component 4's own commit carries what remains:
+   the comments elsewhere in the tree that named a successful overwrite
+   as a routine leak producer.
+2. Component 5 (self-copy short-circuit) is not implemented. See that
+   section.
+
 Executes `docs/adr/0008-overwrite-releases-replaced-blocks.md` (Accepted
 2026-07-31, all three review asks approved, self-copy short-circuit
 chosen). Verified against `development` at 4506f32; the file:line facts
@@ -261,9 +279,19 @@ against invariants, not implementation):
 - The ADR's Status line gains the landing series once the last component
   is in (house rule, standalone commit).
 
-## Sequencing and risk
+## Sequencing and risk (as executed)
 
 Order: 0 -> 1 -> 2 -> 3 -> 4 -> 6 -> 7, with 5 left open.
+
+| Commit | Component |
+| --- | --- |
+| `ee9c691` | 0 -- this plan, with the audit |
+| `483047d` | 1 -- `Transaction::replace_object` + unit tests |
+| `184c182` | 2 -- wiring, the async fanout, and the tightened 0006 assertions |
+| `75d8493` | 3 -- inline-over-block-backed and the dedup arithmetic, pinned |
+| `ca77a5c` | 4 -- comments stop naming overwrite as a routine leak |
+| `63ded13` | 6 -- race arms |
+| `4e04728` | 7 -- docs |
 
 Riskiest is component 2: it is the only one that changes what a write
 does, and it widens `async` across three crates. Mitigation: the
