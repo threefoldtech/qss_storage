@@ -91,7 +91,10 @@ blocks DB (`<meta_root>/blocks/db`, trees `_BLOCKS` and
 `_MULTIPART_PARTS`); block data files live under `<fs_root>/blocks/`.
 
 Related: ADR 0002 (addressing, headers, verify-on-read), ADR 0003
-(multipart GC -- still Proposed; see the multipart pass), ADR 0004 (store
+(the multipart lifecycle and its stale-upload GC -- implemented since
+this ADR was written; the multipart pass below reports age and
+`orphan_part` and `--repair` reaps, see the "(as built)" notes and
+`docs/multipart.md`), ADR 0004 (store
 ownership -- still Proposed; no longer a hard dependency, see Decision),
 ADR 0006 (the protocol whose residue this reconciles), ADR 0007 (one
 backend), `docs/refcount.md`, `docs/fsck.md` (the operator page for what
@@ -151,6 +154,11 @@ authorised freeing the blocks they still hold.
      unimplemented, part records are the *only* reference holders of
      in-flight uploads; a recount that skipped them would reconcile a
      live upload's blocks to zero and free them. Loss by repair.
+     **(as built)** ADR 0003 has since landed and this is unchanged: a
+     part record is still the only holder of an in-flight upload's
+     blocks, and an ORPHAN part record is still a holder -- it holds
+     them until something reaps it, and the recount reports what is,
+     not what ought to be.
    Compare with `_BLOCKS`. Over-count: INFO (the expected direction --
    overwrite leak, cancellation residue). Under-count: CRITICAL.
 2. **Disk sweep**. Walk `blocks/` (skipping `.tmp`). Every entry must be
@@ -190,10 +198,23 @@ authorised freeing the blocks they still hold.
    grouped by upload. **Report-only until ADR 0003 lands**: reaping
    requires 0003's abort semantics (which decrements through the striped
    delete primitive), and guessing them here would smuggle 0003 in.
-   **(as built)** Part count and total bytes per upload only -- no age. A
-   part record carries no timestamp, so per-upload age is unreportable
-   until ADR 0003 adds upload records; every finding states that in its
-   evidence rather than leaving the omission to be discovered.
+   **(as built, ADR 0005 as shipped)** Part count and total bytes per
+   upload only -- no age. A part record carries no timestamp, so
+   per-upload age was unreportable until ADR 0003 added upload records;
+   every finding stated that in its evidence rather than leaving the
+   omission to be discovered.
+   **(as built, after ADR 0003)** The promise is kept and the deviation
+   text is gone. The pass reads `_UPLOADS` as well: one
+   `multipart_upload` finding per upload record carrying its AGE, part
+   count and bytes (an upload with no parts yet is reported on its age
+   alone), and one `orphan_part` finding (INFO) per part record whose
+   upload record does not exist. `--repair` reaps those through ADR
+   0003's take-style primitive, in repair round one (it removes a
+   holder, so the recount must follow it), double-gated on `Recount` and
+   on this pass having run. An undecodable UPLOAD record refuses the
+   pass: without the full set of upload records a live part cannot be
+   told from an orphan, and reaping a live part is loss. The daemon GC
+   is the primary reaper; this is the offline backstop.
 6. **Bucket integrity**. Object trees in the namespace DB with no bucket
    meta (the `bucket_delete` crash residue): WARN; under `--repair`,
    resume the teardown, then let the closing recount reconcile.
@@ -431,6 +452,13 @@ reference: loss. Staleness is a judgment ADR 0003 owns (its abort path
 decrements through the striped delete primitive); until it lands, fsck
 reports ages and touches nothing. Reap-then-recount is the only safe
 order.
+**(as built)** ADR 0003 landed and the judgment is now available in the
+store itself: a part whose upload record exists is live, a part whose
+upload record does not exist is an orphan, and there is no third state
+(complete takes the upload record and every part it names in one
+transaction, so an inheritable part is never visible without its
+upload). `--repair` therefore reaps orphans -- reap-then-recount, in
+that order, exactly as this answer required.
 
 **Q: Why not just delete a dangling record and let dedup heal it?**
 A: Because the surviving holders make the healed record's rc a lie, and
@@ -511,7 +539,10 @@ locked).
       is offline-only acceptable for the first year?
 
 **Behavior definers**
-- [ ] Ordering vs ADR 0003: if fsck ships first, the multipart pass is
+- [x] Ordering vs ADR 0003: if fsck ships first, the multipart pass is
       report-only and flips to reap-via-abort when 0003 lands --
       confirm that ordering is acceptable (the reverse order changes
-      nothing here).
+      nothing here). **Settled as built**: fsck shipped first, 0003
+      landed after, and the flip happened exactly as described -- the
+      pass gained age and `orphan_part`, and `--repair` gained a reap
+      that calls 0003's own primitive rather than reimplementing it.

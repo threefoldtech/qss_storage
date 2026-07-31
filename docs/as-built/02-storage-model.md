@@ -86,7 +86,8 @@ Semantics:
   field requires a version bump instead. This is where a salt or key id would
   go if the question reopens (ADR 0002 resolved it as not implemented).
 - Bucket names starting with `_` are refused at creation, so a bucket can
-  never collide with `_STORE_HEADER`, `_BLOCKS` or `_MULTIPART_PARTS`.
+  never collide with `_STORE_HEADER`, `_BLOCKS`, `_MULTIPART_PARTS` or
+  `_UPLOADS`.
 - Version history: v1 was ADR 0002 (BLAKE3 addressing, u64 fields, this
   header). v2 is ADR 0006: block records store a fanout depth instead of
   allocated path bytes and the `_PATHS` tree no longer exists. A v1 store
@@ -138,15 +139,37 @@ Two fjall trees, named at `cas-storage/src/metastore/meta_store.rs:22-23`:
 are derived from the id and the recorded depth, so there is nothing to
 allocate.)
 
-Two more reserved trees sit alongside them: `_MULTIPART_PARTS`, opened by
-`SharedBlockStore` for in-flight multipart uploads, and `_STORE_HEADER`, which
-holds the single QSST header record (see below). The leading underscore is what
-marks a tree as internal, which is why bucket names starting with `_` are
-refused at creation.
+Three more reserved trees sit alongside them, all opened by
+`SharedBlockStore`: `_MULTIPART_PARTS` (`MULTIPART_PARTS_TREE`,
+`meta_store.rs:40`) holding one record per uploaded part, `_UPLOADS`
+(`UPLOADS_TREE`, `meta_store.rs:49`) holding one record per in-flight
+multipart upload (ADR 0003), and `_STORE_HEADER`, which holds the single
+QSST header record (see below). The leading underscore is what marks a tree
+as internal, which is why bucket names starting with `_` are refused at
+creation.
 
 Object metadata lives in a per-bucket tree, opened by bucket name. Multipart
-upload state lives in its own tree (`cas-storage/src/cas/multipart.rs`,
-`MultiPartTree`).
+state lives in the two trees above (`cas-storage/src/cas/multipart.rs`,
+`MultiPartTree`; `cas-storage/src/cas/uploads.rs` for the upload side).
+Both are in the shared blocks database, not the namespace one, so a single
+transaction spans them -- which is what lets `complete_multipart_upload`
+take an upload record and its part records together.
+
+Keys in both are length-prefixed byte strings, not joined strings:
+
+```
+_UPLOADS:         bucket_len u64 | bucket | key_len u64 | key | upload_id
+_MULTIPART_PARTS: bucket_len u64 | bucket | key_len u64 | key |
+                  upload_len u64 | upload_id | part_number u64 BE
+```
+
+Nothing parses them back: point reads rebuild the key they wrote, and scans
+decode record values. The part key's trailing big-endian part number makes
+all parts of one upload share an exact byte prefix, so per-upload
+enumeration is a prefix scan (`MultiPartTree::parts_of`). Part records
+written before ADR 0003 used `{bucket}-{key}-{upload_id}-{part_number}`,
+which is ambiguous and unreachable by both the new point reads and the
+prefix scan; the value-driven orphan sweep collects them.
 
 In `SharedBlockStore` mode, `_BLOCKS` and the block files are shared across all
 namespaces while each namespace keeps its own bucket and object trees.
@@ -160,7 +183,7 @@ id-list helpers live in `cas-storage/src/metastore/codec.rs`.
 
 Every record is length-exact: a short buffer decodes to `FsError::Truncated`,
 a long one to `FsError::TrailingBytes`. Byte-for-byte golden vectors for all
-four records are pinned in the `mod tests` of each of the files below.
+five records are pinned in the `mod tests` of each of the files below.
 
 ### Block (`cas-storage/src/metastore/block.rs`)
 
@@ -225,6 +248,30 @@ budget.
 [ ids: count * id_width   ]
 ```
 
+### UploadRecord (`cas-storage/src/metastore/upload_record.rs`)
+
+```
+[ created_at: i64 LE      ]  8 bytes
+[ bucket_len: u64 LE      ]  8 bytes
+[ bucket: UTF-8 bytes     ]
+[ key_len: u64 LE         ]  8 bytes
+[ key: UTF-8 bytes        ]
+[ upload_len: u64 LE      ]  8 bytes
+[ upload_id: UTF-8 bytes  ]
+```
+
+One row of `_UPLOADS` per in-flight multipart upload (ADR 0003). The
+record's existence is the upload's: `upload_part` refuses an id that has
+none, and `complete_multipart_upload` and `abort_multipart_upload` both
+begin by claiming it -- `Transaction::take_upload`, an atomic read+remove
+on the shared database, so exactly one of them wins and the loser answers
+`NoSuchUpload`. Complete's claim takes the named part records in the same
+transaction. The record lives in the metastore layer rather than beside
+the upload code in `cas` because the transaction decodes it, and the
+metastore names no type from above it. `created_at` is a wall-clock Unix
+timestamp; the stale-upload GC and fsck both age against it. Added without
+a store-header bump: a new tree with new keys changes no existing record.
+
 ## Block-id widths in records
 
 Records that carry a block-id list write a self-describing width byte, so
@@ -282,6 +329,12 @@ Refcount transitions, per `docs/refcount.md`:
   loss trace in `docs/arch/key-has-block-skip.md`, so overwrites now
   over-count until reconciled)
 - object deleted -> rc - 1 per block occurrence
+- part record reaped -> rc - 1 per block occurrence: a multipart abort,
+  the stale-upload GC, or fsck's `reap_orphan_part`, all through
+  `release_blocks` (`delete_path.rs`), the same striped loop
+  `delete_object` uses
+- multipart upload completed -> no rc change at all: the object record
+  inherits the references its part records held
 - rc reaches 0 -> record removed and file unlinked under one stripe hold
 
 The write path lives in `cas-storage/src/cas/write_path.rs`, the delete path in

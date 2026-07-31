@@ -73,7 +73,8 @@ Structural constraints, updated to the as-built code:
 Related: ADR 0002 (addressing, ContentHash/ETag split), ADR 0005 (fsck
 -- the multipart pass this ADR upgrades), ADR 0006 (the striped
 protocol whose delete primitive abort reuses), `docs/refcount.md`
-(leakage-vs-loss), `docs/fsck.md`.
+(leakage-vs-loss), `docs/fsck.md`, and `docs/multipart.md` (the
+operator page this ADR produced).
 
 ---
 
@@ -89,6 +90,13 @@ Proposed, pending review:
    all): `created_at i64 | bucket_len u64 | bucket | key_len u64 | key
    | upload_id_len u64 | upload_id`. `created_at` is
    `chrono::Utc::now().timestamp()`, the `BucketMeta`/`Object` pattern.
+   **(as built)** The record type lives in the metastore layer
+   (`metastore/upload_record.rs`, beside `bucket_meta.rs`), not in `cas`:
+   `Transaction::take_upload` decodes it inside the transaction, and the
+   metastore layer names no type from above it. A crate-internal
+   `with_created_at` constructor exists solely so everything that ages an
+   upload -- the TTL sweep, fsck's reported age -- can be tested against
+   records that are already old. Sleeping through a TTL is not a test.
 2. **The upload record is the linearization point.** A new
    `Transaction::take_upload` (the `take_object` template: read AND
    remove in one tx) is the single claim primitive. `complete` and
@@ -96,6 +104,45 @@ Proposed, pending review:
    loser fails `NoSuchUpload`. Double-complete, double-abort, and
    complete-vs-abort all collapse into this one rule; no per-upload
    lock exists or is needed.
+   **(as built -- THE AMENDMENT.** This supersedes the shape the rest of
+   this revision was written against, and Decision 6 with it. The
+   landed history keeps the original, which is why the change is
+   recorded here rather than silently rewritten.**)**
+   *Complete claims the upload record AND every part it names in ONE
+   transaction* (`claim_upload_with_parts`), not the record alone.
+   `_UPLOADS` and `_MULTIPART_PARTS` live in the same shared fjall
+   database, so one transaction spans both -- which turns a window that
+   could only have been narrowed into one that does not exist.
+   The window: complete does not release its parts' blocks, it hands
+   them to the object it mints. Between "the upload record is gone" and
+   "the part records are gone" those blocks would have two claimants on
+   paper and one in truth, and anything reaping orphan parts in that
+   instant (the GC's phase 2, by construction) would release references
+   the new object owns. That is loss, and no amount of narrowing makes
+   it not loss. With the parts inside the claim, a named part record
+   disappears at the same instant as its upload record: nothing can ever
+   observe an inheritable part as an orphan.
+   Consequences of the amendment, all landed:
+   - the post-object-creation part-cleanup loop no longer exists --
+     the claim already removed those records;
+   - the object is built from the values the CLAIMING transaction read,
+     not from whatever an earlier validation pass saw;
+   - parts the client did NOT name survive the claim. Nothing inherited
+     their references, so they are true orphans and the GC reaps them;
+   - a claim that does not win removes nothing, so a rejected complete
+     leaves the upload intact and retryable.
+   **(as built)** Complete VALIDATES before it claims: a point read of
+   the upload record at entry (so an upload that is simply gone answers
+   `NoSuchUpload` rather than failing part validation), then the parts
+   list, then the claim. A request the validation rejects has changed
+   nothing, which is what real S3 does with `InvalidPart`. The residual
+   window is stated rather than closed: an abort landing between the
+   entry read and the validation makes the validation fail with
+   `InvalidArgument` ("Part not uploaded") instead of `NoSuchUpload`.
+   Both are 4xx, both leave the store consistent, and the claim remains
+   the authoritative answer -- so the cost of closing it (claiming
+   before validating, and thereby destroying the upload on every
+   malformed request) is not worth paying.
 3. **Existence enforcement.** `upload_part` and
    `complete_multipart_upload` verify the upload record exists (point
    read at entry; complete's claim is the atomic version) and fail
@@ -103,6 +150,14 @@ Proposed, pending review:
    parts list. This is a client-visible behavior change from today's
    laissez-faire acceptance of any upload id; it is what makes abort
    semantics coherent.
+   **(as built)** `upload_part`'s check is at entry, before a single
+   block is stored, so an unknown id costs the client nothing. It is
+   deliberately NOT atomic against a concurrent complete or abort: a
+   part that passes it and lands after another caller claimed the record
+   becomes an orphan part, which the GC reaps. That is the one accepted
+   race of this design (Risks below), and it is bounded leakage.
+   Complete's empty-parts rejection is `InvalidRequest`, "You must
+   specify at least one part".
 4. **Re-keyed part records.** Part keys become length-prefixed:
    `bucket_len u64 | bucket | key_len u64 | key | upload_id_len u64 |
    upload_id | part_number u64 BE` -- unambiguous, and all parts of one
@@ -130,6 +185,29 @@ Proposed, pending review:
    whose references were already released -- fsck's recount would see
    holders exceeding rc, a false loss alarm on a store that lost
    nothing.
+   **(as built)** The per-part removal is a TAKE, not a read followed by
+   a remove: `Transaction::take_part` reads and removes the record in
+   one transaction, and the blocks released are the ones that
+   transaction read (`reap_part`). The ordering above is unchanged --
+   the take commits before the release begins, and a take that finds
+   nothing releases nothing -- but the fusion buys exclusion the split
+   version did not have: two reapers over one part (a client's abort
+   against a GC sweep, or two sweeps) cannot both release it. Split
+   read-then-remove would let both read the same block list and both
+   decrement it, which is a double release: loss, not leakage. `Ok(None)`
+   -- somebody else took it -- is an ordinary outcome, not an error, for
+   every caller.
+   **(as built)** The reap takes the ITERATED storage key rather than
+   rebuilding one from the record's fields, because the GC's orphan
+   sweep reaps records whose key is not reconstructible at all (the
+   legacy dash-joined ones). Rebuilding there would remove nothing and
+   then release blocks the surviving record still claims: precisely the
+   forbidden order.
+   **(as built)** Abort's handler body is `CasFS::abort_upload`, called
+   by both `AbortMultipartUpload` and the GC, so there is exactly one
+   abort implementation. One unreadable or unreapable part record is
+   logged and stepped over rather than stranding every other part of the
+   upload; what is left behind is an orphan part for the next sweep.
 7. **`list_parts` and `list_multipart_uploads`**: read-only. Listings
    are bounded (parts per upload by S3's 10k cap; uploads by the TTL),
    so both scan, decode values, and sort in memory -- S3 ordering (key
@@ -138,6 +216,16 @@ Proposed, pending review:
    scans instead of collation. Pagination markers and max limits are
    honored in-memory; `delimiter` grouping for uploads is deferred
    (known unknown below).
+   **(as built)** Three answers this decision did not spell out:
+   `list_multipart_uploads` on a bucket that does not exist returns
+   `NoSuchBucket` (a listing is bucket-scoped, and an empty list would
+   claim the bucket is there and idle); `list_parts` on an upload that
+   does not exist returns `NoSuchUpload`, the point read again; and
+   `max_parts = 0` / `max_uploads = 0` return an empty page with
+   `is_truncated: true` and no next marker -- the request asked for
+   nothing and there is more, which is exactly what the flag means. An
+   `upload_id_marker` without a `key_marker` is ignored, as S3 does: it
+   only disambiguates within one key.
 8. **Stale-upload GC**: a daemon task in s3cas (spawned before the
    accept loop, exiting on the existing graceful-shutdown signal). Each
    sweep: (a) scan `_UPLOADS` for records older than the TTL and abort
@@ -149,6 +237,23 @@ Proposed, pending review:
    pattern: optional section, Option leaves, DEFAULT_ constant, CLI
    flag wins), `0 = disabled`. Sweep interval: fixed `max(ttl/20, 1h)`,
    not configurable until someone needs it.
+   **(as built)** Three operational details settled during the build:
+   - a part record that does not DECODE is counted in the sweep's error
+     tally and left exactly where it is. Its block list cannot be read,
+     so removing it would strand the references it names forever; that
+     is fsck's business, not a collector's. Nothing else stops a sweep
+     -- every failure is logged, counted and stepped over, because there
+     is no caller to return an error to and one bad record must not
+     strand every later one;
+   - the first tick lands one full period AFTER startup, never at boot.
+     Boot is when a store is busiest, a sweep is disk work, and residue
+     that has already sat for days can wait an hour;
+   - shutdown signals the task where the accept loop breaks and waits at
+     most 5 seconds for it. A sweep that overruns that budget is left to
+     be abandoned: every step it takes is crash-safe on its own (record
+     first, blocks second), so an abandoned sweep is exactly the crash
+     case that ordering was chosen for. Blocking shutdown on a large
+     store's sweep would be the worse failure.
 9. **fsck integration** (the promise ADR 0005 left): the multipart pass
    reads `_UPLOADS` and reports per-upload AGE alongside parts/bytes;
    a new `orphan_part` finding class (part record with no upload
@@ -157,6 +262,35 @@ Proposed, pending review:
    `SetRc`-to-zero reclaims them, entirely inside existing machinery.
    The daemon GC remains the primary reaper; fsck is the offline
    backstop.
+   **(as built)** Four refinements, three of them consequences of the
+   amendment above:
+   - the repair action does not merely remove the record: it reaps
+     through the same take-style primitive the daemon uses
+     (`reap_part`), so the release is the striped decrement and a lost
+     take is a skipped action rather than an error. The closing recount
+     then VALIDATES the result instead of being the thing that produces
+     it;
+   - the reaping is planned in repair ROUND ONE, beside the half-deleted
+     bucket teardowns, not with the rest. Round one is the actions that
+     remove HOLDERS: a reap planned beside the `SetRc`s would have the
+     recount -- computed from a walk that still counted the part -- raise
+     the rc straight back to include the reference just released;
+   - it is double-gated: on `Pass::Recount` like every rc-consequential
+     action, AND on `Pass::MultipartReport`, because that pass is what
+     closes the live-versus-orphan classification. Which leads to the
+     fourth: an UPLOAD record that will not decode refuses the multipart
+     pass outright, the same refusal an undecodable part record makes.
+     Without the full set of upload records a live upload's part cannot
+     be told from an orphan, and reaping a live part is loss;
+   - the `orphan_part` finding carries the raw storage key the record is
+     filed under (the only address a legacy dash-keyed record has),
+     rendered as text when it is printable and lowercase hex otherwise.
+     Length-prefixed keys are frequently valid UTF-8 yet full of NULs,
+     so decodability is the wrong test; printability is the right one.
+   The upload age is reported as days/hours/minutes against the wall
+   clock, the same subtraction the TTL makes. fsck is offline and holds
+   the store's lock, so there is no concurrent writer to be monotonic
+   against.
 10. **Observability**: the three new methods enter `S3_API_METHODS` and
     get `MetricFs` wrappers (today they bypass metrics entirely); the
     GC gains `uploads_reaped` / `orphan_parts_reaped` counters in the
@@ -172,6 +306,11 @@ Proposed, pending review:
    sibling `uploads.rs`; tree opened in `shared_block_store.rs`)
    - `UPLOADS_TREE` constant next to `MULTIPART_PARTS_TREE`; record v1
      with golden vectors; `take_upload` on `Transaction`.
+   - **(as built)** split in two by layering: the record type in
+     `metastore/upload_record.rs` (the transaction decodes it), the
+     lifecycle operations in `cas/uploads.rs` (`create_upload`,
+     `get_upload`, `claim_upload`, `claim_upload_with_parts`,
+     `reap_part`, `abort_upload`, `list_uploads`, `upload_parts`).
 2. **Part re-key + prefix scan** (`cas-storage/src/cas/fs.rs`,
    `multipart.rs`)
    - Binary part-key codec (encode + per-upload prefix); `MultiPartTree`
@@ -191,19 +330,28 @@ Proposed, pending review:
      fixtures: `plant_upload_record`, orphaned-part variants.
 7. **Config + docs** (`config.rs`, `qss_storage.toml.example`,
    `docs/fsck.md`, `docs/multipart.md` or a section in existing docs)
+   - **(as built)** its own page, `docs/multipart.md`: the lifecycle in
+     plain language, the claim rule, the client-visible answers, TTL
+     semantics and the `[multipart]` table, orphan parts and their two
+     reapers, and the upgrade story for a pre-0003 store.
 
 ### Data Flow
+
+**(as built)** -- complete's claim takes the named parts with the record,
+so there is no cleanup loop after the object is minted, and every reap is
+a take:
 
 ```
 create_multipart_upload -> _UPLOADS record (created_at)
 upload_part   [upload exists?] -> blocks (striped bumps) -> part record
-complete      [take_upload claim] -> object meta -> remove part records
-abort         [take_upload claim] -> per part: remove record
+complete      [validate parts] -> claim upload AND named parts (one tx)
+                              -> object meta inherits their blocks
+abort         [take_upload claim] -> per part: take record
                                        -> release_blocks (striped)
 GC sweep      -> aged uploads -> abort path
-              -> orphan parts (no upload record) -> remove -> release
-fsck          -> age + orphan_part findings; repair removes records,
-                 closing recount reclaims
+              -> orphan parts (no upload record) -> take -> release
+fsck          -> age + orphan_part findings; repair reaps through the
+                 same take, closing recount validates
 ```
 
 ---
@@ -284,6 +432,12 @@ fsck          -> age + orphan_part findings; repair removes records,
   upload record -- an orphan part, reaped within one GC interval.
   Leakage bounded by the interval; loss impossible (every rc mutation
   is striped, ADR 0006). The race-window test must pin this.
+  **(as built)** Pinned, and it is the ONLY window of this shape that
+  survived: the complete-versus-orphan-sweep window that the original
+  Decision 6 shape would have opened is closed by the amendment, not
+  narrowed. This one stays open on purpose -- closing it would mean
+  serializing every `upload_part` against the claim, which is a lock on
+  the hot path to prevent bounded leakage.
 - GC aborting an upload a slow client still intends to finish:
   mitigated by the conservative default TTL and per-store config; the
   client sees `NoSuchUpload` on its next part, the S3-idiomatic
@@ -306,6 +460,11 @@ no window where both proceed: everything either path does afterwards is
 keyed to having won the claim. Part records and refcounts touched by a
 loser that was mid-`upload_part` degrade to orphan parts, which the GC
 reaps.
+**(as built)** Complete's claim additionally takes every part it names,
+in the same transaction (Decision 2's amendment). That does not change
+what serializes complete against abort -- the upload record still does --
+but it removes the only state in which a third party (the GC) could act
+on the difference between the two.
 
 **Q: Why must abort remove the part record before releasing its
 blocks, and not the reverse?**
@@ -319,6 +478,29 @@ that, with `--repair`, would RAISE the rc back and permanently leak the
 blocks. The ordering keeps the accounting monotone in the safe
 direction. Same reasoning as ADR 0006's delete ordering, applied one
 level up.
+**(as built)** The removal is a take, so the record and the block list
+that gets released come from one transaction. The ordering argument
+above is untouched; what the take adds is that two reapers of one part
+cannot both act on it, which the split read-then-remove shape would have
+allowed (both reading the same list, both decrementing: a double
+release, which is loss).
+
+**Q: Can the GC's orphan sweep reap a part that a complete in flight is
+about to inherit? (as built)**
+A: No, and not because the window is small -- because it does not exist.
+A completed object INHERITS its parts' block references rather than
+taking new ones, so a part record outliving its upload record while a
+complete was in flight would be indistinguishable from a crashed abort's
+residue, and reaping it would release references the new object holds.
+`_UPLOADS` and `_MULTIPART_PARTS` are trees of the same fjall database,
+so complete takes the upload record and every part it names in ONE
+transaction: a named part disappears at the same instant as its upload
+record. Phase 2 of the sweep can therefore only ever see parts nothing
+inherited -- an aborted upload's residue, an `upload_part` that landed
+after the claim, a part the completing client never named, or a legacy
+record. Every one of those holds its blocks alone, so releasing them is
+right. The GC needs no knowledge of complete's progress, and complete
+needs no coordination with the GC.
 
 **Q: Does the GC racing a live client break anything?**
 A: The GC IS a client: it calls the same abort path, so the claim rule

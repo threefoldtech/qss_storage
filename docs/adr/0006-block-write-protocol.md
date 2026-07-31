@@ -101,7 +101,10 @@ explicitly (see Decision).
 
 Related: ADR 0002 (BLAKE3 addressing), ADR 0004 (store ownership -- the
 `.tmp` sweep depends on it), ADR 0005 (fsck -- reconciles the failure
-residue enumerated here; the built tool is `docs/fsck.md`), ADR 0007 (the
+residue enumerated here; the built tool is `docs/fsck.md`), ADR 0003
+(the multipart lifecycle, whose abort and GC release references through
+this ADR's striped delete primitive -- `release_blocks` is that loop,
+factored and named; see `docs/multipart.md`), ADR 0007 (the
 fjall_notx backend's fate -- this ADR only scopes it out),
 `docs/refcount.md` (leakage-allowed / loss-never),
 `docs/arch/deadlock-fix.md`.
@@ -684,7 +687,12 @@ survives for test injection only; its implementation moves to
   through `upload_part` -> `store_object`, so the stripes cover multipart
   for free. Its real hazard was the `key_has_block` stale-skip (decided
   above). ADR 0003's part-GC decrement must use this ADR's striped delete
-  primitive.
+  primitive. **(as built)** It does: ADR 0003 factored `delete_object`'s
+  inline decrement loop into `release_blocks` and calls that from abort,
+  from the GC sweep and from fsck's orphan-part repair, so there is one
+  decrement implementation and it is this one. `complete` still performs
+  no rc operations -- the object it mints inherits the parts' references
+  rather than taking new ones.
 - Blocking-pool sizing: default pool, add the queue-depth gauge; pivot to
   a dedicated bounded pool if the gauge shows starvation.
 

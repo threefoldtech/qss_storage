@@ -41,6 +41,20 @@ unless the holder enumeration closed completely; a count over a partial
 holder set would authorise freeing blocks that are still referenced, which
 is loss by repair.
 
+One class of leak now has a collector that runs *online*, beside fsck: the
+stale-upload GC of ADR 0003 (`docs/multipart.md`). A multipart upload that
+is never completed or aborted holds its blocks through its part records
+forever, so s3cas sweeps on a TTL -- aborting aged uploads through the same
+claim a client's `AbortMultipartUpload` takes, and removing part records
+whose upload record is gone. It releases references exactly the way
+`DeleteObject` does (per occurrence, striped RMW, record removed before its
+blocks), so it introduces no new rc semantics: it is a caller of the delete
+primitive, not a second one. Each reap is a take -- the record and the block
+list released come out of one transaction -- so two reapers racing over one
+part release it exactly once. fsck stays the backstop and the only thing
+that ever *reconciles*: the GC collects what it can name, fsck counts what
+is actually there.
+
 The one residue this contract cannot express -- a record whose bytes are
 gone (a `buffer`-durability power cut, or corruption) -- gets the `degraded`
 flag on the block record rather than a removal. The record keeps accounting
