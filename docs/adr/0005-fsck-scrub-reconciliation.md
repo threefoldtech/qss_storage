@@ -4,7 +4,11 @@
 **Date**: 2026-07-30
 **Updated**: 2026-07-31 (revised against the as-built ADR 0006 file-first
 protocol and the ADR 0007 backend removal; the original draft predates
-both and described a residue zoo that no longer exists)
+both and described a residue zoo that no longer exists. Same day, owner
+sign-off on all four review asks: degraded flag as record v3;
+under-counts raised and still reported CRITICAL; exit codes 0/1/2/3;
+store-level binary, not an s3cas subcommand. Decision-complete;
+Accepted on implementation start)
 
 ---
 
@@ -93,9 +97,12 @@ backend), `docs/refcount.md`.
 
 ## Decision
 
-A `fsck` subcommand living next to `inspect`. It opens the store's fjall
-DBs through the same header-aware path as the daemon and the existing
-tools (never creates, refuses on header mismatch).
+A store-level `fsck` binary (DECIDED 2026-07-31: its own binary target,
+home in cas-storage, usable against any store root -- not an s3cas
+subcommand; working name `qss-storage-fsck`, naming per the qss_storage
+convention). It opens the store's fjall DBs through the same
+header-aware path as the daemon and the existing tools (never creates,
+refuses on header mismatch).
 
 **Exclusivity** is inherited, not built: fjall's LOCK file makes fsck and
 a running daemon mutually exclusive on every DB fsck opens. The residual
@@ -158,13 +165,13 @@ failure mode this tool must structurally exclude.
 
 Report-only by default. `--repair` applies:
 
-- **rc := recounted value, in both directions.** Lowering to the walked
-  truth is safe under exclusivity. Raising an under-count is the
-  conservative direction and defuses a live premature-free landmine --
-  the CRITICAL finding, its evidence, and the nonzero exit all remain,
-  so the bug it indicates is not hidden. (The original draft refused to
-  touch under-counts; leaving a known under-count in place leaves loss
-  armed. Review ask 2.)
+- **rc := recounted value, in both directions** (DECIDED 2026-07-31).
+  Lowering to the walked truth is safe under exclusivity. Raising an
+  under-count is the conservative direction and defuses a live
+  premature-free landmine -- the CRITICAL finding, its evidence, and
+  the nonzero exit all remain, so the bug it indicates is not hidden.
+  (The original draft refused to touch under-counts; leaving a known
+  under-count in place leaves loss armed.)
 - delete orphan files and off-depth duplicates (nothing references
   them);
 - quarantine, never delete: corrupt blocks and foreign files rename into
@@ -193,8 +200,8 @@ what the record should say afterwards.
   poisoning every future same-content PUT into a new damaged object.
   The loss propagates.
 
-**Chosen mechanism: a `degraded` flag on the block record** (record
-format v3 adds a flags byte). fsck's repair marks damaged records
+**Chosen mechanism (DECIDED 2026-07-31): a `degraded` flag on the block
+record** (record format v3 adds a flags byte). fsck's repair marks damaged records
 degraded instead of removing them; the write path's bump RMW treats a
 degraded record as absent-for-dedup -- it falls through to the insert
 path, writes and fsyncs the file, then *clears the flag and bumps* in
@@ -204,11 +211,14 @@ stance ADR 0006 took) and one branch in the bump path, inside the
 existing tx and stripe. This is the only piece of this ADR that touches
 the daemon.
 
-Fallback if the format bump is declined: `--repair --evict-damaged`
-exports every holder object's metadata into the report, then removes the
-holders and the record -- accounting-correct and heal-enabling, but it
-destroys metadata naming what was lost, and a multi-block object dies
-whole for one damaged block. Review ask 1.
+The rejected fallback -- `--repair --evict-damaged`, exporting every
+holder object's metadata into the report and then removing holders and
+record -- was accounting-correct and heal-enabling without a format
+change, but it destroys metadata naming what was lost, and a
+multi-block object dies whole for one damaged block. Eviction can still
+be added later as an operator policy on top of the flag; the reverse
+order would have left early damaged stores poisoned until the flag
+shipped.
 
 ---
 
@@ -235,11 +245,15 @@ whole for one damaged block. Review ask 1.
      idempotent (rc-set, ENOENT-tolerant deletes and renames,
      idempotent degraded-marking), so a crashed `--repair` is re-run,
      not recovered. The report file is written before repair begins.
-4. **CLI** (`s3cas fsck`)
-   - `[--scrub] [--repair] [--json]`; s3cas-only (respd stores hold no
-     blocks -- verified; the original draft's store-level binary is
-     dropped, review ask 4). Exit codes: 0 clean or INFO-only, 1 WARN,
-     2 CRITICAL, 3 could-not-run.
+4. **CLI** (store-level binary, DECIDED 2026-07-31)
+   - Its own binary target homed in cas-storage (working name
+     `qss-storage-fsck`), `--meta-root`/`--fs-root` plus the
+     StoreOptions merge the other tools use; `[--scrub] [--repair]
+     [--json]`. Usable against any store root regardless of which
+     daemon owns it (respd stores verifiably hold no blocks today, but
+     the tool does not care who wrote the store). Exit codes (DECIDED
+     2026-07-31): 0 clean or INFO-only, 1 WARN, 2 CRITICAL, 3
+     could-not-run.
 
 ### Data Flow
 
@@ -388,23 +402,28 @@ kill-mid-repair test.
 
 ## Implementation Plan
 
+### Decisions locked (owner sign-off 2026-07-31)
+- **Damaged-block mechanism**: degraded flag, record format v3 (flags
+  byte). The format bump is free until a deployed store exists (ADR
+  0006's stance); eviction stays available later as policy on top.
+- **Under-counts**: `--repair` raises rc to the recounted value; the
+  CRITICAL finding and nonzero exit remain.
+- **Exit-code contract**: 0 clean/INFO, 1 WARN, 2 CRITICAL, 3
+  could-not-run. Scripting depends on it once shipped.
+- **CLI home**: store-level binary in cas-storage (working name
+  `qss-storage-fsck`), usable against any store root; no daemon
+  subcommand wrappers to start with.
+
 ### Decisions you will probably want to tweak
-- **Damaged-block mechanism**: degraded flag (record v3).
-  - **Alternative**: `--evict-damaged` only, no format change.
-  - **Cost to change later**: the format bump is free until a deployed
-    store exists (ADR 0006's stance), expensive after; eviction can
-    coexist with the flag, so starting flag-less and adding it later is
-    the reversible order -- but then early damaged stores stay poisoned
-    until the flag ships.
 - **Finding/severity model and `--json` schema**: the tool's scripting
   API; renaming fields later breaks automation. Decide the schema in
-  review, not in code.
+  implementation review, not in code.
 - **Quarantine mechanics**: filesystem rename into `blocks/.quarantine/`
   (visible with `ls`, survives DB damage) vs a DB tree. Cost to change:
   low until documented.
-- **Exit-code contract**: 0 clean/INFO, 1 WARN, 2 CRITICAL, 3
-  could-not-run (resolves the original draft's open question with a
-  default; scripting depends on it once shipped).
+- **Binary name**: `qss-storage-fsck` is a working name (qss_storage
+  naming convention; never bare qss). Cost to change: operator-facing
+  once documented.
 
 ### Known unknowns and how the plan absorbs them
 - Real-store scale: per-pass selection is the first lever, per-bucket
@@ -419,18 +438,13 @@ kill-mid-repair test.
 `scrub` module in cas-storage (walkers, findings, passes, repair
 actions); extend `crash_fixtures.rs` (inflated/deflated rc, bit-flipped
 block, half-deleted bucket, stale part records, kill-mid-repair);
-degraded-flag branch in the bump RMW plus a degraded arm in the race
-stress tests (if ask 1 lands); CLI wiring and `--json`; docs page
-pairing fsck with verify-on-read and `docs/refcount.md`.
+record format v3 with the degraded-flag branch in the bump RMW plus a
+degraded arm in the race stress tests; the store-level binary target
+and `--json`; docs page pairing fsck with verify-on-read and
+`docs/refcount.md`.
 
-Review asks:
-1. Degraded flag (record v3, recommended) or `--evict-damaged` only?
-2. `--repair` raises under-counts to the recounted value while still
-   reporting CRITICAL and exiting nonzero -- agree, or keep the original
-   refuse-to-touch stance?
-3. Exit-code contract as proposed?
-4. s3cas-only CLI, walkers as library (drop the original's store-level
-   binary) -- agree?
+Review asks: none -- all four resolved 2026-07-31 (see Decisions
+locked).
 
 ---
 
