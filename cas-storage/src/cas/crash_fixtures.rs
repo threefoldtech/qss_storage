@@ -21,6 +21,28 @@ pub(crate) fn plant_orphan_file(blocks_root: &Path, id: &BlockId, depth: u8, byt
     std::fs::write(&path, bytes).unwrap();
 }
 
+/// Residue class 1 at ADR 0010's batch width: a whole batch of orphan
+/// block files.
+///
+/// The crash window the batch widened -- a kill between the batch's
+/// directory sync and its transaction commit. Every file of the batch is
+/// durable at its final path and not one of them has a record, because the
+/// records were going to commit together and never did. Up to
+/// `max_blocks_per_commit` of them, and not one more: the cap is what
+/// bounds this.
+///
+/// The class did not change, only the count. Each file is exactly what
+/// [`plant_orphan_file`] plants, which is what makes this fixture a loop
+/// rather than a new shape -- and what makes fsck's existing collection and
+/// the write path's existing adopt-in-place heal apply unaltered.
+///
+/// `blocks` is the (content, depth) of each block in the killed batch.
+pub(crate) fn plant_killed_batch(blocks_root: &Path, batch: &[(BlockId, u8, Vec<u8>)]) {
+    for (id, depth, bytes) in batch {
+        plant_orphan_file(blocks_root, id, *depth, bytes);
+    }
+}
+
 /// Residue class 2: an orphan at a NON-policy depth (depth-change
 /// residue): a file named `<id>` at depth `d1` while the live record says
 /// `d2` -- the store once placed the block deeper or shallower than the

@@ -631,3 +631,114 @@ fn fileless_records_show_up_in_the_record_walk_only() {
         "neither residue class has a file"
     );
 }
+
+/// A batch killed between its directory sync and its commit (ADR 0010).
+///
+/// The window the batch widened: every file of the batch is durable at its
+/// final path, and not one of them has a record, because the records were
+/// going to commit together and never did. The claim under test is that this
+/// is the SAME residue as before, only more of it -- so fsck must report each
+/// file as `orphan_file` (residue class 1) and nothing else, with no new
+/// class and no critical finding, and a later PUT of the same content must
+/// adopt each file in place rather than write a second copy somewhere else.
+///
+/// A batch cap's worth of blocks, because "up to `max_blocks_per_commit`
+/// orphans" is exactly what the ADR promises a single kill can leave.
+#[tokio::test]
+async fn a_batch_killed_before_its_commit_is_a_batch_of_ordinary_orphans() {
+    /// The default cap: the widest residue a single kill may leave.
+    const BATCH: usize = crate::config::DEFAULT_MAX_BLOCKS_PER_COMMIT;
+
+    let dir = tempdir().unwrap();
+    let (shared, fs) = store(&dir);
+    fs.create_bucket("b").unwrap();
+
+    // The batch as it was on disk when the process died: files renamed into
+    // place at the depths the placement policy would pick, records absent.
+    let batch: Vec<(BlockId, u8, Vec<u8>)> = (0..BATCH)
+        .map(|i| {
+            let bytes = format!("killed batch block {i} ").repeat(16).into_bytes();
+            let id = shared.hasher().hash(&bytes);
+            // Depth 1 for the first half and 2 for the rest: a real batch
+            // fans out, and the heal has to follow each file to where it is.
+            let depth = if i % 2 == 0 { 1 } else { 2 };
+            (id, depth, bytes)
+        })
+        .collect();
+    crate::cas::crash_fixtures::plant_killed_batch(fs.fs_root(), &batch);
+
+    let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared).with_meta_root(dir.path());
+    let report = super::engine::run(&ctx, &super::engine::ScrubOptions::full()).unwrap();
+
+    // Class 1, once per file, and nothing else at all.
+    let orphans: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.class == FindingClass::OrphanFile)
+        .collect();
+    assert_eq!(
+        orphans.len(),
+        BATCH,
+        "every file of the killed batch is one orphan: {}",
+        report.render_text()
+    );
+    assert_eq!(
+        report.findings.len(),
+        BATCH,
+        "a killed batch produces no finding of any other class: {}",
+        report.render_text()
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| f.severity != Severity::Critical),
+        "orphan files are leakage, never loss: {}",
+        report.render_text()
+    );
+
+    // Every planted file is named by exactly one finding.
+    let reported: HashSet<String> = orphans.iter().filter_map(|f| f.block.clone()).collect();
+    for (id, _, _) in &batch {
+        assert!(
+            reported.contains(&id.to_hex()),
+            "fsck must name the orphan {}",
+            id.to_hex()
+        );
+    }
+
+    // The heal: re-PUT the same content. Each block adopts the file already
+    // sitting on its directory chain -- same depth, same inode path -- rather
+    // than placing a second copy the scrub would then call an off-depth
+    // duplicate.
+    for (i, (id, depth, bytes)) in batch.iter().enumerate() {
+        put(&fs, "b", &format!("retry-{i}"), bytes.clone()).await;
+
+        let record = shared
+            .block_tree()
+            .get_block(id.as_slice())
+            .unwrap()
+            .expect("the retry records the block");
+        assert_eq!(
+            record.depth(),
+            *depth,
+            "the retry must adopt the orphan where it lies, not move it"
+        );
+        assert_eq!(record.rc(), 1, "one holder: the object that just landed");
+        assert_eq!(
+            shared
+                .hasher()
+                .hash(&std::fs::read(block_disk_path(id, *depth, fs.fs_root().clone())).unwrap()),
+            *id,
+            "the adopted file is the block it is named after"
+        );
+    }
+
+    // And the store is clean again: the heal left nothing for fsck to say.
+    let healed = super::engine::run(&ctx, &super::engine::ScrubOptions::full()).unwrap();
+    assert!(
+        healed.findings.is_empty(),
+        "a re-PUT of every block heals the whole batch: {}",
+        healed.render_text()
+    );
+}

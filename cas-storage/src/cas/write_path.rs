@@ -768,3 +768,637 @@ pub(super) async fn store_inlined_object(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cas::StorageEngine;
+    use crate::cas::block_disk::{BlockDiskOps, RealDiskOps};
+    use crate::cas::fs::BLOCK_SIZE;
+    use crate::metastore::{BlockTree, Durability, block_disk_path};
+    use bytes::Bytes;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::tempdir;
+
+    const BUCKET: &str = "b";
+
+    /// One store with one namespace at a chosen batch cap.
+    fn store_with_cap(
+        dir: &Path,
+        cap: Option<usize>,
+        ops: Option<Arc<dyn BlockDiskOps>>,
+    ) -> (Arc<SharedBlockStore>, CasFS) {
+        let mut shared = SharedBlockStore::new(
+            dir.join("meta/blocks"),
+            dir.join("blocks"),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            None,
+            None,
+            cap,
+        )
+        .unwrap();
+        if let Some(ops) = ops {
+            shared.set_disk_ops(ops);
+        }
+        let shared = Arc::new(shared);
+        let fs = CasFS::new(
+            dir.join("meta/ns"),
+            shared.clone(),
+            SharedMetrics::default(),
+            StorageEngine::Fjall,
+            Some(1),
+            Some(Durability::Buffer),
+            false,
+        )
+        .unwrap();
+        fs.create_bucket(BUCKET).unwrap();
+        (shared, fs)
+    }
+
+    /// `n` blocks' worth of content, every block distinct.
+    fn distinct_blocks(tag: &str, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * BLOCK_SIZE);
+        for block in 0..n {
+            let filler = format!("{tag}-block-{block}-");
+            let mut one = filler.repeat(BLOCK_SIZE / filler.len() + 1);
+            one.truncate(BLOCK_SIZE);
+            out.extend_from_slice(one.as_bytes());
+        }
+        out
+    }
+
+    async fn put(fs: &CasFS, key: &str, data: Vec<u8>) -> Object {
+        let len = data.len();
+        let stream =
+            AsyncByteStream::new(futures::stream::once(async move { Ok(Bytes::from(data)) }));
+        fs.store_single_object_and_meta(BUCKET, key, stream, len)
+            .await
+            .unwrap()
+    }
+
+    /// Reads the block record count at each rename, so a test can see exactly
+    /// when records became visible relative to the files landing.
+    #[derive(Debug)]
+    struct CommitObservingOps {
+        real: RealDiskOps,
+        /// Set once the store exists; `rename` reads through it.
+        tree: StdMutex<Option<Arc<BlockTree>>>,
+        /// Record count observed at each rename, in call order.
+        at_rename: StdMutex<Vec<usize>>,
+        writes: AtomicUsize,
+    }
+
+    impl CommitObservingOps {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                real: RealDiskOps,
+                tree: StdMutex::new(None),
+                at_rename: StdMutex::new(Vec::new()),
+                writes: AtomicUsize::new(0),
+            })
+        }
+
+        fn watch(&self, tree: Arc<BlockTree>) {
+            *self.tree.lock().unwrap() = Some(tree);
+        }
+
+        fn observations(&self) -> Vec<usize> {
+            self.at_rename.lock().unwrap().clone()
+        }
+    }
+
+    impl BlockDiskOps for CommitObservingOps {
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.real.create_dir_all(path)
+        }
+        fn write_new_file(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.real.write_new_file(path, contents)
+        }
+        fn fsync_file(&self, path: &Path, data_only: bool) -> io::Result<()> {
+            self.real.fsync_file(path, data_only)
+        }
+        fn fsync_dir(&self, path: &Path) -> io::Result<()> {
+            self.real.fsync_dir(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let observed = self
+                .tree
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|tree| tree.len().unwrap());
+            if let Some(count) = observed {
+                self.at_rename.lock().unwrap().push(count);
+            }
+            self.real.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.real.remove_file(path)
+        }
+        fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.real.list_dir(path)
+        }
+        fn device_of(&self, path: &Path) -> io::Result<Option<u64>> {
+            self.real.device_of(path)
+        }
+    }
+
+    /// Records appear in batch-sized groups, and never before their files.
+    ///
+    /// This is the ADR's claim made observable. An 8-block object at a cap of
+    /// 4 lands as two batches, and at every rename the tree holds a multiple
+    /// of the cap: 0 for all four renames of the first batch (its records do
+    /// not exist yet), 4 for all four of the second. A per-block protocol
+    /// would count 0,1,2,3,4,5,6,7 instead, and a batch that committed before
+    /// renaming would count 4,4,4,4,8,8,8,8.
+    #[tokio::test]
+    async fn records_commit_once_per_batch_and_never_before_the_files_land() {
+        const CAP: usize = 4;
+        const BLOCKS: usize = 8;
+
+        let dir = tempdir().unwrap();
+        let ops = CommitObservingOps::new();
+        let (shared, fs) = store_with_cap(dir.path(), Some(CAP), Some(ops.clone()));
+        ops.watch(shared.block_tree());
+
+        put(&fs, "big", distinct_blocks("batched", BLOCKS)).await;
+
+        assert_eq!(
+            ops.observations(),
+            vec![0, 0, 0, 0, 4, 4, 4, 4],
+            "records must become visible one batch at a time, after the renames"
+        );
+        assert_eq!(shared.block_tree().len().unwrap(), BLOCKS);
+    }
+
+    /// The cap does not change what the store ends up holding: a request
+    /// split into many batches, into one batch, or into one block per batch
+    /// all leave the same object with the same blocks.
+    #[tokio::test]
+    async fn the_cap_changes_the_batching_and_nothing_else() {
+        let content = distinct_blocks("cap-invariance", 5);
+
+        let mut ids_per_cap = Vec::new();
+        for cap in [1usize, 2, 5, 64] {
+            let dir = tempdir().unwrap();
+            let (shared, fs) = store_with_cap(dir.path(), Some(cap), None);
+            let obj = put(&fs, "same", content.clone()).await;
+
+            assert_eq!(obj.blocks().len(), 5, "cap {cap}");
+            assert_eq!(shared.block_tree().len().unwrap(), 5, "cap {cap}");
+            for id in obj.blocks() {
+                let block = shared
+                    .block_tree()
+                    .get_block(id.as_slice())
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("cap {cap}: every block must be recorded"));
+                assert_eq!(block.rc(), 1, "cap {cap}");
+                let path = block.disk_path(id, fs.fs_root().clone());
+                assert_eq!(
+                    shared.hasher().hash(&std::fs::read(&path).unwrap()),
+                    *id,
+                    "cap {cap}: the file is the block it is named after"
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(fs.fs_root().join(".tmp"))
+                    .unwrap()
+                    .count(),
+                0,
+                "cap {cap}: no temp residue"
+            );
+            ids_per_cap.push(obj.blocks().to_vec());
+        }
+
+        for ids in &ids_per_cap {
+            assert_eq!(
+                ids, &ids_per_cap[0],
+                "the block list cannot depend on the cap"
+            );
+        }
+    }
+
+    /// A block appearing twice in ONE request is one insert plus one bump --
+    /// the accumulator dedups against itself, exactly as two requests dedup
+    /// against committed state.
+    #[tokio::test]
+    async fn a_block_repeated_in_one_request_is_one_file_and_two_references() {
+        let dir = tempdir().unwrap();
+        let ops = CommitObservingOps::new();
+        let (shared, fs) = store_with_cap(dir.path(), None, Some(ops.clone()));
+
+        // Two identical blocks around one distinct one: the repeat is not
+        // adjacent, so a "same as the last block" check would miss it.
+        let repeated = distinct_blocks("repeated", 1);
+        let other = distinct_blocks("other", 1);
+        let mut content = repeated.clone();
+        content.extend_from_slice(&other);
+        content.extend_from_slice(&repeated);
+
+        let obj = put(&fs, "twice", content).await;
+
+        assert_eq!(obj.blocks().len(), 3, "three occurrences in the block list");
+        assert_eq!(obj.blocks()[0], obj.blocks()[2], "the first and last agree");
+        assert_eq!(
+            ops.writes.load(Ordering::SeqCst),
+            2,
+            "one file per distinct block, however often it occurs"
+        );
+
+        let repeated_id = obj.blocks()[0];
+        assert_eq!(
+            shared
+                .block_tree()
+                .get_block(repeated_id.as_slice())
+                .unwrap()
+                .unwrap()
+                .rc(),
+            2,
+            "every occurrence holds its own reference"
+        );
+        assert_eq!(
+            shared
+                .block_tree()
+                .get_block(obj.blocks()[1].as_slice())
+                .unwrap()
+                .unwrap()
+                .rc(),
+            1
+        );
+
+        // And the lifecycle closes exactly: deleting the object drops both.
+        fs.delete_object(BUCKET, "twice").await.unwrap();
+        assert!(
+            shared
+                .block_tree()
+                .get_block(repeated_id.as_slice())
+                .unwrap()
+                .is_none(),
+            "two references in, two references out"
+        );
+    }
+
+    /// The one-block PUT is a one-block batch: today's shape, unchanged.
+    #[tokio::test]
+    async fn a_single_block_put_is_a_one_block_batch() {
+        let dir = tempdir().unwrap();
+        let ops = CommitObservingOps::new();
+        let (shared, fs) = store_with_cap(dir.path(), None, Some(ops.clone()));
+        ops.watch(shared.block_tree());
+
+        let obj = put(&fs, "small", b"one small block".repeat(64).to_vec()).await;
+
+        assert_eq!(obj.blocks().len(), 1);
+        assert_eq!(
+            ops.observations(),
+            vec![0],
+            "one rename, and no record existed when it happened"
+        );
+        assert_eq!(ops.writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two concurrent batches both containing block X, both new (ADR 0010's
+    /// "who wins?").
+    ///
+    /// Both stage their own temp file -- neither saw the other's record,
+    /// because neither had committed one. The stripe serializes them at the
+    /// transaction: the first insert wins, the second's in-tx decision sees
+    /// the committed record and becomes a bump, and its surplus temp file is
+    /// dropped rather than renamed over a live block. At quiesce: one insert,
+    /// one bump, rc exactly 2, one file, no residue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_batches_over_one_new_block_insert_once_and_bump_once() {
+        const ROUNDS: usize = 30;
+        const CAP: usize = 4;
+
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store_with_cap(dir.path(), Some(CAP), None);
+        let fs = Arc::new(fs);
+
+        for round in 0..ROUNDS {
+            // The shared block sits among distinct ones, so each request is a
+            // real batch and the shared block is not its only member.
+            let shared_block = distinct_blocks(&format!("shared-{round}"), 1);
+            let mut left = distinct_blocks(&format!("left-{round}"), 2);
+            left.extend_from_slice(&shared_block);
+            let mut right = distinct_blocks(&format!("right-{round}"), 2);
+            right.extend_from_slice(&shared_block);
+
+            let id = shared.hasher().hash(&shared_block);
+
+            let a = {
+                let fs = fs.clone();
+                tokio::spawn(async move { put(&fs, &format!("a-{round}"), left).await })
+            };
+            let b = {
+                let fs = fs.clone();
+                tokio::spawn(async move { put(&fs, &format!("b-{round}"), right).await })
+            };
+            a.await.unwrap();
+            b.await.unwrap();
+
+            let block = shared
+                .block_tree()
+                .get_block(id.as_slice())
+                .unwrap()
+                .expect("the contended block must have exactly one record");
+            assert_eq!(block.rc(), 2, "round {round}: one insert plus one bump");
+
+            // Exactly one file, at the depth the record names, with the right
+            // bytes -- and no second copy at any other depth.
+            let path = block.disk_path(&id, fs.fs_root().clone());
+            assert_eq!(
+                shared.hasher().hash(&std::fs::read(&path).unwrap()),
+                id,
+                "round {round}: the surviving file is the block"
+            );
+            for depth in 1..=4u8 {
+                if depth != block.depth() {
+                    assert!(
+                        !block_disk_path(&id, depth, fs.fs_root().clone()).exists(),
+                        "round {round}: the loser must not leave an off-depth copy"
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read_dir(fs.fs_root().join(".tmp"))
+                    .unwrap()
+                    .count(),
+                0,
+                "round {round}: the surplus temp file must be removed"
+            );
+        }
+    }
+
+    /// A request whose dedup lookup is overtaken: the record it deduped
+    /// against is deleted before its batch commits.
+    ///
+    /// That lookup is the one thing in a batch that can go stale, and this is
+    /// the shape that makes it go stale on purpose. The batch has to notice
+    /// under the stripe and write the block after all, rather than committing
+    /// a record whose file was just unlinked. Run as a storm because the
+    /// window is small; a wrong implementation shows up as a record with no
+    /// file, which the read-back catches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dedup_hit_overtaken_by_a_delete_still_lands_its_bytes() {
+        const ROUNDS: usize = 40;
+
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store_with_cap(dir.path(), None, None);
+        let fs = Arc::new(fs);
+
+        for round in 0..ROUNDS {
+            let content = distinct_blocks(&format!("overtaken-{round}"), 1);
+            let id = shared.hasher().hash(&content);
+
+            // The reference the racing DELETE will take: the last one, so the
+            // record and the file both go.
+            put(&fs, &format!("seed-{round}"), content.clone()).await;
+
+            let deleter = {
+                let fs = fs.clone();
+                tokio::spawn(
+                    async move { fs.delete_object(BUCKET, &format!("seed-{round}")).await },
+                )
+            };
+            let writer = {
+                let fs = fs.clone();
+                let content = content.clone();
+                tokio::spawn(async move { put(&fs, &format!("writer-{round}"), content).await })
+            };
+            deleter.await.unwrap().unwrap();
+            writer.await.unwrap();
+
+            // Whichever order they landed in, the writer's object is
+            // readable: its record exists and its file is there, whole.
+            let block = shared
+                .block_tree()
+                .get_block(id.as_slice())
+                .unwrap()
+                .unwrap_or_else(|| panic!("round {round}: the writer's block must be recorded"));
+            let path = block.disk_path(&id, fs.fs_root().clone());
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("round {round}: a committed record must have its file: {e}")
+            });
+            assert_eq!(
+                shared.hasher().hash(&bytes),
+                id,
+                "round {round}: complete file, never partial"
+            );
+
+            fs.delete_object(BUCKET, &format!("writer-{round}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Ops whose exclusive-create write signals entry and waits for a
+    /// release, so a test can park a request between its dedup lookup and its
+    /// batch commit -- the one window in which that lookup can go stale.
+    #[derive(Debug)]
+    struct GatedStageOps {
+        real: RealDiskOps,
+        entered: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BlockDiskOps for GatedStageOps {
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.real.create_dir_all(path)
+        }
+        fn write_new_file(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+            self.entered.send(()).ok();
+            self.release.lock().unwrap().recv().ok();
+            self.real.write_new_file(path, contents)
+        }
+        fn fsync_file(&self, path: &Path, data_only: bool) -> io::Result<()> {
+            self.real.fsync_file(path, data_only)
+        }
+        fn fsync_dir(&self, path: &Path) -> io::Result<()> {
+            self.real.fsync_dir(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.real.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.real.remove_file(path)
+        }
+        fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.real.list_dir(path)
+        }
+        fn device_of(&self, path: &Path) -> io::Result<Option<u64>> {
+            self.real.device_of(path)
+        }
+    }
+
+    /// The overtake, arranged rather than raced: the deleted-underneath case,
+    /// deterministically.
+    ///
+    /// A request of two blocks, `[X, N]`. X dedup-hits a committed record, so
+    /// no file is written for it and only its bytes are held. N is new, so it
+    /// stages -- and the gate parks the request right there, holding no
+    /// stripes, which is exactly what lets the DELETE through. The DELETE
+    /// takes X's last reference: record removed, file unlinked. Then the batch
+    /// resumes.
+    ///
+    /// What must happen: the batch notices under X's stripe that the record it
+    /// deduped against is gone, writes X from the bytes it kept, and commits a
+    /// record whose file is really there. What must NOT happen: a record for X
+    /// with no file, which is silent data loss dressed as a successful PUT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dedup_hit_deleted_mid_batch_is_written_from_the_bytes_it_kept() {
+        let dir = tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let ops = Arc::new(GatedStageOps {
+            real: RealDiskOps,
+            entered: entered_tx,
+            release: StdMutex::new(release_rx),
+        });
+        let (shared, fs) = store_with_cap(dir.path(), None, Some(ops));
+        let fs = Arc::new(fs);
+
+        let x = distinct_blocks("deduped-away", 1);
+        let n = distinct_blocks("brand-new", 1);
+        let x_id = shared.hasher().hash(&x);
+
+        // Seed the record the request will dedup against, letting its own
+        // single staged write through the gate.
+        let seed = {
+            let fs = fs.clone();
+            let x = x.clone();
+            tokio::spawn(async move { put(&fs, "seed", x).await })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the seed must stage its block");
+        release_tx.send(()).unwrap();
+        seed.await.unwrap();
+        assert_eq!(
+            shared
+                .block_tree()
+                .get_block(x_id.as_slice())
+                .unwrap()
+                .unwrap()
+                .rc(),
+            1
+        );
+
+        // The request: X dedup-hits (no write), N stages and parks.
+        let mut content = x.clone();
+        content.extend_from_slice(&n);
+        let writer = {
+            let fs = fs.clone();
+            tokio::spawn(async move { put(&fs, "writer", content).await })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the request must reach the new block's stage");
+
+        // Parked with no stripes held, so the DELETE goes through and takes
+        // X's last reference with it.
+        fs.delete_object(BUCKET, "seed").await.unwrap();
+        assert!(
+            shared
+                .block_tree()
+                .get_block(x_id.as_slice())
+                .unwrap()
+                .is_none(),
+            "the premise: the record the request deduped against is gone"
+        );
+
+        // The batch resumes, and has to notice. Two tokens: one frees the
+        // parked stage of N, the second is consumed by the write of X that
+        // the batch is obliged to perform now. That second token being
+        // NEEDED is itself the assertion -- without the fallback the request
+        // would sail through on one, and commit a record for a block whose
+        // file it never wrote.
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+
+        let block = shared
+            .block_tree()
+            .get_block(x_id.as_slice())
+            .unwrap()
+            .expect("the request's own reference must have recreated the record");
+        assert_eq!(block.rc(), 1, "one holder: the request that survived");
+        let path = block.disk_path(&x_id, fs.fs_root().clone());
+        let bytes = std::fs::read(&path)
+            .expect("a committed record must have its file -- this is the loss case");
+        assert_eq!(
+            shared.hasher().hash(&bytes),
+            x_id,
+            "and the file must be the block it is named after"
+        );
+        assert_eq!(
+            std::fs::read_dir(fs.fs_root().join(".tmp"))
+                .unwrap()
+                .count(),
+            0,
+            "no temp residue"
+        );
+    }
+
+    /// A failed request leaves no temp residue: everything it staged is
+    /// unlinked on the way out, and nothing was renamed.
+    #[tokio::test]
+    async fn a_request_that_fails_mid_stream_discards_what_it_staged() {
+        let dir = tempdir().unwrap();
+        let (shared, fs) = store_with_cap(dir.path(), Some(64), None);
+
+        // Enough blocks to fill a batch's worth of staging, then an error
+        // before the request end that would have flushed it.
+        let good = distinct_blocks("doomed", 3);
+        let stream = AsyncByteStream::new(futures::stream::iter(vec![
+            Ok(Bytes::from(good)),
+            Err(io::Error::other("the client went away")),
+        ]));
+
+        let err = store_object(&fs, BUCKET, "never", stream)
+            .await
+            .expect_err("a stream error must fail the request");
+        assert!(err.to_string().contains("the client went away"), "{err}");
+
+        assert_eq!(
+            shared.block_tree().len().unwrap(),
+            0,
+            "a request that never acked records nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(fs.fs_root().join(".tmp"))
+                .unwrap()
+                .count(),
+            0,
+            "and leaves no temp residue behind"
+        );
+    }
+
+    /// The batch is per REQUEST, not per object: a multipart part is its own
+    /// durability unit, and two parts of one upload commit separately.
+    #[tokio::test]
+    async fn each_part_upload_is_its_own_batch() {
+        let dir = tempdir().unwrap();
+        let ops = CommitObservingOps::new();
+        let (shared, fs) = store_with_cap(dir.path(), Some(64), Some(ops.clone()));
+        ops.watch(shared.block_tree());
+
+        for part in 0..2 {
+            let data = distinct_blocks(&format!("part-{part}"), 2);
+            let stream =
+                AsyncByteStream::new(futures::stream::once(async move { Ok(Bytes::from(data)) }));
+            store_object(&fs, BUCKET, "multi", stream).await.unwrap();
+        }
+
+        assert_eq!(
+            ops.observations(),
+            vec![0, 0, 2, 2],
+            "each request commits its own blocks, as one group"
+        );
+    }
+}
