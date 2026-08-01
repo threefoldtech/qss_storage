@@ -21,6 +21,15 @@
 //!   A store the daemon has open fails at the open, which is the intended
 //!   answer.
 //!
+//! The pairing check (ADR 0012) runs before any pass, and not because this
+//! file calls it: `SharedBlockStore::new` compares the header's store id with
+//! the blocks root's `.store-id` marker while opening, so a mispaired store
+//! never reaches a walker. That ordering is the point -- a store whose two
+//! halves belong to different stores must not be "repaired" toward either
+//! side's fiction. It surfaces here as a could-not-run (exit 3) naming both
+//! ids and both paths, and `--re-pair` is the only way to make such a pairing
+//! official.
+//!
 //! Exit codes (the scripting contract): 0 clean or INFO-only, 1 WARN, 2
 //! CRITICAL, 3 could-not-run.
 
@@ -54,11 +63,13 @@ struct Cli {
     #[arg(long, help = CONFIG_HELP)]
     config: Option<PathBuf>,
 
-    #[arg(long, default_value = ".")]
-    meta_root: PathBuf,
+    // Not clap defaults: --re-pair has to be able to tell "the operator said
+    // this path" from "nobody said anything and the tool guessed .".
+    #[arg(long, help = "Metadata root: the databases live here (default: .)")]
+    meta_root: Option<PathBuf>,
 
-    #[arg(long, default_value = ".")]
-    fs_root: PathBuf,
+    #[arg(long, help = "Data root: the block files live here (default: .)")]
+    fs_root: Option<PathBuf>,
 
     #[arg(long, help = "Metadata DB (fjall); default fjall")]
     metadata_db: Option<StorageEngine>,
@@ -88,6 +99,39 @@ struct Cli {
 
     #[arg(long, help = "Emit the report (and the repair summary) as JSON")]
     json: bool,
+
+    #[arg(
+        long = "re-pair",
+        conflicts_with_all = ["repair", "scrub", "json"],
+        help = "Rewrite the blocks root's store-id marker to match the blocks database, making \
+                a refused pairing official. Requires --meta-root and --fs-root spelled out; \
+                runs no passes"
+    )]
+    re_pair: bool,
+}
+
+/// The default both roots take when the operator names neither.
+fn or_here(path: Option<PathBuf>) -> PathBuf {
+    path.unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `--re-pair`: the authoritative recovery from a refused open (ADR 0012).
+///
+/// Both roots must be spelled out. The verb rewrites one of them, and a
+/// default of `.` is never a pairing anybody meant -- an operator who has
+/// just been told two paths disagree should retype both of them.
+fn run_re_pair(cli: &Cli) -> Result<u8> {
+    let (Some(meta_root), Some(fs_root)) = (cli.meta_root.as_ref(), cli.fs_root.as_ref()) else {
+        bail!(
+            "--re-pair needs both --meta-root and --fs-root spelled out: it rewrites the store \
+             id marker under --fs-root to match the database under --meta-root, and neither \
+             path may be a default"
+        );
+    };
+
+    let done = cas_storage::scrub::re_pair(meta_root, fs_root)?;
+    emit(&done.render_text());
+    Ok(exit_code::CLEAN)
 }
 
 /// The two databases a `--meta-root` holds, the way `CasFS::single_namespace`
@@ -170,6 +214,15 @@ async fn run(cli: Cli) -> Result<u8> {
         // reports on a store nobody expected; stderr, so --json stays clean.
         let _ = writeln!(io::stderr(), "configuration loaded from {}", path.display());
     }
+
+    // The one verb that walks nothing: it repairs the identity a walk would
+    // not be allowed to run against.
+    if cli.re_pair {
+        return run_re_pair(&cli);
+    }
+
+    let meta_root = or_here(cli.meta_root);
+    let fs_root = or_here(cli.fs_root);
     // No --stripe-count flag here: the stripe count is a write-concurrency
     // knob and fsck's repair path deletes serially. The config file's value is
     // still honoured so this opens the store the same way the daemon does.
@@ -181,7 +234,7 @@ async fn run(cli: Cli) -> Result<u8> {
         &file.store,
     )?;
 
-    refuse_unless_store_exists(&cli.meta_root)?;
+    refuse_unless_store_exists(&meta_root)?;
 
     // Opening is also the store's own recovery: the block writer purges
     // `.tmp` residue and re-checks that the temp dir shares a filesystem with
@@ -191,8 +244,8 @@ async fn run(cli: Cli) -> Result<u8> {
     // object through the read path, and the corruption scrub re-hashes every
     // block itself under --scrub.
     let casfs = CasFS::single_namespace(
-        cli.fs_root,
-        cli.meta_root.clone(),
+        fs_root,
+        meta_root.clone(),
         SharedMetrics::default(),
         store.metadata_db,
         store.inline_metadata_size,
@@ -212,7 +265,7 @@ async fn run(cli: Cli) -> Result<u8> {
     } else {
         ScrubOptions::metadata_only()
     };
-    let ctx = RepairContext::new(&casfs).with_meta_root(cli.meta_root);
+    let ctx = RepairContext::new(&casfs).with_meta_root(meta_root);
 
     let report = cas_storage::scrub::run(&ctx.scrub_context(), &options)?;
     emit_report(&report, cli.json)?;

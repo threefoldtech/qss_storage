@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use cas_storage::metastore::block_disk_path;
-use cas_storage::{AsyncByteStream, BlockId, CasFS, Durability, SharedMetrics, StorageEngine};
+use cas_storage::{
+    AsyncByteStream, BlockId, BlockStream, CasFS, Durability, RangeRequest, SharedMetrics,
+    StorageEngine,
+};
 use tempfile::TempDir;
 
 /// Exit codes, from the ADR's contract. Duplicated as literals on purpose:
@@ -24,22 +27,28 @@ const WARN: i32 = 1;
 const CRITICAL: i32 = 2;
 const COULD_NOT_RUN: i32 = 3;
 
+/// Runs the tool with the two roots wherever the caller put them.
+///
+/// `cwd` is where the process runs: the tool searches `./qss_storage.toml`
+/// when no `--config` is given, so every call points it at a directory with
+/// no config and the test does not depend on the checkout it runs in.
+fn fsck_roots(meta_root: &Path, fs_root: &Path, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_qss-storage-fsck"))
+        .arg("--meta-root")
+        .arg(meta_root)
+        .arg("--fs-root")
+        .arg(fs_root)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("the fsck binary must run")
+}
+
 /// Runs the tool against `dir` as both roots -- the layout the flags default
 /// to, and the one that puts the store's own databases inside the blocks
 /// root.
 fn fsck(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_qss-storage-fsck"))
-        .arg("--meta-root")
-        .arg(dir)
-        .arg("--fs-root")
-        .arg(dir)
-        // The tool searches ./qss_storage.toml when no --config is given; run
-        // from a directory with no config so the test does not depend on the
-        // checkout it runs in.
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("the fsck binary must run")
+    fsck_roots(dir, dir, dir, args)
 }
 
 fn code(output: &Output) -> i32 {
@@ -53,14 +62,15 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Opens (creating, the first time) a store the way the daemon does.
+/// Opens (creating, the first time) a store the way the daemon does, with
+/// the two roots wherever the caller put them.
 ///
 /// Buffer durability because these stores are thrown away; the tool is told
 /// the same, so it opens what the writer wrote.
-fn open(dir: &Path) -> CasFS {
+fn try_open_roots(meta_root: &Path, fs_root: &Path) -> Result<CasFS, cas_storage::MetaError> {
     CasFS::single_namespace(
-        dir.to_path_buf(),
-        dir.to_path_buf(),
+        fs_root.to_path_buf(),
+        meta_root.to_path_buf(),
         SharedMetrics::default(),
         StorageEngine::Fjall,
         Some(1),
@@ -71,7 +81,18 @@ fn open(dir: &Path) -> CasFS {
         None,
         None,
     )
-    .expect("the store must open")
+}
+
+fn open_roots(meta_root: &Path, fs_root: &Path) -> CasFS {
+    match try_open_roots(meta_root, fs_root) {
+        Ok(fs) => fs,
+        Err(e) => panic!("the store must open: {e}"),
+    }
+}
+
+/// Opens (creating, the first time) a store the way the daemon does.
+fn open(dir: &Path) -> CasFS {
+    open_roots(dir, dir)
 }
 
 /// Stores `data` under `bucket`/`key` and returns its single block id.
@@ -449,6 +470,211 @@ async fn a_closed_reader_is_not_a_panic() {
         Some(CLEAN),
         "orphans are INFO, and a closed pipe does not change the verdict: {stderr}"
     );
+}
+
+// ---- ADR 0012: the two-root store, and the identity that pairs it ----
+
+/// Reads an object back the way an S3 GET does: block paths out of the
+/// metadata, a stream over the files those paths name.
+async fn read_back(fs: &CasFS, bucket: &str, key: &str) -> Vec<u8> {
+    use futures::StreamExt;
+
+    let (_obj, paths) = fs
+        .get_object_paths(bucket, key)
+        .expect("the metadata must read")
+        .expect("the object must exist");
+    let size: usize = paths.iter().map(|(_, size)| size).sum();
+    let mut stream = BlockStream::new(paths, size, RangeRequest::All, SharedMetrics::default());
+    let mut out = Vec::with_capacity(size);
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk.expect("every block file must read"));
+    }
+    out
+}
+
+/// The store this ADR exists for: the database on one root, the block files
+/// on another. It writes, it reads back, it fscks clean, and it reopens on
+/// the same pairing.
+#[tokio::test]
+async fn a_store_split_across_two_roots_works_end_to_end() {
+    let meta = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let payload = b"a block that lives on the slow disk".repeat(40).to_vec();
+
+    {
+        let fs = open_roots(meta.path(), data.path());
+        fs.create_bucket("photos").unwrap();
+        put(&fs, "photos", "one", payload.clone()).await;
+        put(&fs, "photos", "two", b"another object".repeat(20).to_vec()).await;
+        assert_eq!(read_back(&fs, "photos", "one").await, payload);
+    }
+
+    // The halves really are split: the databases under the meta root, the
+    // block files (and the pairing marker) under the data root.
+    assert!(meta.path().join("db").is_dir());
+    assert!(meta.path().join("blocks").join(".db").is_dir());
+    assert!(!data.path().join("db").exists());
+    assert!(!data.path().join("blocks").join(".db").exists());
+    assert!(data.path().join("blocks").join(".store-id").is_file());
+    assert!(!meta.path().join("blocks").join(".store-id").exists());
+
+    let out = fsck_roots(meta.path(), data.path(), cwd.path(), &["--scrub"]);
+    assert_eq!(code(&out), CLEAN, "{}", stdout(&out));
+    assert!(stdout(&out).contains("no findings"), "{}", stdout(&out));
+
+    // Reopening the same pairing serves the same bytes.
+    let fs = open_roots(meta.path(), data.path());
+    assert_eq!(read_back(&fs, "photos", "one").await, payload);
+}
+
+/// A foreign blocks root under a database that knows better: refused at the
+/// open, by the daemon and by the tool, with both ids and both paths in the
+/// message and no override anywhere.
+#[tokio::test]
+async fn a_foreign_blocks_root_is_refused_by_the_daemon_and_the_tool() {
+    let meta = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let stranger = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    {
+        let fs = open_roots(meta.path(), data.path());
+        fs.create_bucket("photos").unwrap();
+        put(&fs, "photos", "one", b"ours".repeat(64).to_vec()).await;
+    }
+    // Somebody else's store, on its own two roots.
+    {
+        let other_meta = TempDir::new().unwrap();
+        let fs = open_roots(other_meta.path(), stranger.path());
+        fs.create_bucket("theirs").unwrap();
+        put(&fs, "theirs", "one", b"not ours".repeat(64).to_vec()).await;
+    }
+
+    let ours = std::fs::read_to_string(data.path().join("blocks").join(".store-id")).unwrap();
+    let theirs = std::fs::read_to_string(stranger.path().join("blocks").join(".store-id")).unwrap();
+    assert_ne!(ours, theirs);
+
+    // The daemon's open: refused, not opened-and-served.
+    let Err(err) = try_open_roots(meta.path(), stranger.path()) else {
+        panic!("a mispaired store must not open");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("store pairing mismatch"), "{msg}");
+    assert!(msg.contains(ours.trim()), "{msg}");
+    assert!(msg.contains(theirs.trim()), "{msg}");
+
+    // The tool's: could-not-run, before any pass, with the same facts and
+    // the recovery verb named.
+    let out = fsck_roots(meta.path(), stranger.path(), cwd.path(), &[]);
+    assert_eq!(code(&out), COULD_NOT_RUN, "{}", stdout(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("store pairing mismatch"), "{stderr}");
+    assert!(stderr.contains(ours.trim()), "{stderr}");
+    assert!(stderr.contains(theirs.trim()), "{stderr}");
+    assert!(stderr.contains("--re-pair"), "{stderr}");
+    assert!(
+        stdout(&out).is_empty(),
+        "no report about a store nobody walked: {}",
+        stdout(&out)
+    );
+
+    // Neither store was touched by the refusals.
+    assert_eq!(
+        std::fs::read_to_string(stranger.path().join("blocks").join(".store-id")).unwrap(),
+        theirs
+    );
+    assert_eq!(
+        code(&fsck_roots(meta.path(), data.path(), cwd.path(), &[])),
+        CLEAN
+    );
+}
+
+/// `--re-pair` is the way out, and the only one: it rewrites the marker to
+/// match the database, says what it did, and leaves a store the next run can
+/// walk.
+#[tokio::test]
+async fn re_pair_is_the_documented_way_out_of_a_refusal() {
+    let meta = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    {
+        let fs = open_roots(meta.path(), data.path());
+        fs.create_bucket("photos").unwrap();
+        put(&fs, "photos", "one", b"restored bytes".repeat(40).to_vec()).await;
+    }
+    let ours = std::fs::read_to_string(data.path().join("blocks").join(".store-id")).unwrap();
+
+    // A data root restored from a backup that predates this database: same
+    // files, another store's marker.
+    let stale = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    std::fs::write(
+        data.path().join("blocks").join(".store-id"),
+        format!("{stale}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        code(&fsck_roots(meta.path(), data.path(), cwd.path(), &[])),
+        COULD_NOT_RUN,
+        "the premise: this pairing is refused"
+    );
+
+    let out = fsck_roots(meta.path(), data.path(), cwd.path(), &["--re-pair"]);
+    assert_eq!(
+        code(&out),
+        CLEAN,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("re-paired"), "{text}");
+    assert!(
+        text.contains(stale),
+        "the marker it replaced is named: {text}"
+    );
+    assert!(text.contains(ours.trim()), "and the id it wrote: {text}");
+
+    // The store walks again, and the marker is the database's id.
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("blocks").join(".store-id")).unwrap(),
+        ours
+    );
+    let after = fsck_roots(meta.path(), data.path(), cwd.path(), &["--scrub"]);
+    assert_eq!(code(&after), CLEAN, "{}", stdout(&after));
+
+    // And it is idempotent: a second run has nothing to do.
+    let again = fsck_roots(meta.path(), data.path(), cwd.path(), &["--re-pair"]);
+    assert_eq!(code(&again), CLEAN);
+    assert!(
+        stdout(&again).contains("already paired"),
+        "{}",
+        stdout(&again)
+    );
+}
+
+/// The verb refuses to guess which roots it is repairing: both have to be
+/// typed out, defaults do not count.
+#[tokio::test]
+async fn re_pair_will_not_take_a_default_root() {
+    let dir = healthy_store().await;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_qss-storage-fsck"))
+        .arg("--re-pair")
+        .arg("--meta-root")
+        .arg(dir.path())
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(code(&out), COULD_NOT_RUN);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--fs-root"), "{stderr}");
+    assert!(stderr.contains("spelled out"), "{stderr}");
+
+    // And it does not run alongside a repair: two different verbs.
+    let clash = fsck(dir.path(), &["--re-pair", "--repair"]);
+    assert_ne!(code(&clash), CLEAN, "conflicting verbs must not both run");
 }
 
 /// The repair summary is JSON too, with its own schema version and the

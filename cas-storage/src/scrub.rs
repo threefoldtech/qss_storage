@@ -25,6 +25,7 @@ pub mod disk;
 pub mod engine;
 pub mod findings;
 pub mod holders;
+pub mod pairing;
 pub mod passes;
 pub mod records;
 pub mod repair;
@@ -41,6 +42,7 @@ pub use disk::{BlockFile, DiskWalk, ForeignPath, walk_disk};
 pub use engine::{ScrubError, ScrubOptions, run};
 pub use findings::{Finding, FindingClass, HolderRef, Severity};
 pub use holders::{ExpectedCounts, HolderEnumerationError, expected_counts, holders_of};
+pub use pairing::{Pairing, PairingError, RePair, re_pair};
 pub use records::{RecordWalk, walk_records};
 pub use repair::{
     RepairAction, RepairContext, RepairCounts, RepairError, RepairOutcome, RepairStatus,
