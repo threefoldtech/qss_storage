@@ -1,6 +1,11 @@
 # The Sync Boundary Moves from the Block to the Ack
 
-**Status**: Proposed
+**Status**: Proposed (review asks 1-3 ruled by owner 2026-08-01:
+boundary = request ack with configurable cap default 64; fdatasync +
+per-batch dirsync chosen, sync primitive eventually configurable;
+locking order signed off. Ask 4, the cross-request timer merge, is
+deferred to its own ADR. The fdatasync-as-user-level question is open
+pending owner ruling.)
 **Date**: 2026-08-01
 
 ---
@@ -277,17 +282,14 @@ acceptable place to stop.
   in `[store]`. Alternative: cap by bytes or by stripe count. Cost to
   change later: none, it is config.
 - **Sync primitive for block files**: fdatasync (data + size), with
-  the per-batch dirsync carrying rename durability. Alternative: keep
-  full fsync per file. Cost to change later: one function, but it is
-  THE performance decision -- changing it back is changing the ADR's
-  point.
+  the per-batch dirsync carrying rename durability. RULED: the
+  performant primitive is the default; a config escape hatch back to
+  full per-file fsync may be added if a filesystem ever demands it,
+  but is not built until one does.
 - **Where the batch closes**: at the request ack and at the cap, never
-  on a timer. Alternative: a small time window to merge concurrent
-  small PUTs into one journal persist (true group commit). Cost to
-  change later: additive -- a timer can be introduced behind the same
-  batch API without touching callers. Deliberately out of scope now:
-  it trades small-PUT latency for throughput and needs its own
-  numbers.
+  on a timer. RULED: the cross-request timer merge (true group
+  commit) gets its own ADR when wanted; the batch API here is shaped
+  so that ADR is additive and touches no callers.
 
 ### Known unknowns and how the plan absorbs them
 - **Concurrent-fdatasync scaling on xfs**: assumed near-linear to
@@ -312,24 +314,32 @@ surface. Tests: crash fixtures for kill-between-dirsync-and-commit
 width, the 16 GiB A/B as a regression benchmark with a floor, and the
 campaign unchanged as the acceptance gate.
 
-### Review asks
-1. Sync boundary = the request ack (with a 64-block cap): yes/no?
-2. fdatasync + per-batch dirsync as the block-file primitive, or keep
-   full per-file fsync inside the batch?
-3. Stripes taken after data syncs, sorted, released after commit --
-   sign off on that locking order?
-4. Is the timer-based small-PUT merge (true group commit) wanted in
-   scope now, or later behind the same API as written?
+### Review asks (all ruled, owner, 2026-08-01)
+1. Sync boundary = the request ack, cap configurable, default 64:
+   APPROVED.
+2. fdatasync + per-batch dirsync as the block-file primitive:
+   APPROVED as default, escape hatch only if a filesystem demands it.
+3. Stripes after data syncs, sorted acquisition, released after
+   commit: SIGNED OFF.
+4. Timer-based cross-request merge: DEFERRED to its own ADR.
 
 ---
 
 ## Open Questions
 
 **Architecture-changers**
-- [ ] Should `fdatasync` durability remain a distinct user-facing
-      level once the batch exists, or collapse into `fsync` (the batch
-      makes their cost nearly identical, and two near-identical levels
-      invite misconfiguration)?
+- [ ] Should `fdatasync` remain a distinct user-facing durability
+      level? After this ADR the two syscalls' cost difference is paid
+      once per request instead of twice per MiB, and on the
+      append-only journal even fdatasync must flush the size metadata
+      -- the two settings become indistinguishable in both speed and
+      crash safety. A knob implying a tradeoff that no longer exists
+      misleads the operator who picks it. PROPOSED: collapse the
+      user-facing levels to `fsync` and `buffer`; keep accepting
+      `fdatasync` in config as a deprecated alias for `fsync` (the
+      strict parser must not refuse existing configs); the fdatasync
+      SYSCALL remains an internal implementation choice where proven
+      equivalent. Awaiting owner ruling.
 
 **Behavior definers**
 - [ ] The cap-sized partial batch mid-request: on a crash, a client
