@@ -1379,6 +1379,98 @@ mod tests {
         );
     }
 
+    /// A few hundred MiB through the real write path at real `fsync`
+    /// durability, one cap against another. Ignored by default.
+    ///
+    /// NOT the acceptance benchmark -- that is the 16 GiB A/B on the rig
+    /// (`tests/real/tools/durability-bench.sh`), which owns the regression
+    /// floor and the hardware it means anything on. This is the smoke check
+    /// that says the batch path works end to end under real syncs and that a
+    /// bigger cap does what it is for, in seconds rather than hours:
+    ///
+    /// ```text
+    /// cargo test -p cas-storage --release -- --ignored --nocapture batch_smoke
+    /// ```
+    ///
+    /// A cap of 1 is the pre-ADR-0010 cadence (one commit and one journal
+    /// fsync per block), so the two rows are the change this ADR is about.
+    ///
+    /// The store goes under `target/`, deliberately, and NOT in `$TMPDIR`:
+    /// `/tmp` is tmpfs on most Linux boxes, where fsync costs nothing and
+    /// both rows come back identical and meaningless. A benchmark that
+    /// silently measures a RAM disk is worse than no benchmark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "writes a few hundred MiB with real fsyncs; run explicitly"]
+    async fn batch_smoke_ab() {
+        /// Blocks per object, so 256 MiB per row at the 1 MiB block size.
+        const BLOCKS: usize = 256;
+
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/batch-smoke");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        for cap in [1usize, 64] {
+            let dir = tempfile::Builder::new()
+                .prefix("ab-")
+                .tempdir_in(&scratch)
+                .unwrap();
+            // Fsync, not Buffer: the whole point is to pay the real syncs.
+            let shared = Arc::new(
+                SharedBlockStore::new(
+                    dir.path().join("meta/blocks"),
+                    dir.path().join("blocks"),
+                    StorageEngine::Fjall,
+                    Some(1),
+                    Some(Durability::Fsync),
+                    None,
+                    None,
+                    Some(cap),
+                )
+                .unwrap(),
+            );
+            let fs = CasFS::new(
+                dir.path().join("meta/ns"),
+                shared.clone(),
+                SharedMetrics::default(),
+                StorageEngine::Fjall,
+                Some(1),
+                Some(Durability::Fsync),
+                false,
+            )
+            .unwrap();
+            fs.create_bucket(BUCKET).unwrap();
+
+            // Distinct content per row: no row may dedup against another's.
+            let content = distinct_blocks(&format!("smoke-{cap}"), BLOCKS);
+            let bytes = content.len();
+
+            let started = std::time::Instant::now();
+            let obj = put(&fs, "giant", content).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(obj.blocks().len(), BLOCKS);
+            assert_eq!(shared.block_tree().len().unwrap(), BLOCKS);
+            #[allow(clippy::cast_precision_loss)] // a printed rate, not a value
+            let rate = (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+            println!(
+                "max_blocks_per_commit={cap:>3}: {:>4} MiB in {:>6.2}s = {rate:>7.1} MiB/s",
+                bytes / (1024 * 1024),
+                elapsed.as_secs_f64(),
+            );
+
+            // Correctness first, speed second: every block readable and
+            // exactly what it claims to be.
+            for id in obj.blocks() {
+                let block = shared
+                    .block_tree()
+                    .get_block(id.as_slice())
+                    .unwrap()
+                    .unwrap();
+                let path = block.disk_path(id, fs.fs_root().clone());
+                assert_eq!(shared.hasher().hash(&std::fs::read(&path).unwrap()), *id);
+            }
+        }
+    }
+
     /// The batch is per REQUEST, not per object: a multipart part is its own
     /// durability unit, and two parts of one upload commit separately.
     #[tokio::test]
