@@ -22,10 +22,19 @@
 # ---------------------------------------------------------------------------
 [store]
 
-# Write durability: "fsync" or "buffer". With "fsync" everything a request
-# acknowledges -- its block files and its metadata records -- is on stable
-# storage before the ack goes out (ADR 0010); "buffer" leaves every write to
-# the OS page cache, so a power loss can take back acknowledged writes.
+# Write durability: "fsync" or "buffer". Both are promises about what an
+# acknowledgement means, and one syscall apart:
+#
+#   fsync   everything the ack covers -- block files and metadata records --
+#           is on stable storage before the ack goes out (ADR 0010). Survives
+#           a power cut.
+#   buffer  everything the ack covers has been handed to the KERNEL before the
+#           ack goes out: written, not flushed. Survives the daemon being
+#           killed; lost only to a power cut or an OS crash.
+#
+# "buffer" is not "nothing is written". The write happens; only the flush is
+# left to the page cache. That is enforced on every path that acknowledges,
+# transactional or not (ADR 0011's rider), and not merely hoped for.
 #
 # There used to be a third level, "fdatasync". ADR 0010 removed it with no
 # alias: once the sync boundary moved from the block to the ack, the two

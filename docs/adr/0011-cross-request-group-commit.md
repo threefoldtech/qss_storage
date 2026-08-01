@@ -359,3 +359,114 @@ plus a new small-object A/B (4 KiB x N clients) as the regression pair.
 **Polish**
 - Config names `group_commit` / `group_commit_window`: proposed as
   written; renaming later is free until the first release ships them.
+
+---
+
+## Rider (implemented with this ADR): acked writes reach the kernel, and the durability level reaches every ack
+
+**This section is not about group commit.** It documents a separate
+durability fix that shipped in the same series, in its own commit, because
+it touches the same line of code this ADR touches -- the persist on the ack
+path. Read it as its own change.
+
+### Why it rode along
+
+Both changes live at the boundary between "the record is written" and "the
+client is told". This ADR moves WHERE that persist happens (one per group
+instead of one per request); the rider fixes WHICH WRITES GET ONE AT ALL.
+Reviewing them apart would have meant reading the same twenty lines twice
+with opposite questions in mind.
+
+### The finding that started it
+
+At `--durability buffer`, an acked `CompleteMultipartUpload` did not survive
+a `kill -9`: campaign findings **buffer-3/mp-94** and **mp-61**, reproduced
+as phase 7 cycle 7 **buffer-7/mp-68**. The pre-recovery corpse is preserved
+at `target/realtest/loss-snapshots-20260801T144750/buffer-cycle7`.
+
+The forensic one-liner, on that corpse: the acked object key
+`buffer-7/mp-68` appears **zero** times in the namespace journal
+(`store/db/0.jnl`), while `mp-67` appears once and later writes from other
+workers (`w1/74` .. `w4/74`) appear at the tail. In the blocks journal
+`mp-68` appears twice -- its `CreateMultipartUpload` record only -- against
+15 occurrences each for `mp-66` and `mp-67`. The store had rotated no
+journal (a single `0.jnl`), so absence is absence.
+
+The hypothesis that corpse suggested: the record died in fjall's userspace
+journal buffer and never reached `write()`, which would make our `buffer`
+contract ("the page cache decides", so process-kill survivable) false.
+
+### What the fjall 3.1.8 investigation actually found
+
+The hypothesis is **not supported**, and the contract was already met on
+every path:
+
+- `Writer::persist` (`journal/writer.rs:203`) ALWAYS flushes the journal's
+  8 KiB userspace `BufWriter` to the kernel first, then applies the mode.
+  `PersistMode::Buffer`'s mode step is `Ok(())`. So `persist(Buffer)` is
+  precisely "write to the OS, no fsync" -- the primitive we wanted, already
+  present.
+- Every fjall write path this codebase uses calls it. Transactions:
+  `FjallTransaction::commit` -> `commit_persist` -> `tx.commit()` +
+  `db.persist(durability)`. Bare tree writes:
+  `SingleWriterTxKeyspace::insert`/`remove` wrap themselves in a write
+  transaction whose durability fjall itself sets to `PersistMode::Buffer`.
+- Pinned empirically. `cas/ack_visibility_tests.rs` reads the journal files
+  off disk after a PUT, after a multipart complete, and after
+  `CreateBucket` / `CreateMultipartUpload`, and finds every acked record
+  there -- **before** the rider's change as well as after.
+
+So the buffer-loss mechanism remains **unexplained**, and this rider must
+not be sold as its fix. What it is: the search found a DIFFERENT, real
+defect one level up.
+
+### The defect this rider does fix
+
+At `fsync` durability, the ack-carrying writes that do NOT go through a
+transaction were never fsynced. They took fjall's internal
+`PersistMode::Buffer` unconditionally, and nothing afterwards applied the
+store's configured level:
+
+- `CreateBucket` (`MetaStore::insert_bucket`),
+- `CreateMultipartUpload` (`uploads::create_upload`),
+- `UploadPart`'s ETag (`CasFS::insert_multipart_part`),
+- respd's `SET` and `DEL`.
+
+A client that received an ETag for a part, or a 200 for a bucket, had a
+record that lived only in the page cache. A `kill -9` cannot see this --
+the page cache outlives the process -- which is exactly why ADR 0009's
+kill-only campaign never caught it. A power cut would have taken those
+acks, which makes it a violation of what `fsync` promises. Latent and
+unproven, and real by construction.
+
+### What changed
+
+`FjallTree::insert` and `FjallTree::remove` now persist at the store's
+durability before returning, through the same `TxDb::persist` the
+transactional commit uses. One place applies the level, and it is on every
+path that ends in an acknowledgement.
+
+Cost: one extra journal fsync per `UploadPart`, `CreateBucket`,
+`CreateMultipartUpload` and respd `SET`/`DEL`, at `fsync` only. At `buffer`
+it is a flush of a buffer that is already flushed -- free. Correct first;
+the way to make it cheap later is to extend this ADR's station to the
+non-transactional record writes, which is the same open question this ADR
+already defers for the namespace keyspaces.
+
+### Contract text, now true
+
+`metastore/traits.rs` and the `[store] durability` comment in
+`qss_storage.toml.example` used to say `buffer` meant "nothing is flushed
+and the page cache decides", which described an absence rather than a
+promise. Both now state the two levels as promises about an
+acknowledgement: `fsync` survives a power cut; `buffer` has reached the
+kernel, survives the process being killed, and is lost only to a power cut
+or an OS crash. `tests/real/phases/07-durability-matrix.sh` already said
+this ("a kill -9 is not power loss") and was left alone.
+
+### What is still open
+
+The buffer-loss finding itself. `write` visibility is ruled out as the
+mechanism, on both source and experiment, so the corpse needs a different
+explanation and the finding stays open. The in-tree tests above are the
+regression pin for the half that is now proven.

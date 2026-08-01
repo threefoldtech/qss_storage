@@ -183,9 +183,21 @@ pub trait Store: Send + Sync + Debug + 'static {
 
 /// `Durability` defines the durability guarantees for storage operations.
 ///
-/// Two levels, and only two (ADR 0010): `fsync`, where everything an ack
-/// covers is on stable storage before the ack goes out, and `buffer`, where
-/// nothing is flushed and the page cache decides.
+/// Two levels, and only two (ADR 0010). Both are promises about what an
+/// ACKNOWLEDGEMENT means, and the difference between them is one syscall:
+///
+/// - `fsync`: everything the ack covers is on stable storage before the ack
+///   goes out. Survives a power cut.
+/// - `buffer`: everything the ack covers has been handed to the KERNEL
+///   before the ack goes out -- written, not flushed. Survives the process
+///   being killed; lost only to a power cut or an OS crash.
+///
+/// `buffer` is not "nothing is written". The write happens; only the flush is
+/// left to the page cache. That distinction is the level's entire reason to
+/// exist, and it is enforced rather than hoped for: the fjall backend
+/// persists at the configured level on every path that ends in an
+/// acknowledgement, transactional or not (see `stores::fjall::TxDb::persist`,
+/// and the ADR 0011 rider for the gap that used to be there).
 ///
 /// The `try_from = "String"` deserialization routes the config file through
 /// the same [`FromStr`] the CLI flag uses, so `durability = "fsync"` in
@@ -208,14 +220,18 @@ pub trait Store: Send + Sync + Debug + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub enum Durability {
-    /// Data is buffered in memory and will be written to disk later.
-    /// This provides the highest performance but lowest durability.
+    /// Acknowledged writes have reached the kernel and nothing has been
+    /// flushed: they survive the process being killed, and are lost only to a
+    /// power cut or an OS crash. The fastest level, and the only one that
+    /// gives the page cache the last word.
     Buffer,
 
     /// Everything a request acknowledges is flushed to stable storage before
     /// the acknowledgement: block files (fdatasync plus the directory fsync
     /// that makes their renames durable) and then the metadata journal
-    /// (fjall `SyncAll`), once per batch.
+    /// (fjall `SyncAll`), once per batch -- and once more for the
+    /// non-transactional record writes an ack rides on, which is what the
+    /// ADR 0011 rider added.
     Fsync,
 }
 

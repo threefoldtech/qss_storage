@@ -24,6 +24,8 @@ mod uploads;
 pub(crate) mod write_path;
 
 #[cfg(test)]
+mod ack_visibility_tests;
+#[cfg(test)]
 pub(crate) mod crash_fixtures;
 #[cfg(test)]
 mod race_tests;

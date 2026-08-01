@@ -6,6 +6,19 @@
 //! real fjall write transaction, so a rollback discards them without touching
 //! the keyspace; the price is that only one writer may be in flight at a
 //! time.
+//!
+//! # Where the durability level is applied
+//!
+//! In exactly one place, [`TxDb::persist`], and on every path that ends in an
+//! acknowledgement: after a transaction commits, and after a bare tree
+//! `insert` or `remove`. The second half was missing until the ADR 0011
+//! rider, and the gap was invisible to a kill-based test: fjall persists its
+//! own journal writes with `PersistMode::Buffer` regardless of what the store
+//! was configured with, which reaches the kernel (so `kill -9` cannot take
+//! it) but never fsyncs (so a power cut can). Every ack-carrying write that
+//! did not go through a transaction -- `CreateBucket`,
+//! `CreateMultipartUpload`, `UploadPart`, respd's `SET` and `DEL` -- was
+//! therefore page-cache-only even at `fsync` durability.
 
 use std::collections::HashMap;
 use std::ops::RangeBounds;
@@ -37,10 +50,38 @@ impl TxDb {
         tx.commit()
             .map_err(|e| MetaError::TransactionError(e.to_string()))?;
 
+        self.persist()
+    }
+
+    /// Persists the journal at this store's configured durability.
+    ///
+    /// The one place a write becomes as durable as the ack about to be sent
+    /// claims. What each mode does, in fjall 3.1.8's journal writer
+    /// (`journal/writer.rs`), is worth stating because the distinction is the
+    /// whole contract:
+    ///
+    /// - both modes FIRST flush the journal's userspace `BufWriter` (8 KiB)
+    ///   with `write`, so the bytes are the kernel's and a process death
+    ///   cannot take them;
+    /// - `Buffer` stops there -- no fsync, the page cache decides when the
+    ///   platter sees it;
+    /// - `SyncAll` then fsyncs, so a power cut cannot take it either.
+    ///
+    /// That is exactly the two-level contract `Durability` promises, which is
+    /// why this is called on every path that acknowledges a write and not
+    /// only after transactions.
+    fn persist(&self) -> Result<(), MetaError> {
         self.db
             .persist(self.durability)
-            .map_err(|e| MetaError::PersistError(e.to_string()))?;
-        Ok(())
+            .map_err(|e| MetaError::PersistError(e.to_string()))
+    }
+
+    /// The persist mode this handle applies. Test-facing: it is how the
+    /// durability plumbing is pinned, since an fsync leaves nothing an
+    /// in-process assertion can look at.
+    #[cfg(test)]
+    pub(crate) fn durability(&self) -> fjall::PersistMode {
+        self.durability
     }
 }
 
@@ -281,12 +322,30 @@ impl FjallTree {
 }
 
 impl BaseMetaTree for FjallTree {
+    /// # Durability
+    ///
+    /// Persisted at the store's durability before returning, because callers
+    /// acknowledge on the strength of this returning `Ok`: `CreateBucket`,
+    /// `CreateMultipartUpload`, `UploadPart`'s ETag and respd's `SET` all
+    /// come through here rather than through a transaction.
+    ///
+    /// Without that persist these writes took whatever fjall does internally
+    /// -- `PersistMode::Buffer`, unconditionally -- so at `fsync` durability
+    /// an acked `UploadPart` was page-cache-only and a power cut could take
+    /// it back. A `kill -9` cannot see that (the page cache outlives the
+    /// process), which is why the ADR 0009 campaign never caught it.
     fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), MetaError> {
         self.partition
             .insert(key, value)
-            .map_err(|e| MetaError::OtherDBError(e.to_string()))
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+        self.db.persist()
     }
 
+    /// # Durability
+    ///
+    /// Persisted at the store's durability before returning; see
+    /// [`insert`](Self::insert). A removal a client was told succeeded --
+    /// respd's `DEL` -- must not come back.
     fn remove(&self, key: &[u8]) -> Result<bool, MetaError> {
         // fjall's remove does not say whether the key was there, so the
         // existence is probed first; the two ops are not one transaction,
@@ -298,6 +357,7 @@ impl BaseMetaTree for FjallTree {
         self.partition
             .remove(key)
             .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+        self.db.persist()?;
         Ok(existed)
     }
 
@@ -641,6 +701,87 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("locked by another process"), "{msg}");
         assert!(msg.contains("daemon"), "{msg}");
+    }
+
+    /// Every byte of every journal file of the store at `dir`, read through
+    /// the filesystem -- what the KERNEL has, not what the process thinks it
+    /// wrote. A record still in fjall's `BufWriter` is not in here.
+    fn journal_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "jnl") {
+                out.extend_from_slice(&std::fs::read(&path).unwrap());
+            }
+        }
+        out
+    }
+
+    /// A bare tree write is on the kernel's side of the buffer when it
+    /// returns, at both durability levels.
+    ///
+    /// The ADR 0011 rider's pin at the layer the rider changed. `insert` and
+    /// `remove` are the ack-carrying non-transactional surface --
+    /// `CreateBucket`, `CreateMultipartUpload`, `UploadPart`, respd's `SET`
+    /// and `DEL` -- and what a client is told about them has to be true of
+    /// the file on disk, not of a userspace buffer.
+    ///
+    /// Observable in-process precisely because `buffer` is a `write` and not
+    /// an fsync: nothing has to crash for the bytes to be visible through the
+    /// filesystem. The fsync half of `Fsync` is NOT observable this way and
+    /// is pinned separately, by the mode assertion below.
+    #[test]
+    fn a_bare_tree_write_reaches_the_kernel_before_it_returns() {
+        for durability in [Durability::Buffer, Durability::Fsync] {
+            let dir = tempdir().unwrap();
+            let store = FjallStore::new(dir.path().to_path_buf(), Some(1), Some(durability))
+                .expect("the store must open");
+            let tree = store.tree_open("acked").unwrap();
+
+            tree.insert(b"a-key-a-client-was-told-about", b"value".to_vec())
+                .unwrap();
+
+            let journal = journal_bytes(dir.path());
+            let needle = b"a-key-a-client-was-told-about";
+            assert!(
+                journal.windows(needle.len()).any(|w| w == needle),
+                "{durability}: an acked bare write is not in the journal on \
+                 disk -- it is in a userspace buffer a kill would take"
+            );
+
+            // The same for the removal side: a DEL a client was told
+            // succeeded must not come back.
+            tree.insert(b"a-key-that-goes-away", b"value".to_vec())
+                .unwrap();
+            tree.remove(b"a-key-that-goes-away").unwrap();
+            let journal = journal_bytes(dir.path());
+            let needle = b"a-key-that-goes-away";
+            assert!(
+                journal.windows(needle.len()).any(|w| w == needle),
+                "{durability}: the removal is not in the journal on disk"
+            );
+        }
+    }
+
+    /// The configured level really is the persist mode the store applies.
+    ///
+    /// The half of the contract no in-process assertion can observe: an
+    /// fsync leaves nothing behind to look at, so what is pinned is that
+    /// `fsync` plumbs through to fjall's `SyncAll` and `buffer` to its
+    /// `Buffer`. Beyond this line the trust boundary is fjall's journal
+    /// writer, which flushes its `BufWriter` and then applies the mode --
+    /// `SyncAll` fsyncs, `Buffer` returns.
+    #[test]
+    fn the_configured_durability_is_the_persist_mode() {
+        for (durability, expected) in [
+            (Durability::Buffer, fjall::PersistMode::Buffer),
+            (Durability::Fsync, fjall::PersistMode::SyncAll),
+        ] {
+            let dir = tempdir().unwrap();
+            let store =
+                FjallStore::new(dir.path().to_path_buf(), Some(1), Some(durability)).unwrap();
+            assert_eq!(store.db().durability(), expected, "{durability}");
+        }
     }
 
     /// Dropping the holder releases the lock, so the refusal above is about
