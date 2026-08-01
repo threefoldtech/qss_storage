@@ -437,6 +437,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .unwrap();
         (fs, dir)

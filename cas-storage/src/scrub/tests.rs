@@ -33,6 +33,7 @@ pub(super) fn store(dir: &TempDir) -> (Arc<SharedBlockStore>, CasFS) {
             None,
             None,
             None,
+            None,
         )
         .unwrap(),
     );
@@ -500,6 +501,7 @@ fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
     let blocks_db = root.join("blocks").join(BLOCKS_DB_DIR_NAME);
@@ -542,6 +544,7 @@ fn the_db_fanout_directory_is_walked_like_any_other() {
         Some(Durability::Buffer),
         None,
         false,
+        None,
         None,
         None,
     )
@@ -587,6 +590,7 @@ fn a_legacy_blocks_db_is_refused_not_shadowed() {
         Some(Durability::Buffer),
         None,
         false,
+        None,
         None,
         None,
     ) else {

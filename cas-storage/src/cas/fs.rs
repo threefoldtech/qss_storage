@@ -158,10 +158,11 @@ impl CasFS {
     /// [`HeaderSpec::default`].
     ///
     /// `verify_on_read` is passed straight to [`CasFS::new`], and
-    /// `stripe_count` and `max_blocks_per_commit` straight to
+    /// `stripe_count`, `max_blocks_per_commit` and `group_commit` straight to
     /// [`SharedBlockStore::new`] (`None` takes the built-in defaults;
-    /// `config::DEFAULT_STRIPE_COUNT` and
-    /// `config::DEFAULT_MAX_BLOCKS_PER_COMMIT` name them).
+    /// `config::DEFAULT_STRIPE_COUNT`,
+    /// `config::DEFAULT_MAX_BLOCKS_PER_COMMIT` and
+    /// `config::DEFAULT_GROUP_COMMIT` name them).
     ///
     /// # One process, one store
     ///
@@ -184,6 +185,7 @@ impl CasFS {
         verify_on_read: bool,
         stripe_count: Option<usize>,
         max_blocks_per_commit: Option<usize>,
+        group_commit: Option<crate::cas::GroupCommit>,
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
@@ -194,6 +196,7 @@ impl CasFS {
             spec,
             stripe_count,
             max_blocks_per_commit,
+            group_commit,
         )?);
         Self::new(
             meta_path,
@@ -615,6 +618,7 @@ mod tests {
             verify_on_read,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(fs.hasher(), hasher, "store must open with the asked hasher");
@@ -670,6 +674,7 @@ mod tests {
             Some(1),
             Some(Durability::Buffer),
             Some(HeaderSpec::from(hasher)),
+            None,
             None,
             None,
         )
@@ -815,6 +820,7 @@ mod tests {
             false,
             Some(1),
             None,
+            None,
         )
         .unwrap();
 
@@ -847,6 +853,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!Arc::ptr_eq(
@@ -868,6 +875,7 @@ mod tests {
                 StorageEngine::Fjall,
                 Some(1),
                 Some(Durability::Buffer),
+                None,
                 None,
                 None,
                 None,

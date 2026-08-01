@@ -123,7 +123,7 @@ impl Drop for BlockWriteGuard {
 }
 
 /// What one distinct block of a batch still needs doing to it.
-enum Payload {
+pub(super) enum Payload {
     /// Its bytes are in a temp file already: the batch syncs, renames and
     /// records it.
     Staged(StagedBlock),
@@ -143,21 +143,21 @@ enum Payload {
 
 /// One distinct block id in the accumulator, with every reference this
 /// request adds to it.
-struct BatchEntry {
-    id: BlockId,
+pub(super) struct BatchEntry {
+    pub(super) id: BlockId,
     /// Length of the block, for the record.
-    len: usize,
+    pub(super) len: usize,
     /// References this request adds: one per occurrence in the object. A
     /// block naming itself twice in one part holds two references, exactly
     /// as it would across two requests.
-    occurrences: usize,
-    payload: Payload,
+    pub(super) occurrences: usize,
+    pub(super) payload: Payload,
     /// Fanout depth, once a file for the block has been placed by THIS
     /// request. `None` while the block is a dedup hit whose file is already
     /// on disk under some other depth, which the live record names.
-    depth: Option<u8>,
+    pub(super) depth: Option<u8>,
     /// Resolved when the entry is accounted for, or on the way out.
-    guard: Option<BlockWriteGuard>,
+    pub(super) guard: Option<BlockWriteGuard>,
 }
 
 /// The blocks of the request that have not been committed yet (ADR 0010).
@@ -236,11 +236,11 @@ fn abandon(shared: &SharedBlockStore, entries: Vec<BatchEntry>) {
 /// What the blocking half of a flush did, so the async half can move the
 /// metrics without holding anything across the commit.
 #[derive(Default)]
-struct FlushOutcome {
+pub(super) struct FlushOutcome {
     /// Blocks whose file this batch put on disk.
-    written: usize,
+    pub(super) written: usize,
     /// Blocks that deduped against a record already there.
-    ignored: usize,
+    pub(super) ignored: usize,
 }
 
 /// Resolves one arriving chunk into the batch: an occurrence of something it
@@ -336,7 +336,7 @@ fn resolve_chunk(
 ///
 /// Degraded records (ADR 0005) count as absent: their file is gone, so
 /// deduplicating against one would commit another damaged object.
-fn has_live_record(shared: &SharedBlockStore, id: &BlockId) -> io::Result<bool> {
+pub(super) fn has_live_record(shared: &SharedBlockStore, id: &BlockId) -> io::Result<bool> {
     let record = shared
         .block_tree()
         .get_block(id.as_slice())
@@ -359,6 +359,16 @@ fn has_live_record(shared: &SharedBlockStore, id: &BlockId) -> io::Result<bool> 
 ///    single blocking closure that OWNS the stripes. That is what makes the
 ///    stretch uncancellable (hard rule 4) and what keeps the fjall
 ///    transaction on one thread with no await inside it (hard rule 3).
+///
+/// # The one branch ADR 0011 added
+///
+/// Stage 3 is either done here, by this request, exactly as ADR 0010 wrote
+/// it -- or handed to the store's commit station, which does the same three
+/// things for several requests at once and wakes each with its own outcome.
+/// Stages 1 and 2 are identical either way, which is the promise ADR 0010
+/// made when it shaped the batch API ("that ADR is additive and touches no
+/// callers"). With no station configured, the code below this branch is the
+/// 0010 close byte for byte.
 async fn flush_batch(fs: &CasFS, batch: &mut BlockBatch) -> io::Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -383,6 +393,34 @@ async fn flush_batch(fs: &CasFS, batch: &mut BlockBatch) -> io::Result<()> {
         return Err(e);
     }
 
+    let outcome = match fs.shared.commit_station() {
+        // Sealed: its data is durable and it is nobody's request any more
+        // until the committer says so. Parking here is cancel-safe -- the
+        // group commits whatever happens to this future, because the station
+        // owns the batch now.
+        Some(station) => station.close(entries, fs.metrics.clone()).await?,
+        None => close_alone(fs, entries).await?,
+    };
+
+    for _ in 0..outcome.ignored {
+        fs.metrics.block_ignored();
+    }
+    tracing::debug!(
+        written = outcome.written,
+        deduped = outcome.ignored,
+        "Batch committed"
+    );
+    Ok(())
+}
+
+/// The ADR 0010 close: this request's batch, closed by this request.
+///
+/// What `flush_batch` did in full before ADR 0011 split the last step out,
+/// and what it still does whenever no commit station is configured. The
+/// station's degrade path does NOT come back through here -- a degraded
+/// member replays its transaction under the group's stripes, which it
+/// already holds (see `group_commit::close_group`).
+async fn close_alone(fs: &CasFS, entries: Vec<BatchEntry>) -> io::Result<FlushOutcome> {
     let ids: Vec<BlockId> = entries.iter().map(|entry| entry.id).collect();
     let stripes = fs.shared.stripes().lock_batch(&ids).await;
 
@@ -399,26 +437,14 @@ async fn flush_batch(fs: &CasFS, batch: &mut BlockBatch) -> io::Result<()> {
     })
     .await;
 
-    let outcome = match joined {
-        Ok(result) => result?,
+    match joined {
+        Ok(result) => result,
         // The closure panicked; every guard went with it, and
         // BlockWriteGuard's Drop counted its block as dropped.
-        Err(join_err) => {
-            return Err(io::Error::other(format!(
-                "block batch task did not complete: {join_err}"
-            )));
-        }
-    };
-
-    for _ in 0..outcome.ignored {
-        fs.metrics.block_ignored();
+        Err(join_err) => Err(io::Error::other(format!(
+            "block batch task did not complete: {join_err}"
+        ))),
     }
-    tracing::debug!(
-        written = outcome.written,
-        deduped = outcome.ignored,
-        "Batch committed"
-    );
-    Ok(())
 }
 
 /// The blocking half of a flush: the stripes are held, the files land, the
@@ -527,7 +553,7 @@ fn commit_batch(
 /// Separate from [`abandon`] because by this point the files have been
 /// renamed into place: there is nothing left to unlink, only the metric to
 /// tell the truth about.
-fn abandon_after_landing(entries: Vec<BatchEntry>) {
+pub(super) fn abandon_after_landing(entries: Vec<BatchEntry>) {
     for mut entry in entries {
         if let Some(guard) = entry.guard.take() {
             guard.failed();
@@ -543,7 +569,17 @@ fn abandon_after_landing(entries: Vec<BatchEntry>) {
 /// ADR 0008's rc exactness a property of the primitives rather than of the
 /// caller. Every occurrence past the first is a bump, because every
 /// reference is a reference.
-fn record_entry(tx: &mut Transaction, entry: &BatchEntry) -> Result<bool, MetaError> {
+///
+/// # Why this is also the CROSS-MEMBER merge (ADR 0011)
+///
+/// Nothing here knows whose entry it is holding. Call it for member A's
+/// entry for block X and then for member B's entry for the same X inside one
+/// transaction, and the second call's `bump_block_rc` reads the first call's
+/// uncommitted insert: one insert, one bump, rc exact. That is why the group
+/// closer merges strangers by doing nothing special -- the merge is a
+/// property of the primitives, which is the same reason it was already a
+/// property within one request.
+pub(super) fn record_entry(tx: &mut Transaction, entry: &BatchEntry) -> Result<bool, MetaError> {
     let mut remaining = entry.occurrences;
     let inserted = if tx.bump_block_rc(entry.id)?.is_none() {
         let depth = entry.depth.expect(
@@ -790,6 +826,16 @@ mod tests {
         cap: Option<usize>,
         ops: Option<Arc<dyn BlockDiskOps>>,
     ) -> (Arc<SharedBlockStore>, CasFS) {
+        store_with_cap_and_station(dir, cap, ops, None)
+    }
+
+    /// The same, with a commit station (ADR 0011) if one is asked for.
+    fn store_with_cap_and_station(
+        dir: &Path,
+        cap: Option<usize>,
+        ops: Option<Arc<dyn BlockDiskOps>>,
+        group_commit: Option<crate::cas::GroupCommit>,
+    ) -> (Arc<SharedBlockStore>, CasFS) {
         let mut shared = SharedBlockStore::new(
             dir.join("meta/blocks"),
             dir.join("blocks"),
@@ -799,6 +845,7 @@ mod tests {
             None,
             None,
             cap,
+            group_commit,
         )
         .unwrap();
         if let Some(ops) = ops {
@@ -1424,6 +1471,7 @@ mod tests {
                     None,
                     None,
                     Some(cap),
+                    None,
                 )
                 .unwrap(),
             );

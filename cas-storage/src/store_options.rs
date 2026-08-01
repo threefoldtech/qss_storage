@@ -8,8 +8,10 @@
 //! calls it. The flag definitions themselves stay with each binary's clap
 //! parser; only the merge is shared.
 
+use crate::cas::GroupCommit;
 use crate::config::{
-    ConfigError, DEFAULT_DURABILITY, DEFAULT_METADATA_DB, DEFAULT_VERIFY_ON_READ, StoreConfig,
+    ConfigError, DEFAULT_DURABILITY, DEFAULT_GROUP_COMMIT, DEFAULT_GROUP_COMMIT_WINDOW,
+    DEFAULT_METADATA_DB, DEFAULT_VERIFY_ON_READ, StoreConfig, parse_group_commit_window,
     validate_max_blocks_per_commit, validate_stripe_count,
 };
 use crate::{Durability, Hasher, HeaderSpec, StorageEngine};
@@ -42,6 +44,15 @@ pub struct StoreOptions {
     /// something a one-off CLI invocation has an opinion about. Like
     /// `stripe_count` it is a property of the process, not of the store.
     pub max_blocks_per_commit: Option<usize>,
+    /// The commit station this process runs, or `None` for the ADR 0010
+    /// write path (ADR 0011). Config-file only, like the batch cap.
+    ///
+    /// `Some` only when `store.group_commit` is true; the window it carries
+    /// is `store.group_commit_window` already parsed, so nothing downstream
+    /// re-reads a string. Another property of the process rather than of the
+    /// store: two processes may open one store with different stations, or
+    /// with none.
+    pub group_commit: Option<GroupCommit>,
 }
 
 impl StoreOptions {
@@ -76,6 +87,17 @@ impl StoreOptions {
         if let Some(cap) = store.max_blocks_per_commit {
             validate_max_blocks_per_commit(cap)?;
         }
+        // The window is parsed whether or not the station is on, so a typo in
+        // it is reported at startup rather than lying dormant until someone
+        // flips group_commit and gets a different error entirely.
+        let window = match store.group_commit_window.as_deref() {
+            Some(text) => parse_group_commit_window(text)?,
+            None => DEFAULT_GROUP_COMMIT_WINDOW,
+        };
+        let group_commit = store
+            .group_commit
+            .unwrap_or(DEFAULT_GROUP_COMMIT)
+            .then_some(GroupCommit { window });
         Ok(Self {
             metadata_db: metadata_db
                 .or(store.metadata_db)
@@ -88,6 +110,7 @@ impl StoreOptions {
             hasher: store.hash.hasher()?,
             stripe_count,
             max_blocks_per_commit: store.max_blocks_per_commit,
+            group_commit,
         })
     }
 
@@ -119,6 +142,72 @@ mod tests {
         // constant stays the single source of truth.
         assert_eq!(opts.stripe_count, None);
         assert_eq!(opts.max_blocks_per_commit, None);
+        assert_eq!(
+            opts.group_commit, None,
+            "a store nothing configures runs the ADR 0010 write path"
+        );
+    }
+
+    /// Group commit is a file-only knob, off unless asked for, and its window
+    /// is parsed once here rather than carried as a string into the store.
+    #[test]
+    fn group_commit_resolves_from_the_file_and_is_off_by_default() {
+        let off = store_config("[store]\n");
+        assert_eq!(
+            StoreOptions::resolve(None, None, None, None, &off)
+                .unwrap()
+                .group_commit,
+            None
+        );
+
+        // A window with no station is not a station.
+        let windowed_but_off = store_config("[store]\ngroup_commit_window = \"2ms\"\n");
+        assert_eq!(
+            StoreOptions::resolve(None, None, None, None, &windowed_but_off)
+                .unwrap()
+                .group_commit,
+            None,
+            "the window alone must not turn the station on"
+        );
+
+        // On, with the default window: natural batching, no timer.
+        let on = store_config("[store]\ngroup_commit = true\n");
+        assert_eq!(
+            StoreOptions::resolve(None, None, None, None, &on)
+                .unwrap()
+                .group_commit,
+            Some(GroupCommit {
+                window: std::time::Duration::ZERO
+            })
+        );
+
+        // On, with a window.
+        let tuned = store_config("[store]\ngroup_commit = true\ngroup_commit_window = \"250us\"\n");
+        assert_eq!(
+            StoreOptions::resolve(None, None, None, None, &tuned)
+                .unwrap()
+                .group_commit,
+            Some(GroupCommit {
+                window: std::time::Duration::from_micros(250)
+            })
+        );
+    }
+
+    /// An unusable window is refused here too, for the same reason the batch
+    /// cap is: a caller may have built the `StoreConfig` in code without
+    /// going past the parse-time check.
+    #[test]
+    fn an_unusable_window_is_refused_at_resolve() {
+        let bad = StoreConfig {
+            group_commit: Some(true),
+            group_commit_window: Some("whenever".to_string()),
+            ..StoreConfig::default()
+        };
+        let err = StoreOptions::resolve(None, None, None, None, &bad).unwrap_err();
+        assert!(
+            err.to_string().contains("group_commit_window"),
+            "message must name the setting: {err}"
+        );
     }
 
     /// The batch cap has no flag, so the file is the only place it can come

@@ -90,6 +90,23 @@ pub const MAX_STRIPE_COUNT: usize = crate::cas::stripes::MAX_STRIPE_COUNT;
 pub const DEFAULT_MAX_BLOCKS_PER_COMMIT: usize =
     crate::cas::write_path::DEFAULT_MAX_BLOCKS_PER_COMMIT;
 
+/// Cross-request group commit (ADR 0011) is OFF unless an operator asks for
+/// it.
+///
+/// Grouping strangers couples their fates and widens what one commit carries.
+/// A store that never sets this runs the ADR 0010 write path byte for byte.
+pub const DEFAULT_GROUP_COMMIT: bool = false;
+
+/// Extra wait a commit station spends gathering members after the first one
+/// arrives (ADR 0011), when nothing configures one.
+///
+/// Zero, and zero means the timer does not exist: groups form by natural
+/// batching alone (whatever queued while the previous group was committing),
+/// so an uncontended request finds the committer idle and commits
+/// immediately. A non-zero window trades lone-ack latency for group size and
+/// is for operators who measured, not for everyone.
+pub const DEFAULT_GROUP_COMMIT_WINDOW: std::time::Duration = std::time::Duration::ZERO;
+
 /// Address the S3 server binds by default.
 pub const DEFAULT_S3_HOST: &str = "localhost";
 
@@ -191,6 +208,25 @@ pub struct StoreConfig {
     /// the journal fsync over more blocks. Not written to disk and not a
     /// format -- two processes may open one store with different caps.
     pub max_blocks_per_commit: Option<usize>,
+    /// Merge the closing step of CONCURRENT requests into one transaction
+    /// with one journal persist (ADR 0011). Absent means
+    /// [`DEFAULT_GROUP_COMMIT`], which is `false`.
+    ///
+    /// Off, the write path is ADR 0010's byte for byte. On, a request's
+    /// batch is handed to a per-store commit station instead of closing
+    /// itself, and the committer merges whatever is queued -- up to the SAME
+    /// [`StoreConfig::max_blocks_per_commit`] cap, which stays the one and
+    /// only bound on transaction size, stripe hold and crash residue.
+    pub group_commit: Option<bool>,
+    /// Extra bounded wait the commit station spends gathering members after
+    /// the FIRST one arrives, as a duration string (`"0ms"`, `"250us"`,
+    /// `"2ms"`). Absent means [`DEFAULT_GROUP_COMMIT_WINDOW`], which is zero.
+    ///
+    /// Zero means the timer does not exist: groups are whatever natural
+    /// batching delivered while the previous group committed, so a lone
+    /// request adds no latency at all. Ignored entirely when
+    /// [`StoreConfig::group_commit`] is off.
+    pub group_commit_window: Option<String>,
 }
 
 /// Refuses a stripe count the store cannot honour as written.
@@ -234,6 +270,29 @@ pub fn validate_max_blocks_per_commit(cap: usize) -> Result<(), ConfigError> {
         return Err(ConfigError::UnsupportedMaxBlocksPerCommit(cap));
     }
     Ok(())
+}
+
+/// Parses a `group_commit_window` string into the wait it names (ADR 0011).
+///
+/// humantime spelling, so `"0ms"`, `"500us"`, `"2ms"` and `"1s"` all mean
+/// what they read as. A unit is REQUIRED: a bare `"0"` is refused rather than
+/// guessed at, because the difference between 0 seconds and 0 milliseconds is
+/// nothing but the difference between 1 and 1 is everything, and a config that
+/// silently picked a unit would be a footgun the first time someone wrote
+/// `group_commit_window = "1"`.
+///
+/// There is no upper bound to enforce. A window longer than a request's
+/// patience is an operator's own mistake to make and to measure; the value
+/// this function refuses is the one that cannot be a duration at all.
+///
+/// # Errors
+///
+/// [`ConfigError::UnsupportedGroupCommitWindow`] naming the offending value.
+pub fn parse_group_commit_window(window: &str) -> Result<std::time::Duration, ConfigError> {
+    humantime::parse_duration(window).map_err(|e| ConfigError::UnsupportedGroupCommitWindow {
+        value: window.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// The `[store.hash]` table: which hash addresses this store's blocks.
@@ -409,6 +468,9 @@ pub fn parse(text: &str, path: &Path) -> Result<QssStorageConfig, ConfigError> {
     if let Some(cap) = config.store.max_blocks_per_commit {
         validate_max_blocks_per_commit(cap)?;
     }
+    if let Some(window) = config.store.group_commit_window.as_deref() {
+        parse_group_commit_window(window)?;
+    }
     Ok(config)
 }
 
@@ -440,6 +502,13 @@ pub enum ConfigError {
     UnsupportedStripeCount(usize),
     /// `store.max_blocks_per_commit` is zero.
     UnsupportedMaxBlocksPerCommit(usize),
+    /// `store.group_commit_window` is not a duration.
+    UnsupportedGroupCommitWindow {
+        /// What the file said.
+        value: String,
+        /// Why it is not a duration, in humantime's words.
+        reason: String,
+    },
 }
 
 impl Display for ConfigError {
@@ -478,6 +547,13 @@ impl Display for ConfigError {
                   closes; write 1 for one commit per block, the pre-ADR-0010 \
                   cadence)"
             ),
+            ConfigError::UnsupportedGroupCommitWindow { value, reason } => write!(
+                f,
+                "unusable group commit window \"{value}\" in \
+                 store.group_commit_window: {reason} (expected a duration \
+                 with a unit, such as \"0ms\", \"250us\" or \"2ms\"; \"0ms\" \
+                 is the default and means no timer at all)"
+            ),
         }
     }
 }
@@ -502,6 +578,8 @@ metadata_db = "fjall"
 verify_on_read = true
 stripe_count = 4096
 max_blocks_per_commit = 32
+group_commit = true
+group_commit_window = "250us"
 
 [store.hash]
 algo = "blake3"
@@ -541,6 +619,12 @@ admin_password = "hunter2"
         assert_eq!(config.store.verify_on_read, Some(true));
         assert_eq!(config.store.stripe_count, Some(4096));
         assert_eq!(config.store.max_blocks_per_commit, Some(32));
+        assert_eq!(config.store.group_commit, Some(true));
+        assert_eq!(
+            config.store.group_commit_window.as_deref(),
+            Some("250us"),
+            "the window is kept as written and parsed once, at resolve"
+        );
         assert_eq!(config.store.hash.algo.as_deref(), Some("blake3"));
         assert_eq!(config.store.hash.width, Some(16));
         assert_eq!(config.store.hash.hasher().unwrap(), Hasher::Blake3W16);
@@ -581,6 +665,17 @@ admin_password = "hunter2"
         assert_eq!(
             config.store.max_blocks_per_commit,
             Some(DEFAULT_MAX_BLOCKS_PER_COMMIT)
+        );
+        assert_eq!(config.store.group_commit, Some(DEFAULT_GROUP_COMMIT));
+        assert_eq!(
+            config
+                .store
+                .group_commit_window
+                .as_deref()
+                .map(parse_group_commit_window)
+                .transpose()
+                .expect("the example's window must parse"),
+            Some(DEFAULT_GROUP_COMMIT_WINDOW)
         );
         assert_eq!(config.store.hash.algo.as_deref(), Some(DEFAULT_HASH_ALGO));
         assert_eq!(config.store.hash.width, Some(DEFAULT_HASH_WIDTH));
@@ -632,6 +727,8 @@ admin_password = "hunter2"
         assert_eq!(config.store.inline_metadata_size, None);
         assert_eq!(config.store.stripe_count, None);
         assert_eq!(config.store.max_blocks_per_commit, None);
+        assert_eq!(config.store.group_commit, None);
+        assert_eq!(config.store.group_commit_window, None);
         assert_eq!(config.store.hash.width, None);
         assert_eq!(config.resp.as_ref().unwrap().host, None);
         assert_eq!(config.resp.as_ref().unwrap().data_dir, None);
@@ -793,6 +890,69 @@ admin_password = "hunter2"
         );
         validate_max_blocks_per_commit(DEFAULT_MAX_BLOCKS_PER_COMMIT)
             .expect("the built-in default must itself be a legal value");
+    }
+
+    /// The window is a duration with a unit, refused at parse time when it is
+    /// not one -- next to the file that holds it, as every other store knob
+    /// is.
+    #[test]
+    fn a_group_commit_window_that_is_not_a_duration_is_an_error() {
+        let err = parse_str("[store]\ngroup_commit_window = \"soon\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("soon"), "message must name the value: {msg}");
+        assert!(
+            msg.contains("group_commit_window"),
+            "message must name the setting: {msg}"
+        );
+        assert!(
+            msg.contains("0ms"),
+            "message must show a value that works: {msg}"
+        );
+    }
+
+    /// A bare number is refused rather than guessed at. `"1"` could be a
+    /// second or a microsecond and the difference is six orders of magnitude
+    /// of ack latency, so the parser makes the operator say which.
+    #[test]
+    fn a_unitless_window_is_refused() {
+        assert!(parse_str("[store]\ngroup_commit_window = \"1\"\n").is_err());
+    }
+
+    /// Zero is a value, not an absence: it is how the timer is turned off,
+    /// and it must be spellable.
+    #[test]
+    fn the_window_spellings_that_must_work() {
+        for (text, expected) in [
+            ("0ms", std::time::Duration::ZERO),
+            ("0s", std::time::Duration::ZERO),
+            ("250us", std::time::Duration::from_micros(250)),
+            ("2ms", std::time::Duration::from_millis(2)),
+            ("1s", std::time::Duration::from_secs(1)),
+        ] {
+            let config = parse_str(&format!("[store]\ngroup_commit_window = \"{text}\"\n"))
+                .unwrap_or_else(|e| panic!("{text} must parse: {e}"));
+            assert_eq!(
+                parse_group_commit_window(config.store.group_commit_window.as_deref().unwrap())
+                    .unwrap(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    /// Group commit is off unless the file says otherwise, and `false` is
+    /// distinguishable from absent -- an operator who writes it out
+    /// explicitly gets the same behaviour, not a different code path.
+    #[test]
+    fn group_commit_is_off_by_default_and_false_is_a_value() {
+        // The ADR 0011 default is off, with no timer.
+        const { assert!(!DEFAULT_GROUP_COMMIT) };
+        assert_eq!(DEFAULT_GROUP_COMMIT_WINDOW, std::time::Duration::ZERO);
+
+        let config = parse_str("[store]\ngroup_commit = false\n").unwrap();
+        assert_eq!(config.store.group_commit, Some(false));
+        let config = parse_str("[store]\n").unwrap();
+        assert_eq!(config.store.group_commit, None);
     }
 
     /// The configured default and the one the store actually uses are one

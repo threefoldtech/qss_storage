@@ -152,6 +152,8 @@ pub async fn check_integrity(args: CheckConfig, store: StoreOptions) -> Result<(
         false,
         store.stripe_count,
         store.max_blocks_per_commit,
+        // No commit station (ADR 0011): this command only reads.
+        None,
     )?;
 
     let Some((obj_meta, paths)) = casfs.get_object_paths(&args.bucket, &args.key)? else {
@@ -240,6 +242,7 @@ mod tests {
             hasher: Hasher::Blake3W32,
             stripe_count: None,
             max_blocks_per_commit: None,
+            group_commit: None,
         }
     }
 
@@ -255,6 +258,7 @@ mod tests {
             false,
             opts.stripe_count,
             opts.max_blocks_per_commit,
+            opts.group_commit,
         )
         .unwrap()
     }

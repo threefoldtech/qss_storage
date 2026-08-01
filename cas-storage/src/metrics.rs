@@ -24,6 +24,26 @@ pub trait MetricsCollector: Send + Sync {
 
     /// The blocking closure completed (success or failure alike).
     fn block_disk_op_finished(&self) {}
+
+    /// One commit station group closed (ADR 0011): one transaction, one
+    /// journal persist, carrying `members` requests' batches.
+    ///
+    /// The counter PAIR is the point. `members / groups` is the mean group
+    /// size -- the number that says whether merging is happening at all --
+    /// and `groups` alone is the write-path persist rate the ADR exists to
+    /// bring down. Neither is meaningful without the other, so they are
+    /// reported together and derived at query time.
+    ///
+    /// Default no-op so existing collectors keep compiling.
+    fn group_committed(&self, _members: u64) {}
+
+    /// A group whose shared transaction failed and was replayed member by
+    /// member, so one bad member failed alone.
+    ///
+    /// Not an error counter: this firing is the isolation working. Sustained
+    /// growth is the signal, because it means something is failing every
+    /// group it lands in.
+    fn group_commit_degraded(&self) {}
 }
 
 /// No-op metrics collector (default)
@@ -83,6 +103,14 @@ impl SharedMetrics {
 
     pub fn block_disk_op_finished(&self) {
         self.0.block_disk_op_finished();
+    }
+
+    pub fn group_committed(&self, members: u64) {
+        self.0.group_committed(members);
+    }
+
+    pub fn group_commit_degraded(&self) {
+        self.0.group_commit_degraded();
     }
 }
 

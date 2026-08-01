@@ -31,6 +31,7 @@
 //!     false,               // verify_on_read
 //!     None,                // stripe count (defaults to 1024)
 //!     None,                // blocks per commit (defaults to 64)
+//!     None,                // group commit (ADR 0011; defaults to off)
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())
@@ -57,6 +58,7 @@
 //!     None,                // header spec (defaults to blake3/32)
 //!     None,                // stripe count (defaults to 1024)
 //!     None,                // blocks per commit (defaults to 64)
+//!     None,                // group commit (ADR 0011; defaults to off)
 //! )?);
 //!
 //! // One CasFS per namespace (e.g. per user)
@@ -127,6 +129,10 @@ pub use cas::{
     // Streaming and utilities
     BLOCKS_DB_DIR_NAME,
     CasFS,
+    // Cross-request group commit (ADR 0011): how a store runs its commit
+    // station, and what that station has done
+    GroupCommit,
+    GroupCommitStats,
     SharedBlockStore,
     StorageEngine,
     // Stale-upload GC (ADR 0003): what one sweep did, and the sweep itself

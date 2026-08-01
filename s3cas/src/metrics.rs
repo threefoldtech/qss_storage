@@ -93,6 +93,12 @@ impl cas_storage::MetricsCollector for CasMetricsAdapter {
     fn block_disk_op_finished(&self) {
         self.0.block_disk_op_finished()
     }
+    fn group_committed(&self, members: u64) {
+        self.0.group_committed(members)
+    }
+    fn group_commit_degraded(&self) {
+        self.0.group_commit_degraded()
+    }
 }
 
 impl SharedMetrics {
@@ -116,6 +122,9 @@ pub struct Metrics {
     data_block_disk_ops_inflight: IntGauge,
     multipart_uploads_reaped: IntCounter,
     multipart_orphan_parts_reaped: IntCounter,
+    group_commits: IntCounter,
+    group_commit_members: IntCounter,
+    group_commits_degraded: IntCounter,
 }
 
 // TODO: this can be improved, make sure this does not crash on multiple instances;
@@ -201,6 +210,27 @@ impl Metrics {
         )
         .expect("can register an int counter in the default registry");
 
+        // The counter PAIR ADR 0011 asks for: divide the second by the first
+        // for the mean group size. Separately, the first IS the write path's
+        // blocks-DB persist rate, which is the number the ADR set out to cut.
+        let group_commits = register_int_counter!(
+            "s3_group_commits",
+            "Commit station groups closed: one blocks-DB transaction and one journal persist each (ADR 0011). Zero means group commit is off or nothing has been written",
+        )
+        .expect("can register an int counter in the default registry");
+
+        let group_commit_members = register_int_counter!(
+            "s3_group_commit_members",
+            "Request batches carried by those groups; divided by s3_group_commits this is the mean group size, and a mean pinned at 1 under load is what the group_commit_window knob is for",
+        )
+        .expect("can register an int counter in the default registry");
+
+        let group_commits_degraded = register_int_counter!(
+            "s3_group_commits_degraded",
+            "Groups whose shared transaction failed and were replayed member by member so one bad member failed alone; this firing is the isolation working, sustained growth is the signal",
+        )
+        .expect("can register an int counter in the default registry");
+
         Self {
             method_calls,
             bucket_count,
@@ -215,7 +245,22 @@ impl Metrics {
             data_block_disk_ops_inflight,
             multipart_uploads_reaped,
             multipart_orphan_parts_reaped,
+            group_commits,
+            group_commit_members,
+            group_commits_degraded,
         }
+    }
+
+    /// One commit station group closed, carrying `members` batches (ADR
+    /// 0011).
+    pub fn group_committed(&self, members: u64) {
+        self.group_commits.inc();
+        self.group_commit_members.inc_by(members);
+    }
+
+    /// A group that had to fall back to per-member transactions.
+    pub fn group_commit_degraded(&self) {
+        self.group_commits_degraded.inc();
     }
 
     /// Stale uploads aborted by one GC sweep (ADR 0003).

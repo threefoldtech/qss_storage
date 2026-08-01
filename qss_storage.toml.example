@@ -91,6 +91,51 @@ stripe_count = 1024
 # Default: 64
 max_blocks_per_commit = 64
 
+# Merge the closing step of CONCURRENT requests into one transaction with one
+# journal persist (ADR 0011). Off, the write path is ADR 0010's exactly: every
+# request closes its own batch. On, a request hands its batch -- files already
+# staged and fdatasynced -- to a per-store commit station and parks; the
+# committer takes whatever is queued, renames every member's files, syncs each
+# touched directory once, and commits everyone's block records in ONE
+# transaction with ONE persist.
+#
+# What it buys: small objects and lone streams, which pay a full persist per
+# request today. A thousand concurrent 4 KiB PUTs become roughly one persist
+# per group instead of a thousand.
+#
+# What it costs: strangers share a commit. A member waits on other requests'
+# renames and one shared persist, and a device hiccup mid-persist stalls
+# everyone parked instead of one request. If the shared transaction fails it
+# rolls back and every member is replayed on its own, so one bad member fails
+# alone -- but the coupling is real, which is why this is opt-in and off by
+# default.
+#
+# A group never carries more than max_blocks_per_commit blocks: the cap above
+# stays the one and only bound on transaction size, stripe hold time and crash
+# residue. Grouping does not make the transaction bigger, it lets strangers
+# fill a cap a small request would have wasted.
+# respd ignores this key: it stores no blocks.
+# Default: false
+group_commit = false
+
+# Extra time the committer spends gathering members after the FIRST one
+# arrives, as a duration with a unit ("0ms", "250us", "2ms").
+#
+# LEAVE THIS ALONE UNLESS YOU MEASURED. Zero -- the default -- means there is
+# no timer: groups are whatever queued up while the previous group was
+# committing, so a request that arrives to an idle committer commits
+# immediately and group commit adds nothing at all to a lone ack. A non-zero
+# window delays every ack by up to this long in exchange for bigger groups,
+# and the deadline runs from the first member of a group, never resets, so
+# groups still close at the cap or the deadline, whichever comes first.
+#
+# The number to look at before touching it is the mean group size
+# (s3_group_commit_members / s3_group_commits). Pinned at 1 under real load is
+# the only thing this knob fixes.
+# Ignored entirely when group_commit is false.
+# Default: "0ms"
+group_commit_window = "0ms"
+
 # ---------------------------------------------------------------------------
 # [store.hash] -- how blocks are addressed.
 #

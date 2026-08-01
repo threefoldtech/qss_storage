@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::hasher::Hasher;
 use crate::metastore::{
@@ -8,6 +8,7 @@ use crate::metastore::{
 };
 
 use super::block_disk::{AtomicBlockWriter, BLOCKS_DB_DIR_NAME, BlockDiskOps, RealDiskOps};
+use super::group_commit::{CommitStation, GroupCommit, GroupCommitStats};
 use super::placement::BlockPlacement;
 use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
 use super::write_path::DEFAULT_MAX_BLOCKS_PER_COMMIT;
@@ -39,6 +40,17 @@ pub struct SharedBlockStore {
     stripes: Stripes,
     /// Most block records one transaction carries (ADR 0010).
     max_blocks_per_commit: usize,
+    /// How this process runs cross-request group commit (ADR 0011), or
+    /// `None` for the ADR 0010 write path.
+    group_commit: Option<GroupCommit>,
+    /// The station itself, built on the first flush that wants one.
+    ///
+    /// Lazy because a station needs a tokio runtime to live in, and a store
+    /// is also opened by tools that have none (fsck, the inspect
+    /// subcommands). Building it eagerly in [`SharedBlockStore::new`] would
+    /// make `group_commit = true` in a shared config file crash every offline
+    /// tool in the deployment.
+    station: OnceLock<CommitStation>,
     /// The atomic temp+fsync+rename writer (open duties already run).
     disk_writer: AtomicBlockWriter,
     /// The low-level disk ops the writer drives; swapped by tests.
@@ -67,6 +79,10 @@ impl SharedBlockStore {
     /// * `max_blocks_per_commit` - Most block records one transaction carries
     ///   (ADR 0010); `None` takes [`DEFAULT_MAX_BLOCKS_PER_COMMIT`]. Like the
     ///   stripe count, a property of this process and not of the store.
+    /// * `group_commit` - `Some` to merge the closing step of concurrent
+    ///   requests through a commit station (ADR 0011), `None` for the ADR
+    ///   0010 write path unchanged. Default off; the station is bounded by
+    ///   the same `max_blocks_per_commit`.
     ///
     /// # Errors
     ///
@@ -82,6 +98,7 @@ impl SharedBlockStore {
         spec: Option<HeaderSpec>,
         stripe_count: Option<usize>,
         max_blocks_per_commit: Option<usize>,
+        group_commit: Option<GroupCommit>,
     ) -> Result<Self, MetaError> {
         // A store from before the .db rename has its database at
         // <blocks>/db, a name that doubles as the 0xdb fanout slot.
@@ -154,6 +171,8 @@ impl SharedBlockStore {
             max_blocks_per_commit: max_blocks_per_commit
                 .unwrap_or(DEFAULT_MAX_BLOCKS_PER_COMMIT)
                 .max(1),
+            group_commit,
+            station: OnceLock::new(),
             disk_writer,
             disk_ops,
         })
@@ -162,6 +181,30 @@ impl SharedBlockStore {
     /// Most block records this process puts in one transaction (ADR 0010).
     pub(super) fn max_blocks_per_commit(&self) -> usize {
         self.max_blocks_per_commit
+    }
+
+    /// This store's commit station, started on first use, or `None` when no
+    /// group commit was configured (ADR 0011).
+    ///
+    /// Called from the write path's flush, which is always inside a tokio
+    /// runtime -- which is exactly why the station is built here and not in
+    /// [`SharedBlockStore::new`], where an offline tool would have to spawn a
+    /// committer task with no runtime to spawn it into.
+    pub(super) fn commit_station(self: &Arc<Self>) -> Option<&CommitStation> {
+        let options = self.group_commit?;
+        Some(
+            self.station
+                .get_or_init(|| CommitStation::start(self, options, self.max_blocks_per_commit)),
+        )
+    }
+
+    /// What this store's commit station has done, or `None` if it has none
+    /// (either group commit is off, or nothing has flushed yet).
+    ///
+    /// `members / groups` is the mean group size, and `groups` is the number
+    /// of write-path persists the blocks DB paid.
+    pub fn group_commit_stats(&self) -> Option<GroupCommitStats> {
+        self.station.get().map(CommitStation::stats)
     }
 
     /// Root directory of the block data files. One per store: every

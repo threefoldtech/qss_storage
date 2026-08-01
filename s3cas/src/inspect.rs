@@ -254,6 +254,7 @@ mod tests {
             hasher: Hasher::Blake3W32,
             stripe_count: None,
             max_blocks_per_commit: None,
+            group_commit: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
             false,
             opts.stripe_count,
             opts.max_blocks_per_commit,
+            opts.group_commit,
         )
         .unwrap();
         casfs.create_bucket(bucket).unwrap();
@@ -371,6 +373,7 @@ mod tests {
             false,
             opts.stripe_count,
             opts.max_blocks_per_commit,
+            opts.group_commit,
         )
         .unwrap();
         drop(casfs);

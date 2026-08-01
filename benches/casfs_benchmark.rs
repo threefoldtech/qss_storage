@@ -42,6 +42,7 @@ fn setup_casfs_with(hasher: Hasher) -> (CasFS, TempDir) {
         false, // verify_on_read: benchmarks measure the normal read path
         None,  // stripe_count: the default 1024, which the sizing note assumes
         None,  // max_blocks_per_commit: the default 64 (ADR 0010)
+        None,  // group_commit: off, the ADR 0011 default
     )
     .unwrap();
 

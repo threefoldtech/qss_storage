@@ -201,6 +201,10 @@ async fn run(cli: Cli) -> Result<u8> {
         false,
         store.stripe_count,
         store.max_blocks_per_commit,
+        // No commit station whatever the config says (ADR 0011): fsck never
+        // goes through the write path, so a station here would be a committer
+        // task waiting on a queue nobody feeds.
+        None,
     )?;
 
     let options = if cli.scrub {

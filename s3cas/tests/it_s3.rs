@@ -99,6 +99,7 @@ static CONFIG: LazyLock<SdkConfig> = LazyLock::new(|| {
         false, // verify_on_read
         None,  // stripe_count: the built-in default
         None,  // max_blocks_per_commit: the built-in default
+        None,  // group_commit: off, the ADR 0011 default
     )
     .expect("can construct CasFS");
     let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
