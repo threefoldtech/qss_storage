@@ -1,11 +1,12 @@
 # The Sync Boundary Moves from the Block to the Ack
 
-**Status**: Proposed (review asks 1-3 ruled by owner 2026-08-01:
+**Status**: Proposed, all questions ruled (owner, 2026-08-01):
 boundary = request ack with configurable cap default 64; fdatasync +
 per-batch dirsync chosen, sync primitive eventually configurable;
-locking order signed off. Ask 4, the cross-request timer merge, is
-deferred to its own ADR. The fdatasync-as-user-level question is open
-pending owner ruling.)
+locking order signed off; the cross-request timer merge deferred to
+its own ADR; `fdatasync` removed as a user-facing durability level
+with no alias -- the levels are `fsync` and `buffer`. Ready for
+implementation.
 **Date**: 2026-08-01
 
 ---
@@ -328,18 +329,19 @@ campaign unchanged as the acceptance gate.
 ## Open Questions
 
 **Architecture-changers**
-- [ ] Should `fdatasync` remain a distinct user-facing durability
-      level? After this ADR the two syscalls' cost difference is paid
-      once per request instead of twice per MiB, and on the
-      append-only journal even fdatasync must flush the size metadata
-      -- the two settings become indistinguishable in both speed and
-      crash safety. A knob implying a tradeoff that no longer exists
-      misleads the operator who picks it. PROPOSED: collapse the
-      user-facing levels to `fsync` and `buffer`; keep accepting
-      `fdatasync` in config as a deprecated alias for `fsync` (the
-      strict parser must not refuse existing configs); the fdatasync
+- [x] RULED (owner, 2026-08-01): `fdatasync` is REMOVED as a
+      user-facing durability level, no compatibility alias -- there
+      are no deployed configs to protect, and the strict parser
+      refusing it with the two valid names in the message IS the
+      migration. The reasoning that killed it: after this ADR the two
+      syscalls' cost difference is paid once per request instead of
+      twice per MiB, and on the append-only journal even fdatasync
+      must flush size metadata -- the two levels become
+      indistinguishable in both speed and crash safety, and a knob
+      implying a dead tradeoff misleads whoever picks it. The
+      user-facing levels are `fsync` and `buffer`. The fdatasync
       SYSCALL remains an internal implementation choice where proven
-      equivalent. Awaiting owner ruling.
+      equivalent (block files in the batch).
 
 **Behavior definers**
 - [ ] The cap-sized partial batch mid-request: on a crash, a client
