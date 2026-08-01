@@ -13,7 +13,7 @@ mod upload_record;
 pub use block::{BLOCKID_SIZE, Block, BlockId, MAX_BLOCKID_SIZE, block_disk_path};
 pub use bucket_meta::BucketMeta;
 pub use content_hash::{CONTENT_HASH_SIZE, ContentHash};
-pub use errors::{FsError, MetaError};
+pub use errors::{FsError, MetaError, StorePairingMismatch};
 pub use meta_store::*;
 pub use object::{Object, ObjectData, ObjectType};
 pub use store_header::{HeaderSpec, StoreHeader, StoreHeaderError, StoreId, StoreInit};

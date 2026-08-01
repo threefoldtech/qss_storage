@@ -8,7 +8,10 @@ use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
 use crate::cas::crash_fixtures::{plant_degraded_record, plant_orphan_file};
-use crate::cas::{AsyncByteStream, BLOCKS_DB_DIR_NAME, CasFS, SharedBlockStore, StorageEngine};
+use crate::cas::{
+    AsyncByteStream, BLOCKS_DB_DIR_NAME, CasFS, STORE_ID_MARKER_NAME, SharedBlockStore,
+    StorageEngine,
+};
 use crate::metastore::{
     BlockId, ContentHash, DEFAULT_BLOCK_TREE, Durability, MAX_BLOCKID_SIZE, ObjectData,
     block_disk_path,
@@ -445,38 +448,59 @@ fn disk_walk_refuses_everything_that_is_not_this_layout() {
     }
 }
 
-/// `.tmp` and `.quarantine` are the store's own, at the top level only. The
+/// The store's own entries -- `.tmp`, `.quarantine`, `.db` and the ADR 0012
+/// `.store-id` marker -- are skipped at the top level, and nowhere else. The
 /// same names one level down are not fanout directories and are reported.
+///
+/// The exact skip table is the assertion: everything else in the fanout is
+/// block-shaped or foreign, so a fifth reserved name added without a thought
+/// would fail here.
 #[test]
-fn tmp_and_quarantine_are_skipped_only_at_the_root() {
+fn the_stores_own_entries_are_skipped_only_at_the_root() {
     let dir = tempdir().unwrap();
     let (shared, fs) = store(&dir);
     let root = fs.fs_root().clone();
 
-    // Store-open already created .tmp; give both something to hide.
+    // Store-open already created .tmp and .store-id; give each of the four
+    // something to hide, and check the marker really is there to be skipped.
     std::fs::create_dir_all(root.join(".tmp")).unwrap();
     std::fs::write(root.join(".tmp").join("half-written"), b"torn").unwrap();
     std::fs::create_dir_all(root.join(".quarantine")).unwrap();
     std::fs::write(root.join(".quarantine").join("corrupt-block"), b"bad").unwrap();
+    assert!(
+        root.join(STORE_ID_MARKER_NAME).is_file(),
+        "the store wrote its pairing marker at open"
+    );
+    assert!(
+        root.join(BLOCKS_DB_DIR_NAME).exists() || dir.path().join("meta/blocks").is_dir(),
+        "the database is somewhere: under blocks/ on one root, under the meta root on two"
+    );
 
     // The same names nested under a fanout directory are just junk.
     std::fs::create_dir_all(root.join("ab").join(".tmp")).unwrap();
     std::fs::create_dir_all(root.join("ab").join(".quarantine")).unwrap();
+    std::fs::create_dir_all(root.join("ab").join(BLOCKS_DB_DIR_NAME)).unwrap();
+    std::fs::write(root.join("ab").join(STORE_ID_MARKER_NAME), b"not mine").unwrap();
 
     let ctx = ScrubContext::new(fs.namespace_meta_store(), &shared);
     let walk = walk_disk(&ctx).unwrap();
 
     assert!(walk.files.is_empty());
-    let foreign: Vec<String> = walk
+    let mut foreign: Vec<String> = walk
         .foreign
         .iter()
         .map(|f| f.path.strip_prefix(&root).unwrap().display().to_string())
         .collect();
-    assert_eq!(foreign.len(), 2, "{foreign:?}");
-    assert!(foreign.contains(&"ab/.tmp".to_string()), "{foreign:?}");
-    assert!(
-        foreign.contains(&"ab/.quarantine".to_string()),
-        "{foreign:?}"
+    foreign.sort();
+    assert_eq!(
+        foreign,
+        vec![
+            "ab/.db".to_string(),
+            "ab/.quarantine".to_string(),
+            "ab/.store-id".to_string(),
+            "ab/.tmp".to_string(),
+        ],
+        "exactly the four names, and only below the root"
     );
 }
 

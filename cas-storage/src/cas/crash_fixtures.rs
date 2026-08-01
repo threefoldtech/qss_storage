@@ -237,6 +237,65 @@ pub(crate) fn plant_stale_part(
     .unwrap();
 }
 
+/// Residue class 11 (ADR 0012): a store that predates the pairing identity
+/// -- a header whose store id bytes are the all-zero absent pattern, which
+/// is what every header written before this ADR carries.
+///
+/// The database must be closed: fjall holds a directory lock, and this
+/// reaches into the header partition the way a pre-0012 build left it.
+pub(crate) fn strip_store_id(db_path: &Path) {
+    use crate::metastore::store_header::{STORE_HEADER_KEY, STORE_HEADER_TREE, STORE_ID_SIZE};
+    use crate::metastore::{FjallStore, Store};
+
+    let store = FjallStore::new(db_path.to_path_buf(), Some(1), None).unwrap();
+    let tree = store.tree_open(STORE_HEADER_TREE).unwrap();
+    let mut raw = tree
+        .get(STORE_HEADER_KEY)
+        .unwrap()
+        .expect("the store to strip must have a header")
+        .to_vec();
+    let len = raw.len();
+    raw[len - STORE_ID_SIZE..].fill(0);
+    tree.insert(STORE_HEADER_KEY, raw).unwrap();
+}
+
+/// Residue class 12 (ADR 0012): a half-adopted store -- the header carries
+/// an id and the blocks root's marker does not exist, which is exactly what
+/// a crash between the two adoption writes leaves. The next open completes
+/// it by writing the marker.
+pub(crate) fn remove_store_id_marker(blocks_root: &Path) {
+    let marker = blocks_root.join(super::block_disk::STORE_ID_MARKER_NAME);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("could not remove {}: {e}", marker.display()),
+    }
+}
+
+/// The other half-adopted shape: a marker that is not an id at all. Damage
+/// rather than a claim -- nothing can be compared against it, so the header
+/// is written over it.
+pub(crate) fn plant_unreadable_store_id_marker(blocks_root: &Path, junk: &[u8]) {
+    std::fs::write(
+        blocks_root.join(super::block_disk::STORE_ID_MARKER_NAME),
+        junk,
+    )
+    .unwrap();
+}
+
+/// The mispairing itself: a blocks root marked as belonging to some OTHER
+/// store. What an operator produces by pointing `--fs-root` at yesterday's
+/// data directory, a sibling store, or a disk that failed to mount and got
+/// repopulated.
+pub(crate) fn plant_foreign_store_id_marker(
+    blocks_root: &Path,
+    id: crate::metastore::StoreId,
+) -> crate::metastore::StoreId {
+    std::fs::create_dir_all(blocks_root).unwrap();
+    super::block_disk::rewrite_store_id_marker(blocks_root, id).unwrap();
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

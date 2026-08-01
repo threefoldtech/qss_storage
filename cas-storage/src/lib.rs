@@ -135,6 +135,8 @@ pub use cas::{
     // station, and what that station has done
     GroupCommit,
     GroupCommitStats,
+    // The blocks root's pairing marker (ADR 0012)
+    STORE_ID_MARKER_NAME,
     SharedBlockStore,
     StorageEngine,
     // Stale-upload GC (ADR 0003): what one sweep did, and the sweep itself

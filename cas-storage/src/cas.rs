@@ -3,7 +3,7 @@ pub mod gc;
 pub mod multipart;
 pub mod range_request;
 pub mod shared_block_store;
-pub use block_disk::BLOCKS_DB_DIR_NAME;
+pub use block_disk::{BLOCKS_DB_DIR_NAME, STORE_ID_MARKER_NAME};
 pub use fs::CasFS;
 pub use fs::StorageEngine;
 pub use gc::{SweepStats, sweep_stale_uploads};

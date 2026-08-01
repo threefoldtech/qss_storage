@@ -19,7 +19,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::cas::block_disk::{BLOCKS_DB_DIR_NAME, QUARANTINE_DIR_NAME, TMP_DIR_NAME};
+use crate::cas::block_disk::{
+    BLOCKS_DB_DIR_NAME, QUARANTINE_DIR_NAME, STORE_ID_MARKER_NAME, TMP_DIR_NAME,
+};
 use crate::metastore::BlockId;
 
 use super::ScrubContext;
@@ -67,11 +69,10 @@ pub struct DiskWalk {
 
 /// Walks the blocks root recursively.
 ///
-/// `.tmp` and `.quarantine` are skipped, at the top level only: `.tmp` is
-/// purged wholesale at store open and is never fsck's business, and
-/// `.quarantine` holds what a previous repair already set aside. Deeper
-/// down, a directory by either name is not a fanout directory and is
-/// reported foreign like anything else.
+/// The store's own top-level entries are skipped by name
+/// ([`is_the_stores_own`]): `.tmp`, `.quarantine`, `.db` and the ADR 0012
+/// pairing marker `.store-id`. Deeper down, an entry by any of those names
+/// is not a fanout directory and is reported foreign like anything else.
 ///
 /// The store's own metadata files are skipped too, wherever they turn up
 /// ([`ScrubContext::store_own_paths`]): the default layout runs the tools
@@ -132,9 +133,7 @@ fn walk_dir(
             continue;
         };
 
-        if at_root
-            && (name == TMP_DIR_NAME || name == QUARANTINE_DIR_NAME || name == BLOCKS_DB_DIR_NAME)
-        {
+        if at_root && is_the_stores_own(&name) {
             continue;
         }
 
@@ -181,6 +180,30 @@ fn walk_dir(
     }
 
     Ok(())
+}
+
+/// The store's own entries at the top of the blocks root -- the whole table,
+/// in one place.
+///
+/// Four names, each dot-prefixed so it can never collide with a fanout
+/// directory (two hex characters) or a block file (full-width hex):
+///
+/// - `.tmp`: staging, purged wholesale at store open and never fsck's
+///   business;
+/// - `.quarantine`: what a previous repair set aside;
+/// - `.db`: the shared block database, when the tools run with one root for
+///   both halves;
+/// - `.store-id`: the pairing marker (ADR 0012), which is the store saying
+///   which store this tree belongs to.
+///
+/// Top level only. One level down, none of these is a fanout directory, so
+/// a directory or file by any of these names is reported foreign like
+/// anything else that is not block-shaped.
+fn is_the_stores_own(name: &str) -> bool {
+    matches!(
+        name,
+        TMP_DIR_NAME | QUARANTINE_DIR_NAME | BLOCKS_DB_DIR_NAME | STORE_ID_MARKER_NAME
+    )
 }
 
 /// Decides whether `name`, sitting under the directory chain `chain`, is a
