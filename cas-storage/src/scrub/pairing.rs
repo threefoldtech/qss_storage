@@ -265,6 +265,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("the store must open")
         .store_id()
