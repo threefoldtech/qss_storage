@@ -16,7 +16,7 @@ pub use content_hash::{CONTENT_HASH_SIZE, ContentHash};
 pub use errors::{FsError, MetaError};
 pub use meta_store::*;
 pub use object::{Object, ObjectData, ObjectType};
-pub use store_header::{HeaderSpec, StoreHeader, StoreHeaderError, StoreInit};
+pub use store_header::{HeaderSpec, StoreHeader, StoreHeaderError, StoreId, StoreInit};
 pub use stores::FjallStore;
 pub use traits::*;
 pub use upload_record::UploadRecord;

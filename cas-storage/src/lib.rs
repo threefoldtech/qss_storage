@@ -119,6 +119,8 @@ pub use metastore::{
     Store,
     StoreHeader,
     StoreHeaderError,
+    // Pairing identity (ADR 0012)
+    StoreId,
     Transaction,
 };
 

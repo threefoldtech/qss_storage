@@ -12,8 +12,17 @@
 //!
 //! ```text
 //! magic [4] = "QSST" | version u16 | hash_algo u8 | hash_width u8 |
-//! created_at u64 (unix seconds) | reserved [16]
+//! created_at u64 (unix seconds) | store_id [16]
 //! ```
+//!
+//! # The store id (ADR 0012)
+//!
+//! The last 16 bytes were the reserved block until ADR 0012 spent them on a
+//! [`StoreId`]: the pairing identity that tells a blocks root which database
+//! it belongs to. All-zero means *absent*, which is exactly what a header
+//! written before ADR 0012 says -- so old stores are adopted at first open
+//! rather than refused, and the format version does not move. A v4 UUID is
+//! never all-zero, so the sentinel costs nothing.
 //!
 //! # Refusal, not migration
 //!
@@ -71,8 +80,69 @@ pub const STORE_HEADER_VERSION: u16 = 3;
 /// creation. Recovery from it is a manual operation.
 pub const STORE_HEADER_SIDECAR: &str = "store_header.bin";
 
-/// Number of trailing bytes reserved for future fields.
-const RESERVED_SIZE: usize = STORE_HEADER_SIZE - 4 - 2 - 1 - 1 - 8;
+/// Width of the store id, in bytes: a UUID.
+pub const STORE_ID_SIZE: usize = STORE_HEADER_SIZE - 4 - 2 - 1 - 1 - 8;
+
+/// The pairing identity of a store (ADR 0012).
+///
+/// Sixteen bytes, minted once at store creation and never rewritten. Its job
+/// is to answer one question at open: does this blocks root belong to this
+/// database? The blocks root carries a copy in `blocks/.store-id`, and a
+/// mismatch is refused rather than warned about -- a mispaired store is not a
+/// degraded store, it is the wrong store.
+///
+/// All-zero is not a value: it is the on-disk spelling of "no id", which is
+/// what every header written before ADR 0012 says. [`StoreId::from_bytes`] is
+/// the only constructor from raw bytes and it rejects that pattern, so a
+/// `StoreId` that exists is an id that was minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoreId([u8; STORE_ID_SIZE]);
+
+impl StoreId {
+    /// Mints a fresh id: a v4 UUID, so the entropy argument is someone
+    /// else's and two stores created in the same second still differ.
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().into_bytes())
+    }
+
+    /// Wraps raw bytes, unless they are the all-zero "absent" pattern.
+    pub fn from_bytes(bytes: [u8; STORE_ID_SIZE]) -> Option<Self> {
+        if bytes == [0u8; STORE_ID_SIZE] {
+            None
+        } else {
+            Some(Self(bytes))
+        }
+    }
+
+    /// The id as it sits in the header.
+    pub fn as_bytes(&self) -> &[u8; STORE_ID_SIZE] {
+        &self.0
+    }
+
+    /// Lowercase hex, the form the `blocks/.store-id` marker carries.
+    pub fn to_hex(&self) -> String {
+        faster_hex::hex_string(&self.0)
+    }
+
+    /// Parses the marker's form: exactly [`STORE_ID_SIZE`] bytes of hex,
+    /// surrounding whitespace tolerated (a marker an operator has echoed by
+    /// hand ends with a newline).
+    pub fn parse_hex(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if trimmed.len() != STORE_ID_SIZE * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; STORE_ID_SIZE];
+        faster_hex::hex_decode(trimmed.as_bytes(), &mut bytes).ok()?;
+        Self::from_bytes(bytes)
+    }
+}
+
+impl Display for StoreId {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
 
 /// What a new store's header should say about its block hash.
 ///
@@ -115,11 +185,12 @@ pub struct StoreHeader {
     version: u16,
     hasher: Hasher,
     created_at: u64,
-    reserved: [u8; RESERVED_SIZE],
+    store_id: [u8; STORE_ID_SIZE],
 }
 
 impl StoreHeader {
-    /// Builds the header for a store being created now.
+    /// Builds the header for a store being created now, with a fresh
+    /// [`StoreId`].
     ///
     /// `created_at` is seconds since the unix epoch, taken from the system
     /// clock; a clock set before 1970 records 0 rather than failing store
@@ -137,15 +208,28 @@ impl StoreHeader {
     }
 
     /// [`StoreHeader::create`] with the creation timestamp supplied, so tests
-    /// can pin a golden vector.
+    /// can pin one half of a golden vector.
     pub fn create_at(spec: HeaderSpec, created_at: u64) -> Result<Self, StoreHeaderError> {
+        Self::create_with(spec, created_at, Some(StoreId::generate()))
+    }
+
+    /// The full constructor: timestamp and store id both supplied.
+    ///
+    /// `None` writes the absent pattern, which is what a pre-ADR-0012 header
+    /// carries -- the shape adoption meets at open, and the one a golden
+    /// vector can pin.
+    pub fn create_with(
+        spec: HeaderSpec,
+        created_at: u64,
+        store_id: Option<StoreId>,
+    ) -> Result<Self, StoreHeaderError> {
         let hasher =
             Hasher::from_header(spec.hash_algo, spec.hash_width).map_err(StoreHeaderError::Hash)?;
         Ok(Self {
             version: STORE_HEADER_VERSION,
             hasher,
             created_at,
-            reserved: [0u8; RESERVED_SIZE],
+            store_id: store_id.map_or([0u8; STORE_ID_SIZE], |id| *id.as_bytes()),
         })
     }
 
@@ -174,11 +258,28 @@ impl StoreHeader {
         self.hasher
     }
 
+    /// This store's pairing identity, or `None` for a header written before
+    /// ADR 0012 -- the adoption case.
+    pub fn store_id(&self) -> Option<StoreId> {
+        StoreId::from_bytes(self.store_id)
+    }
+
+    /// The same header with `id` as its store identity: what adoption writes
+    /// back. The header is a value, so this returns a new one rather than
+    /// mutating the copy every opener is holding.
+    #[must_use]
+    pub fn with_store_id(self, id: StoreId) -> Self {
+        Self {
+            store_id: *id.as_bytes(),
+            ..self
+        }
+    }
+
     /// Serializes the header to its exact on-disk form.
     ///
-    /// The reserved bytes are written back as they were read, so a header
-    /// written by a future version survives a read-write cycle intact. Every
-    /// header *this* build creates has them zeroed.
+    /// The store id is written back as it was read, so a header this build
+    /// only passed through survives the round trip intact -- including the
+    /// absent pattern of a store that has not been adopted yet.
     pub fn to_bytes(&self) -> [u8; STORE_HEADER_SIZE] {
         let mut out = [0u8; STORE_HEADER_SIZE];
         out[..4].copy_from_slice(&STORE_HEADER_MAGIC);
@@ -186,7 +287,7 @@ impl StoreHeader {
         out[6] = self.hash_algo();
         out[7] = self.hash_width();
         out[8..16].copy_from_slice(&self.created_at.to_le_bytes());
-        out[16..].copy_from_slice(&self.reserved);
+        out[16..].copy_from_slice(&self.store_id);
         out
     }
 
@@ -215,8 +316,8 @@ impl StoreHeader {
         let created_at = reader
             .u64("created_at")
             .map_err(StoreHeaderError::Malformed)?;
-        let reserved: [u8; RESERVED_SIZE] = reader
-            .array("reserved")
+        let store_id: [u8; STORE_ID_SIZE] = reader
+            .array("store_id")
             .map_err(StoreHeaderError::Malformed)?;
         reader.finish().map_err(StoreHeaderError::Malformed)?;
 
@@ -226,7 +327,7 @@ impl StoreHeader {
             version,
             hasher,
             created_at,
-            reserved,
+            store_id,
         })
     }
 }
@@ -387,6 +488,29 @@ pub(crate) fn write_sidecar(db_path: &Path, header: &StoreHeader) {
     }
 }
 
+/// Records `id` in an existing store's header, and returns the header as it
+/// now reads (ADR 0012 adoption).
+///
+/// This is the FIRST of the two adoption writes: the header side is the
+/// authoritative one, so it lands before the blocks root's marker. A crash
+/// between them leaves a header with an id and a root without one, which the
+/// next open completes by writing the marker -- the direction that needs no
+/// judgement.
+///
+/// The sidecar is rewritten too, so the manual-recovery copy never claims a
+/// different identity than the record it copies.
+pub(crate) fn adopt_store_id(
+    store: &dyn Store,
+    db_path: &Path,
+    header: StoreHeader,
+    id: StoreId,
+) -> Result<StoreHeader, MetaError> {
+    let adopted = header.with_store_id(id);
+    write_header(store, &adopted)?;
+    write_sidecar(db_path, &adopted);
+    Ok(adopted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,25 +518,27 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::{TempDir, tempdir};
 
-    /// A header created with the default spec at a pinned timestamp, byte for
-    /// byte. Changing this vector changes the on-disk format.
+    /// A header created with the default spec at a pinned timestamp and no
+    /// store id, byte for byte -- the shape every pre-ADR-0012 store has on
+    /// disk. Changing this vector changes the on-disk format.
     ///
     /// magic "QSST" | version 3 | algo 1 (blake3) | width 32 |
-    /// created_at 0x0000000068000001 | 16 zero bytes
+    /// created_at 0x0000000068000001 | 16 zero bytes (store id absent)
     const GOLDEN: [u8; STORE_HEADER_SIZE] = [
         0x51, 0x53, 0x53, 0x54, // "QSST"
         0x03, 0x00, // version 3 (ADR 0005 block record flags byte)
         0x01, // algo: blake3
         0x20, // width: 32
         0x01, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00, // created_at
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // reserved
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // store id: absent
     ];
 
     const GOLDEN_CREATED_AT: u64 = 0x0000_0000_6800_0001;
 
     #[test]
     fn golden_vector() {
-        let header = StoreHeader::create_at(HeaderSpec::default(), GOLDEN_CREATED_AT).unwrap();
+        let header =
+            StoreHeader::create_with(HeaderSpec::default(), GOLDEN_CREATED_AT, None).unwrap();
         assert_eq!(header.to_bytes(), GOLDEN);
 
         let decoded = StoreHeader::from_bytes(&GOLDEN).unwrap();
@@ -421,7 +547,53 @@ mod tests {
         assert_eq!(decoded.hash_width(), 32);
         assert_eq!(decoded.created_at(), GOLDEN_CREATED_AT);
         assert_eq!(decoded.hasher(), Hasher::Blake3W32);
+        assert_eq!(decoded.store_id(), None, "an all-zero id is no id");
         assert_eq!(decoded, header);
+    }
+
+    /// The other half of the vector: the same header with an id in it. The
+    /// id occupies the last 16 bytes and nothing else moves.
+    #[test]
+    fn golden_vector_with_a_store_id() {
+        let id = StoreId::from_bytes([
+            0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+            0xe1, 0xf0,
+        ])
+        .unwrap();
+        let header =
+            StoreHeader::create_with(HeaderSpec::default(), GOLDEN_CREATED_AT, Some(id)).unwrap();
+
+        let mut expected = GOLDEN;
+        expected[16..].copy_from_slice(id.as_bytes());
+        assert_eq!(header.to_bytes(), expected);
+        assert_eq!(header.store_id(), Some(id));
+        assert_eq!(id.to_hex(), "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert_eq!(StoreId::parse_hex(&format!("{id}\n")), Some(id));
+        assert_eq!(StoreHeader::from_bytes(&expected).unwrap(), header);
+    }
+
+    /// The absent pattern is not a value, and neither is a truncated or
+    /// non-hex marker: all three are "this root claims nothing".
+    #[test]
+    fn store_ids_reject_the_absent_pattern_and_junk() {
+        assert_eq!(StoreId::from_bytes([0u8; STORE_ID_SIZE]), None);
+        assert_eq!(StoreId::parse_hex(&"0".repeat(32)), None);
+        assert_eq!(StoreId::parse_hex(""), None);
+        assert_eq!(StoreId::parse_hex("deadbeef"), None);
+        assert_eq!(StoreId::parse_hex(&"z".repeat(32)), None);
+        assert_ne!(StoreId::generate(), StoreId::generate());
+        let id = StoreId::generate();
+        assert_eq!(StoreId::parse_hex(&id.to_hex()), Some(id));
+    }
+
+    /// A created store gets an id; adoption is only for stores that predate
+    /// the field.
+    #[test]
+    fn created_headers_carry_a_fresh_id() {
+        let first = StoreHeader::create(HeaderSpec::default()).unwrap();
+        let second = StoreHeader::create(HeaderSpec::default()).unwrap();
+        assert!(first.store_id().is_some());
+        assert_ne!(first.store_id(), second.store_id());
     }
 
     #[test]
@@ -435,23 +607,30 @@ mod tests {
         }
     }
 
-    /// A future version may use the reserved bytes; this build must neither
-    /// reject them nor drop them.
+    /// Whatever is in the id bytes round-trips: a build that only passes a
+    /// header through must neither reject an id it did not mint nor drop it.
     #[test]
-    fn reserved_bytes_round_trip_untouched() {
+    fn store_id_bytes_round_trip_untouched() {
         let mut raw = GOLDEN;
-        raw[16..].copy_from_slice(&[0xabu8; RESERVED_SIZE]);
+        raw[16..].copy_from_slice(&[0xabu8; STORE_ID_SIZE]);
 
-        let header = StoreHeader::from_bytes(&raw).expect("nonzero reserved must be accepted");
+        let header = StoreHeader::from_bytes(&raw).expect("any id pattern must be accepted");
         assert_eq!(header.to_bytes(), raw);
+        assert_eq!(header.store_id().unwrap().as_bytes(), &[0xabu8; 16]);
     }
 
+    /// Adoption changes the id and nothing else.
     #[test]
-    fn created_headers_zero_the_reserved_bytes() {
-        let bytes = StoreHeader::create(HeaderSpec::default())
-            .unwrap()
-            .to_bytes();
-        assert_eq!(&bytes[16..], &[0u8; RESERVED_SIZE]);
+    fn with_store_id_touches_only_the_id() {
+        let before = StoreHeader::from_bytes(&GOLDEN).unwrap();
+        let id = StoreId::generate();
+        let after = before.with_store_id(id);
+
+        assert_eq!(after.store_id(), Some(id));
+        assert_eq!(after.version(), before.version());
+        assert_eq!(after.hasher(), before.hasher());
+        assert_eq!(after.created_at(), before.created_at());
+        assert_eq!(&after.to_bytes()[..16], &before.to_bytes()[..16]);
     }
 
     #[test]
@@ -612,6 +791,31 @@ mod tests {
         let sidecar = dir.path().join(STORE_HEADER_SIDECAR);
         let bytes = std::fs::read(&sidecar).expect("sidecar must exist next to the db dir");
         assert_eq!(bytes, header.to_bytes());
+    }
+
+    /// Adoption is durable on both copies: the record a reopen reads and the
+    /// sidecar a manual recovery reads say the same id.
+    #[test]
+    fn adoption_writes_the_header_record_and_the_sidecar() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        let adopted = StoreId::generate();
+
+        let created = {
+            let (meta, header) =
+                MetaStore::open_or_create(db.clone(), Some(1), HeaderSpec::default(), fjall)
+                    .unwrap();
+            assert!(header.store_id().is_some(), "a new store mints its own");
+            adopt_store_id(&*meta.get_underlying_store(), &db, header, adopted).unwrap()
+        };
+        assert_eq!(created.store_id(), Some(adopted));
+
+        let (_meta, reopened) =
+            MetaStore::open_or_create(db.clone(), Some(1), HeaderSpec::default(), fjall).unwrap();
+        assert_eq!(reopened.store_id(), Some(adopted));
+
+        let sidecar = std::fs::read(dir.path().join(STORE_HEADER_SIDECAR)).unwrap();
+        assert_eq!(sidecar, created.to_bytes());
     }
 
     /// Builds a store the raw way (no header), leaving a non-empty db
