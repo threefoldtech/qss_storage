@@ -18,6 +18,10 @@ set -uo pipefail
 
 phase_begin 07 durability-matrix
 
+# Same entry hygiene as phase 6, same reason: a cycle owns its daemon
+# from start to kill, whatever the previous phase left listening.
+s3d_ensure_stopped
+
 cycles=${QSSRT_CRASH_CYCLES:-3}
 record "crash-cycles" "$cycles"
 record "durability" buffer

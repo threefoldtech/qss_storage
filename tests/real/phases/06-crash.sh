@@ -18,6 +18,14 @@ set -uo pipefail
 
 phase_begin 06 crash
 
+# A crash cycle must start the daemon itself, at the cycle's durability.
+# In the standard sequence phase 5 always left the port free; the --tb
+# sequence replaces phase 5, arrived here with phase 1's daemon still
+# listening, and every kill, restart and fsck of the phase failed against
+# a daemon the cycle never owned. Adopt-and-stop makes the phase
+# self-contained in either sequence.
+s3d_ensure_stopped
+
 cycles=${QSSRT_CRASH_CYCLES:-3}
 record "crash-cycles" "$cycles"
 record "durability" fsync
