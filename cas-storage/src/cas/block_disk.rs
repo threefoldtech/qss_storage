@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::metastore::{BlockId, Durability, block_disk_path};
+use crate::metastore::{BlockId, Durability, StoreId, block_disk_path};
 
 /// Name of the temp directory under the blocks root. Crash residue in here
 /// is garbage by definition and is purged once at store open -- never by a
@@ -71,6 +71,15 @@ pub(crate) const QUARANTINE_DIR_NAME: &str = ".quarantine";
 /// inside the database directory, and the scrub had to skip that whole
 /// subtree -- one block in 256 invisible to every fsck pass.
 pub const BLOCKS_DB_DIR_NAME: &str = ".db";
+
+/// Name of the pairing marker under the blocks root (ADR 0012): the store id
+/// this tree belongs to, as lowercase hex.
+///
+/// Dot-prefixed like every other reserved name, so it can never be mistaken
+/// for a fanout directory or a block. It is the fs half of the pairing
+/// identity whose meta half lives in the store header, and it is written
+/// once -- by adoption or at creation -- and never again by the daemon.
+pub const STORE_ID_MARKER_NAME: &str = ".store-id";
 
 /// Process-wide temp-name nonce. Uniqueness per ATTEMPT is load-bearing: a
 /// cancelled attempt's detached writer must never share a temp inode with a
@@ -171,6 +180,94 @@ impl BlockDiskOps for RealDiskOps {
     }
 }
 
+/// What the blocks root's [`STORE_ID_MARKER_NAME`] file says, if anything
+/// (ADR 0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreIdMarker {
+    /// No marker file. Either a store from before ADR 0012, or a root whose
+    /// adoption was interrupted between the header write and this one.
+    Absent,
+    /// A marker that is not a store id: truncated, empty, not hex. Damage
+    /// rather than a claim -- it names no store, so nothing can be compared
+    /// against it and the header's id is written over it.
+    Unreadable(String),
+    /// The store this blocks root says it belongs to.
+    Present(StoreId),
+}
+
+/// Reads the blocks root's pairing marker.
+///
+/// A missing file is [`StoreIdMarker::Absent`], not an error: that is the
+/// legacy and the half-adopted shape. Anything present but unparseable is
+/// [`StoreIdMarker::Unreadable`], carrying the bytes as the operator would
+/// see them (lossily, truncated) so a log line can show what was there.
+///
+/// # Errors
+///
+/// Only a real IO failure -- unreadable directory, EIO -- which must not be
+/// mistaken for "this root claims nothing".
+pub(crate) fn read_store_id_marker(blocks_root: &Path) -> io::Result<StoreIdMarker> {
+    let path = blocks_root.join(STORE_ID_MARKER_NAME);
+    match fs::read(&path) {
+        Ok(raw) => {
+            let text = String::from_utf8_lossy(&raw);
+            Ok(match StoreId::parse_hex(&text) {
+                Some(id) => StoreIdMarker::Present(id),
+                None => StoreIdMarker::Unreadable(
+                    text.chars()
+                        .take(64)
+                        .collect::<String>()
+                        .replace(|c: char| c.is_control(), "."),
+                ),
+            })
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(StoreIdMarker::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes the pairing marker by the block protocol's own rules: exclusive
+/// create in `.tmp`, fsync, rename into the blocks root, fsync the root.
+///
+/// The temp file shares the blocks root's filesystem (the same-device check
+/// at open guarantees it), so the rename is atomic and a reader never sees a
+/// half-written identity. Synced whatever the durability level says: this is
+/// one write per store lifetime, and a marker that did not survive the crash
+/// that adopted it would be re-adopted from scratch on a root that may have
+/// changed hands in between.
+fn write_marker(ops: &dyn BlockDiskOps, root: &Path, tmp: &Path, id: StoreId) -> io::Result<()> {
+    ops.create_dir_all(tmp)?;
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = tmp.join(format!("{STORE_ID_MARKER_NAME}-{nonce}"));
+    let contents = format!("{}\n", id.to_hex());
+
+    let attempt = (|| -> io::Result<()> {
+        ops.write_new_file(&temp_path, contents.as_bytes())?;
+        ops.fsync_file(&temp_path, false)?;
+        ops.rename(&temp_path, &root.join(STORE_ID_MARKER_NAME))?;
+        ops.fsync_dir(root)
+    })();
+
+    if let Err(e) = attempt {
+        // Best effort: the temp is garbage either way and the open-time
+        // purge is the backstop.
+        let _ = ops.remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// [`write_marker`] against the real filesystem, for callers that hold a
+/// blocks root but no writer -- fsck's re-pair verb.
+pub(crate) fn rewrite_store_id_marker(blocks_root: &Path, id: StoreId) -> io::Result<()> {
+    write_marker(
+        &RealDiskOps,
+        blocks_root,
+        &blocks_root.join(TMP_DIR_NAME),
+        id,
+    )
+}
+
 /// A block whose bytes are written to a temp file and nothing more (ADR
 /// 0010).
 ///
@@ -213,6 +310,11 @@ pub(super) struct AtomicBlockWriter {
     /// successful fsync, so membership is a durable-on-crash claim (at
     /// `Buffer` the set is never consulted -- nothing is claimed durable).
     known_durable: Mutex<HashSet<PathBuf>>,
+    /// What the root's `.store-id` said at open (ADR 0012). Read here
+    /// because open is the only moment it can be read before anything has
+    /// been written; compared against the header by `SharedBlockStore::new`,
+    /// which is the only place that knows both halves.
+    store_id_marker: StoreIdMarker,
 }
 
 impl AtomicBlockWriter {
@@ -226,6 +328,9 @@ impl AtomicBlockWriter {
     ///   could not be atomic. Refused loudly at open; a runtime `EXDEV`
     ///   (someone mounted over a fanout dir while running) is logged as a
     ///   store-level fault when the rename fails.
+    /// - reads the `.store-id` marker (ADR 0012) and hands it up: the
+    ///   comparison against the header belongs to `SharedBlockStore::new`,
+    ///   which opens the database this root claims to belong to.
     pub fn open(ops: &dyn BlockDiskOps, root: PathBuf, durability: Durability) -> io::Result<Self> {
         let tmp = root.join(TMP_DIR_NAME);
         ops.create_dir_all(&root)?;
@@ -250,11 +355,14 @@ impl AtomicBlockWriter {
             ));
         }
 
+        let store_id_marker = read_store_id_marker(&root)?;
+
         let writer = Self {
             root,
             tmp,
             durability,
             known_durable: Mutex::new(HashSet::new()),
+            store_id_marker,
         };
 
         if writer.syncs() {
@@ -274,6 +382,20 @@ impl AtomicBlockWriter {
     /// Whether this durability level fsyncs at all.
     fn syncs(&self) -> bool {
         !matches!(self.durability, Durability::Buffer)
+    }
+
+    /// What the blocks root claimed about its store at open (ADR 0012).
+    pub fn store_id_marker(&self) -> &StoreIdMarker {
+        &self.store_id_marker
+    }
+
+    /// Writes (or rewrites) the blocks root's pairing marker.
+    ///
+    /// Called only by `SharedBlockStore::new`, and only after the header
+    /// side of the identity is durable: header first, marker second, so the
+    /// crash window leaves the state a reopen can complete without judging.
+    pub fn write_store_id_marker(&self, ops: &dyn BlockDiskOps, id: StoreId) -> io::Result<()> {
+        write_marker(ops, &self.root, &self.tmp, id)
     }
 
     /// Writes `bytes` as block `id` at fanout `depth` and returns the final
@@ -887,6 +1009,73 @@ mod tests {
         RealDiskOps.write_new_file(&path, b"a").unwrap();
         let err = RealDiskOps.write_new_file(&path, b"b").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    /// The marker round-trips through the atomic protocol: temp file, fsync,
+    /// rename, and nothing left in `.tmp`.
+    #[test]
+    fn the_store_id_marker_round_trips_through_temp_and_rename() {
+        let ops = RecordingOps::recording_over_real();
+        let (writer, dir) = open_writer(&ops, Durability::Buffer);
+        let root = dir.path().join("blocks");
+        assert_eq!(*writer.store_id_marker(), StoreIdMarker::Absent);
+
+        let id = StoreId::generate();
+        writer.write_store_id_marker(&ops, id).unwrap();
+
+        let marker = root.join(STORE_ID_MARKER_NAME);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{}\n", id.to_hex())
+        );
+        assert_eq!(
+            read_store_id_marker(&root).unwrap(),
+            StoreIdMarker::Present(id)
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(TMP_DIR_NAME)).unwrap().count(),
+            0,
+            "the marker's temp file is renamed away, not left behind"
+        );
+        // Written the way blocks are: exclusive create, sync, rename, dirsync
+        // -- even at Buffer, because this one is identity, not data.
+        assert!(ops.count("rename") >= 1, "{:?}", ops.entries());
+        assert_eq!(ops.count("fsync-file:fsync "), 1, "{:?}", ops.entries());
+
+        // A reopen sees it, and rewriting it is not an error.
+        let reopened = AtomicBlockWriter::open(&ops, root.clone(), Durability::Buffer).unwrap();
+        assert_eq!(*reopened.store_id_marker(), StoreIdMarker::Present(id));
+        let second = StoreId::generate();
+        reopened.write_store_id_marker(&ops, second).unwrap();
+        assert_eq!(
+            read_store_id_marker(&root).unwrap(),
+            StoreIdMarker::Present(second)
+        );
+    }
+
+    /// A marker that is not an id names no store: it is damage, reported as
+    /// such rather than parsed into a claim.
+    #[test]
+    fn an_unparseable_marker_is_not_a_claim() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("blocks");
+        std::fs::create_dir_all(&root).unwrap();
+
+        for junk in [
+            &b""[..],
+            b"not hex at all\n",
+            b"deadbeef\n",
+            &[0xffu8, 0xfe][..],
+        ] {
+            std::fs::write(root.join(STORE_ID_MARKER_NAME), junk).unwrap();
+            assert!(
+                matches!(
+                    read_store_id_marker(&root).unwrap(),
+                    StoreIdMarker::Unreadable(_)
+                ),
+                "{junk:?} is not a store id"
+            );
+        }
     }
 
     fn hex_of(byte: u8) -> String {

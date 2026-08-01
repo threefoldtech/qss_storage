@@ -34,10 +34,11 @@
 //!
 //! # Forward compatibility
 //!
-//! The 16 reserved bytes are written zeroed and are *not* rejected when a
-//! future version puts something there -- they round-trip untouched. Anything
-//! that changes the meaning of the existing fields must bump `version`
-//! instead.
+//! The record has no spare bytes left: ADR 0012 spent the reserved block on
+//! the store id. Whatever pattern the id bytes hold round-trips untouched, so
+//! a build that only passes a header through neither rejects nor drops an id
+//! it did not mint. Anything that changes the meaning of the existing fields,
+//! or needs a field of its own, must bump `version`.
 
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
