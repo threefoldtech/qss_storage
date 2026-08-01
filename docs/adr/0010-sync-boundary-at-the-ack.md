@@ -1,6 +1,6 @@
 # The Sync Boundary Moves from the Block to the Ack
 
-**Status**: Proposed, all questions ruled (owner, 2026-08-01):
+**Status**: Accepted, all questions ruled (owner, 2026-08-01):
 boundary = request ack with configurable cap default 64; fdatasync +
 per-batch dirsync chosen, sync primitive eventually configurable;
 locking order signed off; the cross-request timer merge deferred to
