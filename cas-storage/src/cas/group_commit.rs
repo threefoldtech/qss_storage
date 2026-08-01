@@ -494,10 +494,10 @@ fn close_group(
                 .disk_writer()
                 .write_block(&*ops, &entry.id, depth, bytes)
             {
-                // The file for this block does not exist, so no member of the
-                // group may record it. Marking it live would be a lie; the
-                // transaction is left to fail on it, which fails exactly the
-                // members that named it.
+                // The block has no file, so nobody may record it. It stays
+                // out of `placed`, and the pass after the landing fails
+                // exactly the members that named it -- unless one of them
+                // staged a copy of its own, which lands and rescues them all.
                 tracing::error!(
                     block_hash = %entry.id.to_hex(),
                     error = %e,
@@ -513,51 +513,88 @@ fn close_group(
 
     // Staged files: one lands per distinct new block, the rest are surplus.
     // Surplus is either a block another writer committed before this group
-    // reached its stripes, or one a stranger IN this group staged too.
-    let mut to_land: Vec<&StagedBlock> = Vec::new();
-    for entries in &members {
-        for entry in entries {
-            let Payload::Staged(staged) = &entry.payload else {
-                continue;
-            };
-            if live[&entry.id] || placed.contains_key(&entry.id) {
-                shared.disk_writer().discard_staged(&*ops, staged);
-            } else {
-                placed.insert(entry.id, staged.depth);
-                to_land.push(staged);
+    // reached its stripes, or one a stranger IN this group staged too. The
+    // surplus file is DISCARDED, never renamed over the winner: renaming
+    // would swap a live inode for identical bytes, and if the winner chose
+    // another fanout depth it would leave an off-depth duplicate behind
+    // (residue class 2) for fsck to collect.
+    {
+        let mut to_land: Vec<&StagedBlock> = Vec::new();
+        for entries in &members {
+            for entry in entries {
+                let Payload::Staged(staged) = &entry.payload else {
+                    continue;
+                };
+                if live[&entry.id] || placed.contains_key(&entry.id) {
+                    shared.disk_writer().discard_staged(&*ops, staged);
+                } else {
+                    placed.insert(entry.id, staged.depth);
+                    to_land.push(staged);
+                }
             }
+        }
+
+        // Files durable at their final paths, every touched directory synced
+        // once -- before a single record exists (hard rule 5, ADR 0006,
+        // unchanged at group width). A failure here is a store-level fault
+        // and not one member's fault, so it fails the group: there is no
+        // isolation to offer when the filesystem has stopped answering.
+        if let Err(e) = shared.disk_writer().land_batch(&*ops, &to_land) {
+            let message = format!("landing the group's block files: {e}");
+            return members
+                .into_iter()
+                .map(|entries| {
+                    abandon_after_landing(entries);
+                    Err(io::Error::new(e.kind(), message.clone()))
+                })
+                .collect();
         }
     }
 
-    // Files durable at their final paths, every touched directory synced once
-    // -- before a single record exists (hard rule 5, ADR 0006, unchanged at
-    // group width). A failure here is a store-level fault, not one member's
-    // fault, so it fails the group: there is no isolation to offer when the
-    // filesystem stopped answering.
-    if let Err(e) = shared.disk_writer().land_batch(&*ops, &to_land) {
-        let message = format!("landing the group's block files: {e}");
-        return members
-            .into_iter()
-            .map(|entries| {
-                abandon_after_landing(entries);
-                Err(io::Error::new(e.kind(), message.clone()))
-            })
-            .collect();
+    // Every entry with no live record now knows which depth this group put
+    // its file at -- including a member that deduped against a record another
+    // member had to rewrite, and a member whose own copy was surplus.
+    //
+    // An entry left with neither is one whose file could not be written at
+    // all (the rewrite above failed). Its member fails HERE rather than in
+    // the transaction, because a record naming a file that does not exist is
+    // the one thing this protocol must never commit.
+    let mut refused: Vec<Option<io::Error>> = Vec::with_capacity(members.len());
+    for entries in &mut members {
+        let mut member_failed = None;
+        for entry in entries.iter_mut() {
+            if live[&entry.id] {
+                continue;
+            }
+            match placed.get(&entry.id) {
+                Some(&depth) => entry.depth = Some(depth),
+                None if member_failed.is_none() => {
+                    member_failed = Some(io::Error::other(format!(
+                        "no block file for {} could be placed by this group",
+                        entry.id.to_hex()
+                    )));
+                }
+                None => {}
+            }
+        }
+        refused.push(member_failed);
     }
 
     // ONE transaction carrying every member's inserts and bumps, ONE persist.
     let mut tx = shared.meta_store().begin_transaction();
     let mut outcomes = Vec::with_capacity(members.len());
     let mut failure = None;
-    'group: for entries in &members {
+    'group: for (entries, refused) in members.iter().zip(&refused) {
         let mut outcome = FlushOutcome::default();
-        for entry in entries {
-            match record_entry(&mut tx, entry) {
-                Ok(true) => outcome.written += 1,
-                Ok(false) => outcome.ignored += 1,
-                Err(e) => {
-                    failure = Some(e);
-                    break 'group;
+        if refused.is_none() {
+            for entry in entries {
+                match record_entry(&mut tx, entry) {
+                    Ok(true) => outcome.written += 1,
+                    Ok(false) => outcome.ignored += 1,
+                    Err(e) => {
+                        failure = Some(e);
+                        break 'group;
+                    }
                 }
             }
         }
@@ -572,10 +609,21 @@ fn close_group(
         );
         match tx.commit() {
             Ok(()) => {
-                for entries in members {
-                    resolve_landed(entries);
-                }
-                return outcomes.into_iter().map(Ok).collect();
+                return members
+                    .into_iter()
+                    .zip(outcomes)
+                    .zip(refused)
+                    .map(|((entries, outcome), refused)| match refused {
+                        Some(e) => {
+                            abandon_after_landing(entries);
+                            Err(e)
+                        }
+                        None => {
+                            resolve_landed(entries);
+                            Ok(outcome)
+                        }
+                    })
+                    .collect();
             }
             Err(e) => failure = Some(e),
         }
@@ -598,7 +646,14 @@ fn close_group(
     metrics[0].group_commit_degraded();
     members
         .into_iter()
-        .map(|entries| replay_alone(shared, entries))
+        .zip(refused)
+        .map(|(entries, refused)| match refused {
+            Some(e) => {
+                abandon_after_landing(entries);
+                Err(e)
+            }
+            None => replay_alone(shared, entries),
+        })
         .collect()
 }
 
