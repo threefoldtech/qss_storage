@@ -65,7 +65,7 @@ struct Cli {
 
     #[arg(
         long,
-        help = "Durability level (buffer, fsync, fdatasync); default fsync, which is strongest"
+        help = "Durability level (buffer, fsync); default fsync, which is strongest"
     )]
     durability: Option<Durability>,
 

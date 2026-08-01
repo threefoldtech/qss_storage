@@ -376,17 +376,21 @@ bytes, a single-part block list, or the multipart shape.
 |--------------|---------------------|
 | `Buffer` | `Buffer` |
 | `Fsync` | `SyncAll` |
-| `Fdatasync` | `SyncData` |
 
-Default is `Fsync`, and the `s3cas` CLI default is `fsync` -- the strongest
-mode.
+Default is `Fsync`, and the `s3cas` CLI default is `fsync` -- the stronger of
+the two.
 
-The mapping follows the POSIX names: `fsync` flushes data and metadata
-(strongest), `fdatasync` flushes data only (weaker, faster). It was originally
-crossed -- `Fsync` selected `SyncData` and `Fdatasync` selected `SyncAll`,
-with `fdatasync` as the default -- which was flagged as finding H12 and fixed
-on 2026-07-30 by swapping the mapping and moving the default to `Fsync`, so
-the default persist behavior is unchanged while the names now tell the truth.
+There were three levels once. The middle one, `fdatasync`, mapped to fjall's
+`SyncData`; ADR 0010 removed it with no compatibility alias, and the parser
+refuses the name with the two valid ones in the message. The reasoning: after
+the sync boundary moved from the block to the ack, the two syscalls' cost
+difference is paid once per request instead of twice per MiB, and on an
+append-only journal even fdatasync must flush the size metadata -- so the two
+levels became indistinguishable in speed and in crash safety, and a knob
+naming a dead tradeoff misleads whoever picks it.
+
+The fdatasync SYSCALL did not go anywhere: it is what the batch uses on block
+files, where the per-batch directory fsync carries the rename's durability.
 
 ## Transactional model
 

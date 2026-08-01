@@ -130,14 +130,14 @@ mod tests {
         );
         let opts = StoreOptions::resolve(
             Some(StorageEngine::Fjall),
-            Some(Durability::Fdatasync),
+            Some(Durability::Fsync),
             Some(64),
             Some(2048),
             &store,
         )
         .unwrap();
         assert_eq!(opts.metadata_db, StorageEngine::Fjall);
-        assert_eq!(opts.durability, Durability::Fdatasync);
+        assert_eq!(opts.durability, Durability::Fsync);
         assert_eq!(opts.inline_metadata_size, Some(64));
         assert_eq!(opts.stripe_count, Some(2048), "the flag must beat the file");
     }

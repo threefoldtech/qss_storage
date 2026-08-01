@@ -3,7 +3,7 @@
 //! Blocks reach their final path by write-temp + fsync + rename, never by
 //! writing in place. The invariant this buys (hard rule 5): a block record
 //! is committed only after its file is durable at its final path --
-//! crash-true at `Fsync`/`Fdatasync`, ordering-true at `Buffer`.
+//! crash-true at `Fsync`, ordering-true at `Buffer`.
 //!
 //! Two layers live here:
 //!
@@ -229,7 +229,7 @@ impl AtomicBlockWriter {
     ///
     /// 1. `create_dir_all` the fanout dir;
     /// 2. exclusive-create `.tmp/<hex id>-<nonce>` and write all bytes;
-    /// 3. fsync the temp file (full at `Fsync`, fdatasync at `Fdatasync`);
+    /// 3. fdatasync the temp file;
     /// 4. fsync the fanout chain deepest-up until a known-durable ancestor
     ///    (directories always get full fsync);
     /// 5. rename over the final path -- unconditionally: if an orphan or a
@@ -261,7 +261,10 @@ impl AtomicBlockWriter {
             ops.write_new_file(&temp_path, bytes)?;
 
             if self.syncs() {
-                ops.fsync_file(&temp_path, matches!(self.durability, Durability::Fdatasync))?;
+                // fdatasync, always (ADR 0010): the file was just created and
+                // fully written, so data+size is everything that matters, and
+                // the directory fsync below carries the rename's durability.
+                ops.fsync_file(&temp_path, true)?;
                 self.fsync_chain_deepest_up(ops, &fanout_dir)?;
             }
 
@@ -474,14 +477,23 @@ mod tests {
         writer.write_block(&ops, &test_id(), 2, b"payload").unwrap();
         let during = ops.entries()[before_write..].to_vec();
 
-        // The file, full fsync.
+        // The file: fdatasync, always (ADR 0010). Its directory entry is made
+        // durable by the dir fsyncs, not by a full file fsync.
+        assert_eq!(
+            during
+                .iter()
+                .filter(|e| e.starts_with("fsync-file:fdatasync "))
+                .count(),
+            1,
+            "{during:?}"
+        );
         assert_eq!(
             during
                 .iter()
                 .filter(|e| e.starts_with("fsync-file:fsync "))
                 .count(),
-            1,
-            "{during:?}"
+            0,
+            "no block file ever gets a full fsync: {during:?}"
         );
         // The two new fanout dirs (ab/ and ab/01/), deepest-up, plus the
         // post-rename fsync of the landing dir.
@@ -507,10 +519,12 @@ mod tests {
         );
     }
 
+    /// Block files get data-only syncs and directories get full ones -- the
+    /// split ADR 0010 settled on, now that there is no level to choose it.
     #[test]
-    fn fdatasync_uses_data_only_for_the_file_and_full_for_dirs() {
+    fn block_files_are_data_only_and_dirs_are_full() {
         let ops = RecordingOps::recording_over_real();
-        let (writer, _dir) = open_writer(&ops, Durability::Fdatasync);
+        let (writer, _dir) = open_writer(&ops, Durability::Fsync);
         writer.write_block(&ops, &test_id(), 1, b"payload").unwrap();
 
         assert_eq!(ops.count("fsync-file:fdatasync"), 1, "{:?}", ops.entries());

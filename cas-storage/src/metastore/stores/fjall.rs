@@ -94,14 +94,14 @@ impl FjallStore {
                 )),
             })?;
 
-        // The mapping follows the POSIX names: fsync flushes data and
-        // metadata (fjall SyncAll, strongest), fdatasync flushes data only
-        // (fjall SyncData, weaker but faster). The default is the strongest
-        // mode, same persist behavior as before the names were untangled.
+        // Two levels since ADR 0010. `fsync` persists the journal with data
+        // AND metadata (fjall SyncAll, the strongest mode); `buffer` leaves
+        // the flush to the page cache. fjall's SyncData has no user-facing
+        // level any more: on an append-only journal it must flush the size
+        // metadata anyway, so it bought nothing that SyncAll does not.
         let durability = match durability.unwrap_or(Durability::Fsync) {
             Durability::Buffer => fjall::PersistMode::Buffer,
             Durability::Fsync => fjall::PersistMode::SyncAll,
-            Durability::Fdatasync => fjall::PersistMode::SyncData,
         };
 
         Ok(Self {

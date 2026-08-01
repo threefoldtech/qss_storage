@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The ADR 0010 A/B rig: one 16 GiB multipart ingest, one durability
 # level, one number. Run once per level to reproduce the table that
-# motivated the ADR (fsync 62 / fdatasync 75 / buffer 1025 MB/s on a
-# btrfs nvme, 2026-08-01) -- and, once 0010 is implemented, to hold
-# the regression floor.
+# motivated the ADR (fsync 62 / buffer 1025 MB/s on a btrfs nvme,
+# 2026-08-01; the 75 MB/s middle row was the fdatasync level, which
+# 0010 removed) -- and, now that 0010 is implemented, to hold the
+# regression floor.
 #
 #   tests/real/tools/durability-bench.sh fsync
 #   tests/real/tools/durability-bench.sh buffer

@@ -183,13 +183,28 @@ pub trait Store: Send + Sync + Debug + 'static {
 
 /// `Durability` defines the durability guarantees for storage operations.
 ///
-/// This enum represents different levels of durability that can be used
-/// when configuring storage operations.
+/// Two levels, and only two (ADR 0010): `fsync`, where everything an ack
+/// covers is on stable storage before the ack goes out, and `buffer`, where
+/// nothing is flushed and the page cache decides.
 ///
 /// The `try_from = "String"` deserialization routes the config file through
-/// the same [`FromStr`] the CLI flag uses, so `durability = "fdatasync"` in
-/// `qss_storage.toml` and `--durability fdatasync` cannot drift apart, and a
+/// the same [`FromStr`] the CLI flag uses, so `durability = "fsync"` in
+/// `qss_storage.toml` and `--durability fsync` cannot drift apart, and a
 /// typo is reported with the same message in both places.
+///
+/// # `fdatasync` was a level and is not one any more
+///
+/// ADR 0010 removed it with no compatibility alias. After the sync boundary
+/// moved from the block to the ack, the two syscalls' cost difference is
+/// paid once per request instead of twice per MiB, and on the append-only
+/// journal even fdatasync must flush the size metadata -- the two levels
+/// became indistinguishable in both speed and crash safety, and a knob
+/// implying a dead tradeoff misleads whoever picks it. The parser refusing
+/// the name, with the two valid ones in the message, IS the migration.
+///
+/// The fdatasync SYSCALL is untouched: it is the internal primitive the
+/// batch uses for block files, where the per-batch directory fsync carries
+/// the rename durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub enum Durability {
@@ -197,13 +212,11 @@ pub enum Durability {
     /// This provides the highest performance but lowest durability.
     Buffer,
 
-    /// Data is synchronized to disk with full metadata using fsync.
-    /// This provides the highest durability but lowest performance.
+    /// Everything a request acknowledges is flushed to stable storage before
+    /// the acknowledgement: block files (fdatasync plus the directory fsync
+    /// that makes their renames durable) and then the metadata journal
+    /// (fjall `SyncAll`), once per batch.
     Fsync,
-
-    /// Data is synchronized to disk without metadata using fdatasync.
-    /// This provides a balance between durability and performance.
-    Fdatasync,
 }
 
 impl FromStr for Durability {
@@ -220,9 +233,14 @@ impl FromStr for Durability {
         match s.to_lowercase().as_str() {
             "buffer" => Ok(Durability::Buffer),
             "fsync" => Ok(Durability::Fsync),
-            "fdatasync" => Ok(Durability::Fdatasync),
+            "fdatasync" => Err(
+                "the fdatasync durability level was removed (ADR 0010): the sync boundary \
+                 is the request ack now, which makes it indistinguishable from fsync in \
+                 both speed and crash safety -- use fsync or buffer"
+                    .to_string(),
+            ),
             _ => Err(format!(
-                "unknown durability option: {s} (expected buffer, fsync or fdatasync)"
+                "unknown durability option: {s} (expected buffer or fsync)"
             )),
         }
     }
@@ -243,7 +261,6 @@ impl std::fmt::Display for Durability {
         let name = match self {
             Durability::Buffer => "buffer",
             Durability::Fsync => "fsync",
-            Durability::Fdatasync => "fdatasync",
         };
         f.write_str(name)
     }

@@ -63,7 +63,7 @@ pub const DEFAULT_HASH_ALGO: &str = "blake3";
 pub const DEFAULT_HASH_WIDTH: u8 = 32;
 
 /// Durability for a store whose config and flags say nothing: full fsync, the
-/// strongest of the three.
+/// stronger of the two levels ADR 0010 left standing.
 pub const DEFAULT_DURABILITY: Durability = Durability::Fsync;
 
 /// Metadata backend used when nothing selects one.
@@ -447,7 +447,7 @@ mod tests {
     /// here as a compile or assertion failure.
     const FULL: &str = r#"
 [store]
-durability = "fdatasync"
+durability = "fsync"
 inline_metadata_size = 4096
 metadata_db = "fjall"
 verify_on_read = true
@@ -485,7 +485,7 @@ admin_password = "hunter2"
     fn full_file_parses() {
         let config = parse_str(FULL).expect("full file must parse");
 
-        assert_eq!(config.store.durability, Some(Durability::Fdatasync));
+        assert_eq!(config.store.durability, Some(Durability::Fsync));
         assert_eq!(config.store.inline_metadata_size, Some(4096));
         assert_eq!(config.store.metadata_db, Some(StorageEngine::Fjall));
         assert_eq!(config.store.verify_on_read, Some(true));
@@ -633,8 +633,24 @@ admin_password = "hunter2"
         let msg = err.to_string();
         assert!(msg.contains("unknown durability option: sync"), "{msg}");
         assert!(
-            msg.contains("fdatasync"),
-            "message must list the options: {msg}"
+            msg.contains("buffer") && msg.contains("fsync"),
+            "message must list the two options: {msg}"
+        );
+    }
+
+    /// The level ADR 0010 removed, with no alias. The refusal IS the
+    /// migration, so the message has to say which ADR took it and which two
+    /// names are left -- "unknown durability option" alone would send an
+    /// operator hunting for a typo they did not make.
+    #[test]
+    fn removed_fdatasync_level_is_refused_with_the_two_that_remain() {
+        let err = parse_str("[store]\ndurability = \"fdatasync\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("removed"), "message must say removed: {msg}");
+        assert!(msg.contains("0010"), "message must name the ADR: {msg}");
+        assert!(
+            msg.contains("fsync") && msg.contains("buffer"),
+            "message must name the two valid levels: {msg}"
         );
     }
 
@@ -813,7 +829,7 @@ admin_password = "hunter2"
 
     #[test]
     fn durability_and_engine_round_trip_through_display() {
-        for durability in [Durability::Buffer, Durability::Fsync, Durability::Fdatasync] {
+        for durability in [Durability::Buffer, Durability::Fsync] {
             let text = format!("[store]\ndurability = \"{durability}\"\n");
             assert_eq!(parse_str(&text).unwrap().store.durability, Some(durability));
         }

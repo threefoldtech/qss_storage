@@ -22,9 +22,16 @@
 # ---------------------------------------------------------------------------
 [store]
 
-# Write durability of the metadata database: "buffer", "fsync" or
-# "fdatasync". POSIX names: fsync is data + metadata (strongest), fdatasync is
-# data only, buffer leaves the write to the OS page cache.
+# Write durability: "fsync" or "buffer". With "fsync" everything a request
+# acknowledges -- its block files and its metadata records -- is on stable
+# storage before the ack goes out (ADR 0010); "buffer" leaves every write to
+# the OS page cache, so a power loss can take back acknowledged writes.
+#
+# There used to be a third level, "fdatasync". ADR 0010 removed it with no
+# alias: once the sync boundary moved from the block to the ack, the two
+# syscalls' cost difference is paid once per request instead of twice per MiB,
+# and on the append-only journal fdatasync must flush the size metadata
+# anyway. A config still naming it is refused at startup.
 # Default: "fsync"
 durability = "fsync"
 

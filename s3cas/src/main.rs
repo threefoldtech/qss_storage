@@ -78,7 +78,7 @@ pub struct ServerConfig {
 
     #[arg(
         long,
-        help = "Durability level (buffer, fsync, fdatasync); default fsync, which is strongest"
+        help = "Durability level (buffer, fsync); default fsync, which is strongest"
     )]
     durability: Option<Durability>,
 
@@ -641,13 +641,13 @@ mod tests {
         );
         let flags = ServerConfig {
             port: Some(7000),
-            durability: Some(Durability::Fdatasync),
+            durability: Some(Durability::Fsync),
             ..flags_with_credentials()
         };
         let resolved = resolve_server(flags, &file).unwrap();
 
         assert_eq!(resolved.port, 7000);
-        assert_eq!(resolved.store.durability, Durability::Fdatasync);
+        assert_eq!(resolved.store.durability, Durability::Fsync);
         assert_eq!(resolved.access_key, "flag-ak");
         assert_eq!(resolved.secret_key, "flag-sk");
     }
