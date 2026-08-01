@@ -1,6 +1,6 @@
 # The Sync Boundary Moves from the Block to the Ack
 
-**Status**: Accepted, all questions ruled (owner, 2026-08-01):
+**Status**: Implemented (2026-08-01). All questions ruled (owner, 2026-08-01):
 boundary = request ack with configurable cap default 64; fdatasync +
 per-batch dirsync chosen, sync primitive eventually configurable;
 locking order signed off; the cross-request timer merge deferred to
@@ -344,10 +344,108 @@ campaign unchanged as the acceptance gate.
       equivalent (block files in the batch).
 
 **Behavior definers**
-- [ ] The cap-sized partial batch mid-request: on a crash, a client
+- [x] CONFIRMED AS PROPOSED by implementation (2026-08-01). The
+      cap-sized partial batch mid-request: on a crash, a client
       retrying the part re-uploads all its blocks; earlier batches'
-      blocks dedup-hit and heal orphans in place. Confirm that is the
-      intended retry story (it is today's, at batch width).
-- [ ] Does `complete-multipart-upload` need its own batch (it writes
-      no blocks, only records), or is one tx + one persist -- which it
-      already is -- sufficient? (Proposed: already sufficient.)
+      blocks dedup-hit and heal orphans in place. That is today's
+      retry story at batch width, and no new mechanism was built for
+      it.
+- [x] CONFIRMED AS PROPOSED by implementation (2026-08-01).
+      `complete-multipart-upload` keeps its existing one tx + one
+      persist and got no batch machinery: it writes no blocks, and
+      ADR 0003's claim transaction already carries arbitrarily many
+      operations under one commit.
+
+---
+
+## As Built (2026-08-01)
+
+Implemented as decided. Four deviations, all narrower than the text
+rather than wider, and one memory cost the ADR did not price.
+
+### Stripes are sorted on the stripe INDEX, not on the block hash
+
+The ADR says "sorted block-hash order". The implementation
+(`Stripes::lock_batch`) sorts on the stripe index and collapses
+duplicates. Hash order is not a total order over the LOCKS: several
+hashes share a stripe (the index is two bytes reduced modulo the
+count), so hash order picks whichever member a batch happens to hold,
+and two batches holding different members of the same two stripes take
+them in opposite orders -- the exact ABBA the sorted acquisition exists
+to rule out. The two orders coincide whenever a batch's hashes address
+distinct stripes, which is the common case; sorting on the index is
+correct in the case that is not. Pinned by
+`concurrent_batches_sharing_stripes_do_not_deadlock`.
+
+### A dedup hit holds its bytes until its batch commits
+
+The ADR says dedup lookups still happen per block against committed
+state, and that the insert-vs-bump decision is made inside the
+transaction. Both hold. What the ADR does not address is the gap
+between the two: the lookup that decided NOT to write a file can be
+overtaken by a concurrent DELETE taking that record's last reference,
+and then the batch would commit a record whose file was just unlinked
+-- silent loss dressed as a successful PUT.
+
+So a dedup hit keeps its bytes until its batch commits. Under the
+stripes, before the transaction, the batch re-reads each such record;
+if it is gone the block is written the single-block way right there,
+from the bytes it kept. The window is small but not theoretical -- the
+existing PUT/DELETE storm tests hit it -- and the alternative (failing
+the request) would turn a race into a spurious 500.
+
+The cost the ADR did not price: a batch holds up to
+`max_blocks_per_commit` blocks of RETAINED BYTES per in-flight request,
+but only for blocks that deduped. Steady-state ingest of new data
+retains nothing (every block stages to a temp file and drops its
+buffer); a re-upload of existing content retains up to 64 MiB per
+in-flight request at the default cap. That is the same order as the
+dirty page cache a batch of staged files pins, and the cap bounds both.
+Pinned by `a_dedup_hit_deleted_mid_batch_is_written_from_the_bytes_it_kept`.
+
+### A staged block that loses the race is discarded, not renamed over
+
+The ADR's answer to "two concurrent batches both contain block X"
+says the loser's temp file "is surplus and is removed on release (the
+existing adopt-in-place logic from the crash-heal path covers the file
+already being at its final name)". The implementation removes the
+surplus temp file WITHOUT renaming it: under the stripes it sees the
+winner's committed record and simply drops its own file. Renaming
+first would replace a live block's inode with identical bytes for no
+gain, and -- if the winner placed the block at a different fanout depth
+-- would leave an off-depth duplicate (residue class 2) for fsck to
+collect. Same outcome, one less piece of residue.
+
+### `AtomicBlockWriter::sync_batch` is async; the rest of `block_disk` is not
+
+The module was entirely synchronous by design. The batch's concurrent
+file syncs need a fan-out, so that one method is `async` and spawns a
+blocking task per file. The ADR permits this explicitly ("the
+concurrency primitive is an implementation detail behind the batch
+API") and nothing outside that method changed.
+
+### The durability levels
+
+`fdatasync` is gone from the enum, the parser, both CLIs, the config
+file and the docs, with no alias. The parser refuses the name with a
+message that names the ADR and the two levels that remain, which is
+the migration. The fdatasync SYSCALL is now unconditional for block
+files, where the per-batch directory fsync carries rename durability.
+
+### Measured
+
+The 16 GiB A/B stays the external rig
+(`tests/real/tools/durability-bench.sh`) and the campaign stays the
+acceptance gate; neither was run here. The in-tree smoke A/B
+(`batch_smoke_ab`, `#[ignore]`d) puts 256 MiB through the real write
+path at real `fsync` durability, on `target/` rather than `$TMPDIR`
+because `/tmp` is tmpfs on most machines and would make both rows
+meaningless:
+
+| `max_blocks_per_commit` | MiB/s |
+| ----------------------- | ----- |
+| 1 (the pre-0010 cadence) | 227  |
+| 64 (the default)         | 416  |
+
+Single stream, one laptop btrfs nvme, 2026-08-01. Directionally what
+the ADR predicts; the rig's numbers are the ones that count.
