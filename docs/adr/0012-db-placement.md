@@ -1,6 +1,10 @@
 # The Database Takes the Fast Disk: Tiered Store Roots
 
-**Status**: Proposed
+**Status**: Proposed, all four review asks APPROVED (owner, 2026-08-01):
+automatic adoption at first open; recovery via fsck's explicit re-pair
+verb only, no daemon override; paths stay CLI-only with the two roots as
+the whole placement mechanism; no third `--blocks-db-path` knob until a
+workload asks. Ready for implementation.
 **Date**: 2026-08-01
 
 ---
@@ -292,13 +296,13 @@ mismatch refusal (both directions), adoption, half-adoption crash
 fixture, scrub-skips-marker, and the harness tiered rail asserting the
 whole shape end to end.
 
-### Review asks
-1. Automatic adoption at first open (vs explicit fsck verb): yes/no?
-2. Recovery via fsck re-pair only, no daemon override flag: yes/no?
+### Review asks (all ruled, owner, 2026-08-01)
+1. Automatic adoption at first open (vs explicit fsck verb): APPROVED.
+2. Recovery via fsck re-pair only, no daemon override flag: APPROVED.
 3. Keep paths CLI-only (no toml paths), the two roots as the whole
-   placement mechanism: yes/no?
+   placement mechanism: APPROVED.
 4. Scope: no `--blocks-db-path` third placement until a workload asks:
-   yes/no?
+   APPROVED.
 
 ---
 

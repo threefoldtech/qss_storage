@@ -1,6 +1,10 @@
 # Strangers Share a Flush: Cross-Request Group Commit
 
-**Status**: Proposed
+**Status**: Proposed, all four review asks APPROVED (owner, 2026-08-01):
+natural batching default with `group_commit_window = 0` and the timer
+strictly opt-in; `max_blocks_per_commit` is the one and only group bound;
+degrade-to-individual replay on group tx failure; blocks-DB scope only.
+Ready for implementation.
 **Date**: 2026-08-01
 
 ---
@@ -321,14 +325,14 @@ poisoned member, N-1 acks), cross-member same-block property test, crash
 fixture at group width asserting class-1-only residue, and the 16 GiB A/B
 plus a new small-object A/B (4 KiB x N clients) as the regression pair.
 
-### Review asks
+### Review asks (all ruled, owner, 2026-08-01)
 1. Natural batching default with `group_commit_window = 0`, timer strictly
-   opt-in: yes/no?
+   opt-in: APPROVED.
 2. Reuse `max_blocks_per_commit` as the one group bound (no second cap):
-   yes/no?
+   APPROVED.
 3. Degrade-to-individual-replay on group tx failure (stranger isolation
-   over group atomicity): yes/no?
-4. Scope: blocks DB only in this ADR, namespace DBs deferred: yes/no?
+   over group atomicity): APPROVED.
+4. Scope: blocks DB only in this ADR, namespace DBs deferred: APPROVED.
 
 ---
 
