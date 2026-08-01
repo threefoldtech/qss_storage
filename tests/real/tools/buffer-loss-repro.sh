@@ -8,12 +8,28 @@
 # complete returns, restart, HEAD the key. Score of 2026-08-01: 92
 # kills, 0 losses -- the naive window does not reproduce it, which is
 # itself evidence (prime suspect: fjall journal rotation under load;
-# next lever is the campaign's crash rig at elevated cycle count).
+# next lever is elevated cycle count on the filesystem the finding
+# occurred on, which is what the two knobs below are for).
 #
 #   tests/real/tools/buffer-loss-repro.sh [iterations]
 #
-# Owns ports 18034/19140/16399 (tools/bench.toml) and a scratch store
-# under target/buffer-loss-repro. Do not run alongside the bench rig.
+#   QSSBL_STORE=<dir>    run the store somewhere else (e.g. the /s3 xfs
+#                        disk, where the finding happened). The rig
+#                        refuses a non-empty directory it did not make:
+#                        wiping a store it cannot vouch for is the
+#                        operator's call, not a tool default.
+#   QSSBL_SNAPDIR=<dir>  where kept snapshots go (default beside the
+#                        default store, on the home disk -- snapshots of
+#                        a loss must survive the next iteration's churn).
+#
+# Every kill snapshots the dead store (cp -a) BEFORE the restart, so the
+# journal and sstables are preserved exactly as the crash left them. A
+# snapshot whose key then HEADs fine is deleted on the spot; a snapshot
+# whose key is ABSENT is kept, with the daemon log beside it -- that
+# directory is the fjall-rs upstream report, ready to attach.
+#
+# Owns ports 18034/19140/16399 (tools/bench.toml) and its scratch dirs,
+# and nothing else. Do not run alongside the bench rig.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -23,10 +39,12 @@ export AWS_ACCESS_KEY_ID=qssrealtest AWS_SECRET_ACCESS_KEY=qssrealtestsecret
 export AWS_DEFAULT_REGION=us-east-1
 EP="--endpoint-url http://127.0.0.1:18034"
 ITER=${1:-20}
+STORE="${QSSBL_STORE:-$B/store}"
+SNAPDIR="${QSSBL_SNAPDIR:-$B/snaps}"
 
 start() {
-    "$BIN" server --config "$HERE/bench.toml" --fs-root "$B/store" \
-        --meta-root "$B/store" --durability buffer \
+    "$BIN" server --config "$HERE/bench.toml" --fs-root "$STORE" \
+        --meta-root "$STORE" --durability buffer \
         >>"$B/daemon.log" 2>&1 &
     DPID=$!
     for _ in $(seq 1 100); do
@@ -47,11 +65,21 @@ hammer() { # continuous 1 MiB PUTs until killed
     done
 }
 
-mkdir -p "$B"
-rm -rf "$B/store"
+mkdir -p "$B" "$SNAPDIR"
+if [ -n "${QSSBL_STORE:-}" ]; then
+    # An overridden store location is wiped by whoever chose it, never
+    # here: this rig only vouches for the directory it created itself.
+    if [ -d "$STORE" ] && [ -n "$(ls -A "$STORE" 2>/dev/null)" ]; then
+        echo "QSSBL_STORE=$STORE is not empty; wipe it yourself if you mean it"
+        exit 1
+    fi
+    mkdir -p "$STORE"
+else
+    rm -rf "$B/store"
+fi
 part="$B/part.bin"
 head -c $((6 * 1024 * 1024)) /dev/urandom >"$part"
-lost=0 ok=0 failed=0
+lost=0 ok=0 failed=0 kept=0
 
 for i in $(seq 1 "$ITER"); do
     start || { echo "iter $i: daemon would not start"; exit 1; }
@@ -72,13 +100,20 @@ for i in $(seq 1 "$ITER"); do
         kill -9 "$DPID"
         for p in "${hpids[@]}"; do kill -9 "$p" 2>/dev/null; done
         while kill -0 "$DPID" 2>/dev/null; do sleep 0.05; done
+        # The store exactly as the crash left it, BEFORE recovery gets to
+        # rewrite the journal's tail. Deleted below if the key survived.
+        snap="$SNAPDIR/iter-$i"
+        cp -a "$STORE" "$snap"
         start || { echo "iter $i: no restart"; exit 1; }
         if aws $EP s3api head-object --bucket repro --key "$key" \
             >/dev/null 2>&1; then
             ok=$((ok + 1))
+            rm -rf "$snap"
         else
             lost=$((lost + 1))
-            echo "iter $i: RECORD ABSENT after acked complete"
+            kept=$((kept + 1))
+            tail -n 200 "$B/daemon.log" >"$snap/daemon-tail.log"
+            echo "iter $i: RECORD ABSENT after acked complete -- snapshot kept at $snap"
         fi
     else
         failed=$((failed + 1))
@@ -91,4 +126,4 @@ for i in $(seq 1 "$ITER"); do
     wait 2>/dev/null
 done
 
-echo "RESULT: $ok survived, $lost LOST, $failed complete-failures, of $ITER"
+echo "RESULT: $ok survived, $lost LOST, $failed complete-failures, of $ITER ($kept snapshot(s) kept)"
