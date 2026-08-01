@@ -36,7 +36,7 @@ crash_worker() {
 # upload's lifetime as often as inside a PUT's.
 crash_multipart_worker() {
     local bucket="$1" prefix="$2" size="$3" ack="$4" deadline="$5" n=0 key tmp
-    tmp="$(qssrt_scratch)/mp-$$"
+    tmp="$(qssrt_scratch)/mp-${BASHPID:-$$}"
     while [ "$(date +%s)" -lt "$deadline" ]; do
         key="$prefix/mp-$n"
         gen_file "$key" "$size" "$tmp"
@@ -105,17 +105,32 @@ crash_cycle() {
 
     # The claim under test: everything the client saw succeed is readable and
     # byte-identical afterwards.
-    local key size bad=0 checked=0 want got
+    local key size bad=0 checked=0 want got exists
     while IFS=$'\t' read -r key size; do
         [ -n "$key" ] || continue
         checked=$((checked + 1))
         want=$(gen_md5 "$key" "$size")
         got=$(s3_get_stream "$bucket" "$key" 2>/dev/null | md5sum | cut -d' ' -f1)
         if [ "$want" != "$got" ]; then
+            # One retry after a beat: a GET that hiccups right after the
+            # restart reads as the md5 of an empty stream, which is not
+            # the same verdict as an object that is gone.
+            sleep 2
+            got=$(s3_get_stream "$bucket" "$key" 2>/dev/null | md5sum | cut -d' ' -f1)
+        fi
+        if [ "$want" != "$got" ]; then
+            # Name which failure this IS: a record that answers HEAD with
+            # wrong bytes is a content problem; no record at all is loss.
+            if s3api head-object --bucket "$bucket" --key "$key" \
+                >/dev/null 2>&1; then
+                exists="record present"
+            else
+                exists="RECORD ABSENT"
+            fi
             bad=$((bad + 1))
             [ "$bad" -le 5 ] &&
                 check_fail "cycle $cycle: acknowledged object survives the crash" \
-                    "$key: generated $want, read back $got"
+                    "$key: generated $want, read back $got ($exists)"
         fi
     done <"$ack"
 

@@ -71,7 +71,13 @@ s3_put_file() {
 # a seekable body, and the ETag check needs the size to be exact.
 s3_put_generated() {
     local bucket="$1" key="$2" size="$3" tmp
-    tmp="$(qssrt_scratch)/put-$$-$RANDOM"
+    # mktemp, and nothing cheaper: $$ is the same for every parallel
+    # worker of a phase, and forked workers inherit IDENTICAL $RANDOM
+    # state -- so under the crash storm all four workers computed the
+    # same tmp path in lockstep and uploaded each other's bytes. The
+    # store faithfully served that back, and the campaign read it as 52
+    # corrupted objects.
+    tmp=$(mktemp "$(qssrt_scratch)/put-XXXXXXXX") || return 1
     gen_file "$key" "$size" "$tmp"
     s3_put_file "$bucket" "$key" "$tmp"
     local status=$?
@@ -106,15 +112,19 @@ s3_get_stream() {
     mkfifo "$fifo" || return 1
     (
         # On failure, open and close the FIFO so the reader sees EOF instead
-        # of hanging forever on a GET that never started.
-        s3api get-object --bucket "$bucket" --key "$key" "$fifo" >/dev/null 2>&1 ||
-            : >"$fifo"
+        # of hanging forever on a GET that never started; the status file
+        # keeps the failure from masquerading as an empty object.
+        s3api get-object --bucket "$bucket" --key "$key" "$fifo" >/dev/null 2>&1
+        aws_status=$?
+        [ "$aws_status" = 0 ] || : >"$fifo"
+        printf '%s' "$aws_status" >"$fifo.status"
     ) &
     timeout "${QSSRT_GET_TIMEOUT:-3600}" cat "$fifo"
     status=$?
     wait
-    rm -f "$fifo"
-    return $status
+    [ "$status" = 0 ] && status=$(cat "$fifo.status" 2>/dev/null || printf 1)
+    rm -f "$fifo" "$fifo.status"
+    return "${status:-1}"
 }
 
 # The object's bytes, fetched the way a client actually fetches a big one:
