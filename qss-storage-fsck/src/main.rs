@@ -200,6 +200,7 @@ async fn run(cli: Cli) -> Result<u8> {
         Some(store.header_spec()),
         false,
         store.stripe_count,
+        store.max_blocks_per_commit,
     )?;
 
     let options = if cli.scrub {

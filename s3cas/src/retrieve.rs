@@ -61,6 +61,7 @@ pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
         Some(store.header_spec()),
         store.verify_on_read,
         store.stripe_count,
+        store.max_blocks_per_commit,
     )?;
 
     let (obj_meta, paths) = match casfs.get_object_paths(&args.bucket, &args.key)? {
@@ -111,6 +112,7 @@ mod tests {
             verify_on_read: false,
             hasher: Hasher::Blake3W32,
             stripe_count: None,
+            max_blocks_per_commit: None,
         }
     }
 

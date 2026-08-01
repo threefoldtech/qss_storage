@@ -10,6 +10,7 @@ use crate::metastore::{
 use super::block_disk::{AtomicBlockWriter, BLOCKS_DB_DIR_NAME, BlockDiskOps, RealDiskOps};
 use super::placement::BlockPlacement;
 use super::stripes::{DEFAULT_STRIPE_COUNT, Stripes};
+use super::write_path::DEFAULT_MAX_BLOCKS_PER_COMMIT;
 use super::{StorageEngine, multipart::MultiPartTree};
 
 /// SharedBlockStore manages everything block-scoped that must be one per
@@ -36,6 +37,8 @@ pub struct SharedBlockStore {
     placement: BlockPlacement,
     /// Per-block-hash lock stripes; every `_BLOCKS` mutation runs under one.
     stripes: Stripes,
+    /// Most block records one transaction carries (ADR 0010).
+    max_blocks_per_commit: usize,
     /// The atomic temp+fsync+rename writer (open duties already run).
     disk_writer: AtomicBlockWriter,
     /// The low-level disk ops the writer drives; swapped by tests.
@@ -61,11 +64,15 @@ impl SharedBlockStore {
     ///   an existing store is opened. `None` takes [`HeaderSpec::default`].
     /// * `stripe_count` - Number of block lock stripes; `None` takes
     ///   [`DEFAULT_STRIPE_COUNT`]. Sizing rule in `cas::stripes`.
+    /// * `max_blocks_per_commit` - Most block records one transaction carries
+    ///   (ADR 0010); `None` takes [`DEFAULT_MAX_BLOCKS_PER_COMMIT`]. Like the
+    ///   stripe count, a property of this process and not of the store.
     ///
     /// # Errors
     ///
     /// [`MetaError::StoreLocked`] if another process holds the blocks DB, and
     /// [`MetaError::Header`] if its header is missing or unacceptable.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut path: PathBuf,
         mut blocks_root: PathBuf,
@@ -74,6 +81,7 @@ impl SharedBlockStore {
         durability: Option<Durability>,
         spec: Option<HeaderSpec>,
         stripe_count: Option<usize>,
+        max_blocks_per_commit: Option<usize>,
     ) -> Result<Self, MetaError> {
         // A store from before the .db rename has its database at
         // <blocks>/db, a name that doubles as the 0xdb fanout slot.
@@ -139,9 +147,21 @@ impl SharedBlockStore {
             placement: BlockPlacement::new(blocks_root.clone()),
             blocks_root,
             stripes: Stripes::new(stripe_count.unwrap_or(DEFAULT_STRIPE_COUNT)),
+            // Clamped rather than refused: the config and CLI layers already
+            // reject zero with a message naming the setting, and a store
+            // built in code should not be able to wedge the write path with
+            // a batch that can never close.
+            max_blocks_per_commit: max_blocks_per_commit
+                .unwrap_or(DEFAULT_MAX_BLOCKS_PER_COMMIT)
+                .max(1),
             disk_writer,
             disk_ops,
         })
+    }
+
+    /// Most block records this process puts in one transaction (ADR 0010).
+    pub(super) fn max_blocks_per_commit(&self) -> usize {
+        self.max_blocks_per_commit
     }
 
     /// Root directory of the block data files. One per store: every

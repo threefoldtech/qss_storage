@@ -370,6 +370,7 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
         Some(args.store.header_spec()),
         args.store.verify_on_read,
         args.store.stripe_count,
+        args.store.max_blocks_per_commit,
     )?;
 
     // store.hash applies at creation only: an existing store is addressed by

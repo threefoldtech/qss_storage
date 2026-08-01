@@ -83,6 +83,13 @@ pub const DEFAULT_STRIPE_COUNT: usize = crate::cas::stripes::DEFAULT_STRIPE_COUN
 /// stripes its two-byte index can never reach; see `cas::stripes`.
 pub const MAX_STRIPE_COUNT: usize = crate::cas::stripes::MAX_STRIPE_COUNT;
 
+/// Blocks one transaction carries when nothing configures a cap (ADR 0010).
+///
+/// Re-exported from `cas::write_path` rather than restated, so this and the
+/// number the write path actually batches are one value.
+pub const DEFAULT_MAX_BLOCKS_PER_COMMIT: usize =
+    crate::cas::write_path::DEFAULT_MAX_BLOCKS_PER_COMMIT;
+
 /// Address the S3 server binds by default.
 pub const DEFAULT_S3_HOST: &str = "localhost";
 
@@ -173,6 +180,17 @@ pub struct StoreConfig {
     /// disk, so two processes may open the same store with different counts
     /// (each still serializes its own writers correctly).
     pub stripe_count: Option<usize>,
+    /// Most block records one transaction carries, and so the widest crash
+    /// residue a single kill can leave (ADR 0010). Absent means
+    /// [`DEFAULT_MAX_BLOCKS_PER_COMMIT`].
+    ///
+    /// A request larger than the cap becomes several consecutive batches, the
+    /// last one closing at the ack; a request smaller than it is one batch,
+    /// so a single-block PUT is unaffected whatever this says. Lower it to
+    /// shorten stripe hold time and narrow the residue, raise it to amortize
+    /// the journal fsync over more blocks. Not written to disk and not a
+    /// format -- two processes may open one store with different caps.
+    pub max_blocks_per_commit: Option<usize>,
 }
 
 /// Refuses a stripe count the store cannot honour as written.
@@ -195,6 +213,25 @@ pub struct StoreConfig {
 pub fn validate_stripe_count(count: usize) -> Result<(), ConfigError> {
     if count == 0 || count > MAX_STRIPE_COUNT {
         return Err(ConfigError::UnsupportedStripeCount(count));
+    }
+    Ok(())
+}
+
+/// Refuses a batch cap of zero.
+///
+/// Zero is the one unusable value: a batch that may hold no blocks commits
+/// nothing and never closes, so the write path would either spin or silently
+/// clamp. An operator who wants the old per-block cadence writes `1`, which
+/// is a legal value and means exactly that. There is no upper bound to
+/// enforce -- a cap above a request's block count simply never binds, and the
+/// transaction size it implies is the operator's to weigh.
+///
+/// # Errors
+///
+/// [`ConfigError::UnsupportedMaxBlocksPerCommit`].
+pub fn validate_max_blocks_per_commit(cap: usize) -> Result<(), ConfigError> {
+    if cap == 0 {
+        return Err(ConfigError::UnsupportedMaxBlocksPerCommit(cap));
     }
     Ok(())
 }
@@ -369,6 +406,9 @@ pub fn parse(text: &str, path: &Path) -> Result<QssStorageConfig, ConfigError> {
     if let Some(count) = config.store.stripe_count {
         validate_stripe_count(count)?;
     }
+    if let Some(cap) = config.store.max_blocks_per_commit {
+        validate_max_blocks_per_commit(cap)?;
+    }
     Ok(config)
 }
 
@@ -398,6 +438,8 @@ pub enum ConfigError {
     UnsupportedHashWidth(u8),
     /// `store.stripe_count` (or `--stripe-count`) is outside the usable range.
     UnsupportedStripeCount(usize),
+    /// `store.max_blocks_per_commit` is zero.
+    UnsupportedMaxBlocksPerCommit(usize),
 }
 
 impl Display for ConfigError {
@@ -429,6 +471,13 @@ impl Display for ConfigError {
                   block writer on one lock, and the stripe index is two bytes \
                   wide so anything larger is never reached)"
             ),
+            ConfigError::UnsupportedMaxBlocksPerCommit(cap) => write!(
+                f,
+                "unsupported batch cap {cap} in store.max_blocks_per_commit \
+                 (expected 1 or more: a batch that may hold no blocks never \
+                  closes; write 1 for one commit per block, the pre-ADR-0010 \
+                  cadence)"
+            ),
         }
     }
 }
@@ -452,6 +501,7 @@ inline_metadata_size = 4096
 metadata_db = "fjall"
 verify_on_read = true
 stripe_count = 4096
+max_blocks_per_commit = 32
 
 [store.hash]
 algo = "blake3"
@@ -490,6 +540,7 @@ admin_password = "hunter2"
         assert_eq!(config.store.metadata_db, Some(StorageEngine::Fjall));
         assert_eq!(config.store.verify_on_read, Some(true));
         assert_eq!(config.store.stripe_count, Some(4096));
+        assert_eq!(config.store.max_blocks_per_commit, Some(32));
         assert_eq!(config.store.hash.algo.as_deref(), Some("blake3"));
         assert_eq!(config.store.hash.width, Some(16));
         assert_eq!(config.store.hash.hasher().unwrap(), Hasher::Blake3W16);
@@ -527,6 +578,10 @@ admin_password = "hunter2"
         assert_eq!(config.store.metadata_db, Some(DEFAULT_METADATA_DB));
         assert_eq!(config.store.verify_on_read, Some(DEFAULT_VERIFY_ON_READ));
         assert_eq!(config.store.stripe_count, Some(DEFAULT_STRIPE_COUNT));
+        assert_eq!(
+            config.store.max_blocks_per_commit,
+            Some(DEFAULT_MAX_BLOCKS_PER_COMMIT)
+        );
         assert_eq!(config.store.hash.algo.as_deref(), Some(DEFAULT_HASH_ALGO));
         assert_eq!(config.store.hash.width, Some(DEFAULT_HASH_WIDTH));
 
@@ -576,6 +631,7 @@ admin_password = "hunter2"
         assert_eq!(config.store.metadata_db, None);
         assert_eq!(config.store.inline_metadata_size, None);
         assert_eq!(config.store.stripe_count, None);
+        assert_eq!(config.store.max_blocks_per_commit, None);
         assert_eq!(config.store.hash.width, None);
         assert_eq!(config.resp.as_ref().unwrap().host, None);
         assert_eq!(config.resp.as_ref().unwrap().data_dir, None);
@@ -706,6 +762,37 @@ admin_password = "hunter2"
                 .unwrap_or_else(|e| panic!("{count} must be accepted: {e}"));
             assert_eq!(config.store.stripe_count, Some(count));
         }
+    }
+
+    /// Zero is the one batch cap that cannot work; 1 is legal and means the
+    /// pre-ADR-0010 cadence, one commit per block.
+    #[test]
+    fn a_zero_batch_cap_is_an_error_and_one_is_not() {
+        let err = parse_str("[store]\nmax_blocks_per_commit = 0\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('0'), "message must name the value: {msg}");
+        assert!(
+            msg.contains("max_blocks_per_commit"),
+            "message must name the setting: {msg}"
+        );
+
+        for cap in [1, 2, DEFAULT_MAX_BLOCKS_PER_COMMIT, 4096] {
+            let config = parse_str(&format!("[store]\nmax_blocks_per_commit = {cap}\n"))
+                .unwrap_or_else(|e| panic!("{cap} must be accepted: {e}"));
+            assert_eq!(config.store.max_blocks_per_commit, Some(cap));
+        }
+    }
+
+    /// The configured default and the one the store actually uses are one
+    /// value, not two that happen to match today.
+    #[test]
+    fn the_default_batch_cap_is_the_write_paths_own() {
+        assert_eq!(
+            DEFAULT_MAX_BLOCKS_PER_COMMIT,
+            crate::cas::write_path::DEFAULT_MAX_BLOCKS_PER_COMMIT
+        );
+        validate_max_blocks_per_commit(DEFAULT_MAX_BLOCKS_PER_COMMIT)
+            .expect("the built-in default must itself be a legal value");
     }
 
     /// The configured default and the one the store actually uses are one

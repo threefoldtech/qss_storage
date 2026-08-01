@@ -292,6 +292,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         fs.create_bucket(BUCKET).unwrap();

@@ -10,7 +10,7 @@
 
 use crate::config::{
     ConfigError, DEFAULT_DURABILITY, DEFAULT_METADATA_DB, DEFAULT_VERIFY_ON_READ, StoreConfig,
-    validate_stripe_count,
+    validate_max_blocks_per_commit, validate_stripe_count,
 };
 use crate::{Durability, Hasher, HeaderSpec, StorageEngine};
 
@@ -34,6 +34,14 @@ pub struct StoreOptions {
     /// how THIS process serializes its own block writers, so it applies on
     /// every open and two processes may legitimately differ.
     pub stripe_count: Option<usize>,
+    /// Most block records one transaction carries (ADR 0010), `None` for the
+    /// built-in default.
+    ///
+    /// Config-file only, like `verify_on_read`: it is a throughput-versus-
+    /// residue-width tradeoff an operator sets once for a deployment, not
+    /// something a one-off CLI invocation has an opinion about. Like
+    /// `stripe_count` it is a property of the process, not of the store.
+    pub max_blocks_per_commit: Option<usize>,
 }
 
 impl StoreOptions {
@@ -62,6 +70,12 @@ impl StoreOptions {
         if let Some(count) = stripe_count {
             validate_stripe_count(count)?;
         }
+        // Re-validated here even though it has no flag to arrive by: a caller
+        // that built a StoreConfig in code rather than parsing one has not
+        // been past the parse-time check.
+        if let Some(cap) = store.max_blocks_per_commit {
+            validate_max_blocks_per_commit(cap)?;
+        }
         Ok(Self {
             metadata_db: metadata_db
                 .or(store.metadata_db)
@@ -73,6 +87,7 @@ impl StoreOptions {
             verify_on_read: store.verify_on_read.unwrap_or(DEFAULT_VERIFY_ON_READ),
             hasher: store.hash.hasher()?,
             stripe_count,
+            max_blocks_per_commit: store.max_blocks_per_commit,
         })
     }
 
@@ -103,6 +118,27 @@ mod tests {
         // None, not the number: the default is applied by the store, so the
         // constant stays the single source of truth.
         assert_eq!(opts.stripe_count, None);
+        assert_eq!(opts.max_blocks_per_commit, None);
+    }
+
+    /// The batch cap has no flag, so the file is the only place it can come
+    /// from -- and an unusable one must still be refused here, because a
+    /// caller may have built the `StoreConfig` without parsing a file.
+    #[test]
+    fn the_batch_cap_comes_from_the_file_and_zero_is_refused() {
+        let store = store_config("[store]\nmax_blocks_per_commit = 8\n");
+        let opts = StoreOptions::resolve(None, None, None, None, &store).unwrap();
+        assert_eq!(opts.max_blocks_per_commit, Some(8));
+
+        let bad = StoreConfig {
+            max_blocks_per_commit: Some(0),
+            ..StoreConfig::default()
+        };
+        let err = StoreOptions::resolve(None, None, None, None, &bad).unwrap_err();
+        assert!(
+            err.to_string().contains("max_blocks_per_commit"),
+            "message must name the setting: {err}"
+        );
     }
 
     #[test]

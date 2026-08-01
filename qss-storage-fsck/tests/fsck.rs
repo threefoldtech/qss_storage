@@ -68,6 +68,7 @@ fn open(dir: &Path) -> CasFS {
         None,
         false,
         None,
+        None,
     )
     .expect("the store must open")
 }

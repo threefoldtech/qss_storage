@@ -19,7 +19,7 @@ mod placement;
 mod read_path;
 pub(crate) mod stripes;
 mod uploads;
-mod write_path;
+pub(crate) mod write_path;
 
 #[cfg(test)]
 pub(crate) mod crash_fixtures;

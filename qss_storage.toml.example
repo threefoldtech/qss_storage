@@ -72,6 +72,25 @@ verify_on_read = false
 # Default: 1024
 stripe_count = 1024
 
+# Most block records one transaction carries (ADR 0010). One request -- a part
+# upload, a single-part PUT -- is one durability unit: its block files are made
+# durable as a group, then all of its block records commit in ONE transaction
+# with ONE journal fsync, and only then does the client see success. A request
+# holding more blocks than this becomes several consecutive batches, the last
+# one closing at the ack; a request holding fewer is a single batch, so a
+# one-block PUT costs exactly what it always did.
+#
+# The tradeoff this knob moves: a larger cap amortizes the journal fsync over
+# more blocks (that is the throughput), a smaller one shortens how long a batch
+# holds its stripes and narrows the crash residue. A kill between a batch's
+# directory sync and its commit leaves up to this many orphan block files --
+# residue class 1, which fsck collects and a later PUT of the same content
+# heals in place. Nothing here is written to disk: change it freely between
+# restarts. 1 means one commit per block, the cadence from before ADR 0010.
+# respd ignores this key: it stores no blocks.
+# Default: 64
+max_blocks_per_commit = 64
+
 # ---------------------------------------------------------------------------
 # [store.hash] -- how blocks are addressed.
 #

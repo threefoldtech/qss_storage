@@ -30,6 +30,7 @@
 //!     None,                // header spec (defaults to blake3/32)
 //!     false,               // verify_on_read
 //!     None,                // stripe count (defaults to 1024)
+//!     None,                // blocks per commit (defaults to 64)
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())
@@ -55,6 +56,7 @@
 //!     Some(Durability::Fsync),
 //!     None,                // header spec (defaults to blake3/32)
 //!     None,                // stripe count (defaults to 1024)
+//!     None,                // blocks per commit (defaults to 64)
 //! )?);
 //!
 //! // One CasFS per namespace (e.g. per user)

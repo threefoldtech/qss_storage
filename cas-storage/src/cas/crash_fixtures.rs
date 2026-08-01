@@ -235,6 +235,7 @@ mod tests {
                 Some(Durability::Buffer),
                 None,
                 None,
+                None,
             )
             .unwrap(),
         );
