@@ -1,12 +1,15 @@
 # Strangers Share a Flush: Cross-Request Group Commit
 
-**Status**: Accepted (2026-08-01), all four review asks APPROVED (owner,
-2026-08-01): natural batching default with `group_commit_window = 0` and
-the timer strictly opt-in; `max_blocks_per_commit` is the one and only
-group bound; degrade-to-individual replay on group tx failure; blocks-DB
-scope only. Both Open Questions under "Behavior definers" are ruled AS
-PROPOSED: group commit merges at `buffer` durability too, and the degrade
-path's replay is strictly direct. Ready for implementation.
+**Status**: Implemented (2026-08-01). All four review asks APPROVED
+(owner, 2026-08-01): natural batching default with
+`group_commit_window = 0` and the timer strictly opt-in;
+`max_blocks_per_commit` is the one and only group bound;
+degrade-to-individual replay on group tx failure; blocks-DB scope only.
+Both Open Questions under "Behavior definers" ruled AS PROPOSED and built
+that way: group commit merges at `buffer` durability too, and the degrade
+path's replay is strictly direct. See **As Built** for the deviations, and
+the **Rider** section for a separate durability fix that shipped in the
+same series.
 **Date**: 2026-08-01
 
 ---
@@ -359,6 +362,107 @@ plus a new small-object A/B (4 KiB x N clients) as the regression pair.
 **Polish**
 - Config names `group_commit` / `group_commit_window`: proposed as
   written; renaming later is free until the first release ships them.
+
+---
+
+## As Built (2026-08-01)
+
+Implemented as decided. Seven deviations, all narrower or more explicit
+than the text rather than wider.
+
+### The committer loop is a task; the group's close is the blocking part
+
+The ADR says "one committer loop on a blocking thread". What was built is
+a tokio task that receives sealed batches and awaits the stripe union, and
+then runs the whole close -- renames, directory syncs, transaction,
+persist -- inside ONE `spawn_blocking` closure that OWNS the stripe guard.
+The reason is the stripes: they are `tokio::sync::Mutex`es, so acquiring
+them is an await, and a raw thread would have to block a runtime handle on
+them from outside the runtime. The shape that came out is exactly ADR
+0010's `flush_batch` at group width, which is also what makes the hard
+rules hold by the same argument as before: no await inside the
+transaction, and the rename-through-persist stretch runs to completion
+whether or not anybody is still waiting for it.
+
+### The station is built on first use, not at store open
+
+`SharedBlockStore::new` records the option and a `OnceLock`; the station
+starts on the first flush that wants one. A store is also opened by tools
+with no tokio runtime at all -- fsck, `s3cas check`, `s3cas retrieve` --
+and spawning a committer there would panic. Building it lazily means
+`group_commit = true` in a shared config file cannot crash the offline
+tools of the same deployment. Those tools additionally pass `None`
+explicitly, because a committer waiting on a queue nobody feeds is not
+something a read-only command should own.
+
+### A record read that FAILS under the stripes does not fail anybody there
+
+The group's pre-transaction pass reads each distinct block record to
+decide the file work. ADR 0010's single-batch close propagates a read
+error immediately; the group closer logs it and records "no live record"
+instead, leaving the transaction as the single authority. The transaction
+reads the same bytes through the same decode, fails there, and THAT is
+what routes the member to the degrade path and isolates it. Being wrong in
+this direction costs a rename-over of identical bytes; being wrong the
+other way would commit a record whose file is gone. This is what makes
+stranger isolation total rather than only transactional, and it is what
+`a_poisoned_member_fails_alone_and_its_group_acks` exercises.
+
+### Two failures are isolated BEFORE the transaction, and one is not
+
+- A member whose block file could not be placed at all (an overtaken
+  dedup hit whose rewrite failed, with no other member staging a copy)
+  fails on its own, before the transaction, because a record naming a
+  file that does not exist is the one thing this protocol must never
+  commit.
+- A landing failure -- a rename or a directory fsync that errors -- fails
+  the WHOLE group. The ADR's isolation promise is scoped to the group
+  transaction, and a filesystem that has stopped answering is not one
+  member's fault. This keeps `land_batch` exactly as ADR 0010 wrote it,
+  including the union directory sync.
+
+### The group bound counts the sum, not the union
+
+A member is admitted while `blocks_so_far + member.len() <=
+max_blocks_per_commit`. Distinct ids shared between members are counted
+once per member, so a group can be slightly smaller than the cap would
+allow. Conservative in the direction the cap exists for, and it avoids
+computing a union to decide whether to compute a union. A member that
+would overflow is carried to lead the next group, which is also the only
+reason the gathering loops can stop mid-drain: an unbounded receiver has
+no way to un-receive.
+
+### Metrics are the counter pair, not a histogram
+
+`GroupCommitStats { groups, members, largest, degraded }`, exposed from
+the store and as four prometheus counters in s3cas (`s3_group_commits`,
+`s3_group_commit_members`, `s3_group_commits_degraded`). The ADR allows
+this explicitly ("or at minimum a counter pair allowing mean group
+size"), `groups` IS the persists count the ADR asks for, and `degraded`
+is the signal the failure-isolation path needed and the ADR did not name.
+
+### The window is a real wait, including for a lone member
+
+With a non-zero `group_commit_window`, a request that arrives to an idle
+committer waits out the window before its group closes. That is the
+deadline-from-the-first-entrant semantics as specified, and it is the
+price the knob exists to charge -- which is why it defaults to zero and
+why `a_lone_request_does_not_wait_at_window_zero` asserts both rows: the
+zero-window PUT returns at once, and the one-second-window PUT really
+does take a second.
+
+### Measured
+
+Nothing was benchmarked here. The 16 GiB A/B
+(`tests/real/tools/durability-bench.sh`) and the new small-object A/B the
+ADR calls for stay the external rig's, and the campaign stays the
+acceptance gate. The in-tree tests assert correctness and grouping
+behaviour, not throughput: a lone request's latency at window zero, one
+poisoned member failing alone while three strangers ack, the cross-member
+same-block merge at rc exactness over ten rounds, a kill at group width
+leaving class-1-only residue that a retry heals, a cap that bounds the
+group and not just the batch, and a 24-writer small-object flood whose
+refcounts close exactly.
 
 ---
 
