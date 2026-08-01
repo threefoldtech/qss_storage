@@ -1,10 +1,12 @@
 # Strangers Share a Flush: Cross-Request Group Commit
 
-**Status**: Proposed, all four review asks APPROVED (owner, 2026-08-01):
-natural batching default with `group_commit_window = 0` and the timer
-strictly opt-in; `max_blocks_per_commit` is the one and only group bound;
-degrade-to-individual replay on group tx failure; blocks-DB scope only.
-Ready for implementation.
+**Status**: Accepted (2026-08-01), all four review asks APPROVED (owner,
+2026-08-01): natural batching default with `group_commit_window = 0` and
+the timer strictly opt-in; `max_blocks_per_commit` is the one and only
+group bound; degrade-to-individual replay on group tx failure; blocks-DB
+scope only. Both Open Questions under "Behavior definers" are ruled AS
+PROPOSED: group commit merges at `buffer` durability too, and the degrade
+path's replay is strictly direct. Ready for implementation.
 **Date**: 2026-08-01
 
 ---
@@ -346,14 +348,13 @@ plus a new small-object A/B (4 KiB x N clients) as the regression pair.
       keyspaces are many.
 
 **Behavior definers**
-- [ ] Should group commit merge at `buffer` durability too (tx merge, no
-      persist -- lock contention is the only win)? Proposed: yes, the
-      station is durability-agnostic and the 1025 -> 2360 buffer delta
-      says tx count alone is worth it.
-- [ ] Is the degrade path's individual replay allowed to re-enter the
-      station (and possibly merge with a NEW group), or strictly direct?
-      Proposed: strictly direct -- degraded means degraded, no second
-      coupling on the retry.
+- [x] RULED AS PROPOSED (owner, 2026-08-01): group commit merges at
+      `buffer` durability too (tx merge, no persist -- lock contention is
+      the only win). The station is durability-agnostic and the
+      1025 -> 2360 buffer delta says tx count alone is worth it.
+- [x] RULED AS PROPOSED (owner, 2026-08-01): the degrade path's
+      individual replay is STRICTLY DIRECT -- it never re-enters the
+      station. Degraded means degraded, no second coupling on the retry.
 
 **Polish**
 - Config names `group_commit` / `group_commit_window`: proposed as
