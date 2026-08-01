@@ -1,0 +1,77 @@
+# qss_storage-realtest.toml -- the daemon configuration the real-hardware
+# campaign runs on (ADR 0009 ground rule 3).
+#
+# This is NOT a deployment example; see qss_storage.toml.example for that.
+# It is the campaign's own file, and the values in it are chosen to make the
+# phases mean something:
+#
+#   - fsync durability by default, because that is the strongest claim we
+#     make and the one the campaign is here to test. Phase 7 re-runs the
+#     crash cycle at buffer level by passing --durability on the command
+#     line, which outranks this file.
+#   - the shortest multipart TTL the daemon accepts, for phase 3.
+#   - an explicit inline threshold, so phase 1's inline boundary exists at
+#     all: the shipped default is 1, which inlines nothing.
+#   - loopback endpoints on 127.0.0.1, matching tests/real/campaign.conf.
+#
+# Paths are NOT here: --fs-root and --meta-root are command-line only by
+# design, and the harness passes them from campaign.conf.
+
+[store]
+
+# The strongest level, and the one every durability claim in ADR 0006 is
+# written against.
+durability = "fsync"
+
+# Objects at or below this many bytes live inside their metadata record.
+# The payload that actually fits is this minus the object header, so phase 1
+# measures the boundary by watching the block-file count rather than
+# asserting the arithmetic.
+inline_metadata_size = 1024
+
+metadata_db = "fjall"
+
+# Left off: the campaign verifies content by byte-comparing against its own
+# generator on every GET, and the whole-store integrity claim comes from
+# `qss-storage-fsck --scrub` in phase 8. Turning it on would measure the
+# read path's verify cost instead, which is a different campaign.
+verify_on_read = false
+
+# The default. The stress and terabyte phases run more concurrent writers
+# than a laptop would, and this is the knob that keeps unrelated blocks off
+# the same lock.
+stripe_count = 1024
+
+[store.hash]
+algo = "blake3"
+width = 32
+
+[s3]
+host = "127.0.0.1"
+port = 18034
+
+# Must match QSSRT_ACCESS_KEY and QSSRT_SECRET_KEY in campaign.conf;
+# preflight refuses to run if they have drifted apart. Not a secret: a
+# loopback-bound daemon on a disk that is about to be wiped.
+access_key = "qssrealtest"
+secret_key = "qssrealtestsecret"
+
+[s3.metrics]
+host = "127.0.0.1"
+port = 19140
+
+[multipart]
+
+# One day is the shortest TTL the daemon accepts, and the sweep period has a
+# one-hour floor (max(ttl/20, 1h)), so a real sweep cannot be observed inside
+# a 2-4 hour campaign. Phase 3 asserts everything that does not require
+# waiting and skips the sweep itself unless QSSRT_GC_WAIT=1 buys the ~25
+# hours. Recorded in docs/realtest.md as the one place the ADR's phase 3
+# cannot be executed as literally written.
+stale_ttl_days = 1
+
+[resp]
+host = "127.0.0.1"
+port = 16399
+
+# data_dir is passed on the command line by the harness, per store.
