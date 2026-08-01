@@ -2,9 +2,13 @@
 
 **Audience**: fjall-rs maintainers (eventually), and this repo's own record.
 **Status**: tech doc only -- deliberately NOT yet an issue or PR upstream.
-**Date**: 2026-08-01
-**fjall**: 3.1.8 (crates.io; source cross-checked against the fjall-rs/fjall
-repo at tag 3.1.8, local clone at ~/prppl/fjall)
+One finding here is confirmed-and-fixed on our side; the crash-loss
+mechanism itself is OPEN, with a preserved corpse that constrains it.
+**Date**: 2026-08-01 (revised same day: the first draft's mechanism
+hypothesis did not survive its own regression test, and this document says
+so rather than pretending otherwise)
+**fjall**: 3.1.8 (crates.io; source cross-checked against fjall-rs/fjall at
+tag 3.1.8, local clone at ~/prppl/fjall)
 **Consumer**: qss_storage (content-addressed S3 store; fjall via
 `SingleWriterTxDatabase`, one database for block records, one per-namespace
 database for object records)
@@ -13,24 +17,22 @@ database for object records)
 
 ## One-paragraph summary
 
-An application that acknowledges writes to its clients after
-`keyspace.insert()` returns -- without calling `persist()` -- has
-acknowledged data that may not exist ANYWHERE outside its own process
-memory: not on disk, not in the page cache, invisible to the kernel. fjall's
-journal writer buffers entries in an 8 KiB userspace `BufWriter`, nothing
-bounds how long an entry may sit there, and `PersistMode::Buffer` -- whose
-name suggests "the cheapest tier, basically what happens anyway" -- is in
-fact the operation that would have saved the data (it drains the buffer to
-the OS). We hit this in production-grade crash testing, lost acknowledged
-records across `kill -9`, spent a night suspecting journal rotation and
-write-behind (both innocent), and only closed it with a post-kill snapshot
-of the store taken before recovery ran. This document is the write-up we
-wish we could have read first: the mechanism, the evidence, the consumer
-mistake, and two small upstream suggestions that would make the trap harder
-to fall into. The primary fault is ours -- we did not call `persist()` on an
-ack-carrying path. The sharp edge is real nonetheless.
-
----
+While crash-testing at our weakest durability level we lost three
+client-acknowledged writes across `kill -9` (never at our fsync level, and
+never reproducible by killing at the ack -- 492 targeted kills, zero
+losses). Chasing it produced two distinct results. CONFIRMED: fjall
+persists single keyspace operations (`insert`/`remove` outside an explicit
+batch or tx) with `PersistMode::Buffer` unconditionally -- reaching the
+kernel, but never fsyncing -- so an application that maps "fsync
+durability" onto bare keyspace writes silently has power-loss-vulnerable
+acks; we fixed that on our side by calling `persist(<configured mode>)` on
+every ack-carrying path, and a one-line doc note upstream would spare the
+next consumer the archaeology. OPEN: the kill -9 losses themselves are NOT
+explained by the userspace journal buffer, which was our first theory --
+the corpse of a reproduced loss (store snapshotted between kill and
+restart, before recovery) shows acknowledged records absent from the
+on-disk journal in a pattern that theory cannot produce, detailed below.
+We would value a maintainer's read on it.
 
 ## The mechanism, from source (fjall 3.1.8)
 
@@ -38,123 +40,103 @@ ack-carrying path. The sharp edge is real nonetheless.
 
 - The journal writer wraps its file in a `BufWriter` with
   `JOURNAL_BUFFER_BYTES = 8 * 1024` (writer.rs:21, :177, :194).
-- `write_raw` (single op) and `write_batch` (batch/tx commit) serialize
-  entries and `write_all` them INTO THE BUFWRITER, setting
-  `is_buffer_dirty = true` (writer.rs:258-298, :326-379). No flush happens
-  here. When these return, the bytes are in process memory only.
-- `Writer::persist(mode)` (writer.rs:203-234) first drains the BufWriter to
-  the kernel (`self.file.flush()`) whenever it is dirty, and THEN applies
-  the mode: `SyncAll` -> `sync_all()`, `SyncData` -> `sync_data()`,
-  `Buffer` -> `Ok(())`.
+- `write_raw` / `write_batch` serialize entries INTO the BufWriter and mark
+  it dirty (writer.rs:258-298, :326-379). No flush here.
+- `Writer::persist(mode)` (writer.rs:203-234) FIRST drains the BufWriter to
+  the kernel (`flush()`) whenever dirty, THEN applies the mode: `SyncAll`
+  -> `sync_all()`, `SyncData` -> `sync_data()`, `Buffer` -> `Ok(())`.
 
-So the three `PersistMode`s are not "nothing / fdatasync / fsync". They are
-"write() / write()+fdatasync / write()+fsync". `PersistMode::Buffer` is not
-a no-op tier -- it is the write() tier, and it only exists for callers who
-CALL persist. A consumer who never calls `persist()` gets a fourth,
-undocumented tier: nothing at all, bounded only by the 8 KiB buffer rolling
-over from later traffic (or journal rotation's internal
-`persist(SyncAll)`, writer.rs:67, at the default 64 MiB pre-allocation).
+So the three `PersistMode`s are write() / write()+fdatasync /
+write()+fsync -- `Buffer` is not a no-op, it is the write() tier.
 
-There is no time bound. On a quiet keyspace, an entry can sit in the
-userspace buffer indefinitely.
+The part we missed on first read, found by writing a regression test
+against our own hypothesis: single keyspace operations do not skip persist.
+`SingleWriterTxKeyspace::insert`/`remove` route through an internal write
+that fjall itself persists with `PersistMode::Buffer` (see the
+`durability(Some(PersistMode::Buffer))` wiring in `src/db.rs`), so bare
+writes ARE kernel-visible by the time they return. Our deterministic test
+-- ack a write, then read the journal FILES through the filesystem and
+assert the record bytes are present -- passes on unmodified fjall 3.1.8,
+at every durability level. That test killed our first theory (below) and
+now pins the boundary permanently in our suite.
 
-## What we observed
+## Finding 1 (confirmed, fixed on our side): bare writes cap out at Buffer
 
-Contract under test: our `buffer` durability level promises "acknowledged
-writes survive process kill; only power loss / OS crash may take them" --
-i.e. write()-before-ack semantics. Our crash campaign (kill -9 mid-storm,
-restart, verify every client-acknowledged object) produced:
+The flip side of that internal `PersistMode::Buffer`: it is applied
+REGARDLESS of what durability the application wanted. Transactions let the
+caller persist afterwards at any mode (we always did); bare keyspace
+writes got Buffer, full stop, unless the application remembers to call
+`persist()` itself -- and ours did not. Every ack-carrying
+non-transactional write we make (bucket creation, multipart-upload
+creation, `UploadPart`'s ETag, our RESP daemon's `SET`/`DEL`) was
+therefore page-cache-only even with the store configured to fsync.
+Invisible to kill-based testing (the page cache outlives the process);
+real against power loss. Fixed on our side: `insert`/`remove` now call
+`persist(<configured mode>)` before returning -- one added journal fsync
+per such ack at our fsync level, free at our buffer level.
 
-- Hundreds of storm PUTs per cycle: acknowledged, survived, every cycle.
-- THREE lost objects across ~45 buffer-durability cycles over two days
-  (`mp-94`, `mp-61`, then reproduced-on-purpose `mp-68`) -- every single
-  one a multipart-complete acknowledgement, never a storm PUT.
-- A targeted rig doing kill-the-instant-complete-acks: 492 kills across
-  btrfs and xfs, ZERO losses. The naive window does not reproduce it.
+Upstream suggestion 1: a sentence on the keyspace write API -- "single
+operations are persisted at `PersistMode::Buffer`; call `persist()` for
+stronger guarantees" -- would have saved us the archaeology. The behavior
+is defensible; its discoverability is the trap.
 
-The decisive instrument was a store snapshot (`cp -a`) taken between the
-kill and the restart, so recovery could not rewrite the journal tail before
-we read it. In the reproduction's corpse
-(`target/realtest/loss-snapshots-20260801T144750/buffer-cycle7`):
+## Finding 2 (open): the kill -9 losses, and the corpse that refuses both theories
 
-- The lost key's multipart and part records ARE present in the (busy,
-  frequently-rolled) blocks-database journal.
-- The lost key's object record -- the write its acknowledgement rode on --
-  appears NOWHERE in the namespace-database journal file, while its
-  immediate neighbors (`mp-66`, `mp-67`, acknowledged seconds earlier) are
-  present and survived.
+The observations:
 
-That pattern is exactly the 8 KiB buffer: the namespace database sees one
-small record per object (thin traffic, buffer lingers), the blocks
-database sees a flood (buffer rolls constantly). The record died in
-userspace, pre-write(); recovery then correctly replayed a journal that
-genuinely never contained it. It also explains the 492-kill negative: a
-kill immediately after a quiet ack usually lands just after the buffer
-happened to roll; only a hot storm keeps the tail wide.
+- Three acknowledged CompleteMultipartUpload results lost across kill -9
+  at our buffer level, out of ~45 hot-storm crash cycles over two days;
+  never a plain PUT, never at our fsync level, and 492 kill-at-the-ack
+  attempts reproduce nothing.
+- The reproduction we finally captured (a `cp -a` of the store between the
+  kill and the restart, so recovery could not touch the tail): the lost
+  key appears exactly TWICE in the on-disk journals -- its
+  create-multipart-upload records -- while each surviving neighbor key
+  (acknowledged seconds earlier and seconds later) appears ~15 times. The
+  lost key's part-upload records and its object record are absent from
+  every `.jnl` file in the snapshot. No journal rotation had occurred.
 
-## The consumer-side fault (ours)
+Why our first theory died: "the record was still in the 8 KiB userspace
+BufWriter when the kill landed" explains a missing TAIL. It does not
+explain this shape -- the part-upload acks happened SECONDS before the
+kill, on the busy database whose buffer rolls constantly, and (per Finding
+1's investigation) every one of those writes ends in a
+`persist(PersistMode::Buffer)` that drains the buffer to the kernel. Once
+write() returns, `kill -9` cannot unwrite it. Writes acknowledged AFTER
+the lost key's survived the same kill. An append-only, single-writer,
+mutex-serialized journal should not be able to contain later entries while
+physically missing earlier flushed ones.
 
-Our transactional writes were correct all along: every transaction commit
-is followed by `db.persist(<configured mode>)`. What was not correct: our
-non-transactional tree writes (`keyspace.insert()` directly) -- which is
-the path our object records take, i.e. the very write each S3
-acknowledgement stands on -- called `persist()` NEVER, at ANY durability
-level. Two consequences:
+Constraints any explanation has to satisfy: process kill only (no power
+involved); the missing records span two databases (parts in one, the
+object record in the other); the corpse's journal files carry the 64 MiB
+`set_len` preallocation with the written region ending before the missing
+records; recovery afterwards behaved correctly for what the files
+contained. Things this suggests to us, none verified: something in the
+journal manager / memtable-seal path that can drop or redirect buffered
+entries under concurrency; or a write path for these specific operations
+that does not end in the persist we think it does; or an error swallowed
+somewhere that poisoned less than it should have. We know what it is NOT:
+rotation (`Writer::rotate` begins with `persist(SyncAll)` under the writer
+lock) and tx write-behind (batch commit `write_batch`es synchronously
+under the same lock) were both cleared by source reading, and the plain
+BufWriter-tail theory is refuted above.
 
-- At our `buffer` level: the proven kill-loss above.
-- At our `fsync` level: a latent POWER-LOSS window. The object record
-  reaches the kernel when the 8 KiB buffer rolls and stable storage only
-  at journal rotation. Our campaign is kill-only by design (no power-loss
-  rig yet), which is why this second gap produced no finding; the source
-  makes it unarguable.
-
-Fix (in progress on our side, rides with our group-commit change):
-ack-carrying non-transactional writes are followed by `persist()` at the
-store's durability before the acknowledgement -- `PersistMode::Buffer` at
-our buffer level (a write(), near-free), `SyncAll` at our fsync level (a
-real added fsync; correctness first). Not fjall's bug to fix.
-
-## Why we are writing to you anyway: two suggestions
-
-1. **Documentation sharpening.** `PersistMode::Buffer`'s doc comment
-   ("Flushes data to OS buffers...") is accurate for CALLERS OF PERSIST,
-   but the enum reads like a durability ladder whose bottom rung is "what
-   you get anyway". The trap is believing insert-then-ack already has
-   Buffer semantics. One sentence on `insert`/`remove`/`Batch::commit` --
-   "data is buffered in process memory until `persist()` is called or the
-   journal buffer fills; an application that acknowledges writes without
-   `persist(PersistMode::Buffer)` can lose acknowledged data on process
-   crash" -- would likely have saved us (and, we suspect, others: this
-   failure needs a hot process, a kill, and a quiet keyspace to show
-   itself, and it hides from naive crash tests, which is the worst kind of
-   rare).
-
-2. **An opt-in bound on buffer residence.** Either a keyspace/database
-   option to flush-on-commit (write() only -- the cost is a syscall per
-   commit, and applications that want fewer can group), or a time bound (a
-   flush of dirty journal buffers on some small interval). Either would
-   convert "unbounded invisible window on quiet keyspaces" into a bounded
-   one for consumers who never learned to call persist. We are NOT asking
-   for a behavior change to defaults; the current design is coherent and
-   fast, and everything needed already exists via `persist()`.
+Upstream suggestion 2 (really a question): does this shape ring a bell? We
+can share the corpse (pre-recovery journals + sstables + the acknowledged
+set, 4.8 MiB) and the harness that reproduced it (~1 loss per 15 hot-storm
+crash cycles).
 
 ## Reproduction, if wanted
 
 All in the qss_storage repo (github.com/threefoldtech/qss_storage):
 
-- `tests/real/tools/buffer-loss-repro.sh` -- the naive kill-at-ack rig
-  (expected result: no loss; that negative is part of the story).
+- `tests/real/tools/buffer-loss-repro.sh` -- the kill-at-ack rig; its
+  hundreds of clean kills are themselves part of the evidence.
 - `tests/real/run.sh --fresh --phase 7` with `QSSRT_CRASH_CYCLES=15` and
   `QSSRT_CRASH_SNAPSHOT_DIR=<dir>` -- the hot-storm crash matrix with
   pre-recovery snapshots; reproduced the loss 1-in-15 cycles on xfs.
-- The corpse itself (pre-recovery journal + sstables + the acknowledged
-  set, 4.8 MiB) is preserved and can be shared on request.
-
-## Non-conclusions
-
-For completeness, two mechanisms we suspected first and cleared by source
-reading, so nobody re-suspects them: journal rotation
-(`Writer::rotate` begins with `persist(SyncAll)` under the writer lock --
-no window there) and tx write-behind (batch commit `write_batch`es
-synchronously under the same lock -- ordering is fine). The buffer between
-`write_all` and `flush` is the whole story.
+- The corpse: preserved outside the repo, available on request.
+- The permanent regression tests for the write-visibility boundary:
+  `cas-storage/src/metastore/stores/fjall.rs` (journal-bytes assertions)
+  and `cas-storage/src/cas/ack_visibility_tests.rs`.
