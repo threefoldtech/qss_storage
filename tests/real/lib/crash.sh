@@ -100,6 +100,31 @@ crash_cycle() {
     acked=$(wc -l <"$ack")
     record "cycle-$cycle-acked-objects" "$acked"
 
+    # Buffer-loss investigation (findings buffer-3/mp-94, mp-61): the
+    # store's METADATA exactly as the kill left it, BEFORE recovery gets to
+    # rewrite the journal's tail. Opt-in via QSSRT_CRASH_SNAPSHOT_DIR; off,
+    # nothing changes. The block fanout is listed rather than copied -- a
+    # RECORD ABSENT corpse is fjall's journal and sstables, and the listing
+    # proves which files existed without copying gigabytes per cycle. The
+    # operator (or the driver) deletes snapshots of cycles that verified
+    # clean; one that reproduces the loss ships as the fjall-rs report.
+    if [ -n "${QSSRT_CRASH_SNAPSHOT_DIR:-}" ]; then
+        local snap entry
+        snap="$QSSRT_CRASH_SNAPSHOT_DIR/$label-cycle$cycle"
+        mkdir -p "$snap/store/blocks"
+        for entry in "$QSSRT_S3_STORE"/* "$QSSRT_S3_STORE"/.[!.]*; do
+            [ -e "$entry" ] || continue
+            [ "$(basename "$entry")" = blocks ] && continue
+            cp -a "$entry" "$snap/store/"
+        done
+        [ -d "$QSSRT_S3_STORE/blocks/.db" ] &&
+            cp -a "$QSSRT_S3_STORE/blocks/.db" "$snap/store/blocks/"
+        find "$QSSRT_S3_STORE/blocks" -path '*/.db' -prune -o \
+            -type f -printf '%P\t%s\n' >"$snap/block-files.tsv" 2>/dev/null
+        cp "$ack" "$snap/acked.tsv"
+        check_pass "cycle $cycle: post-kill metadata snapshot" "$snap"
+    fi
+
     s3d_start "$durability" ||
         check_fail "cycle $cycle: daemon restarts after kill -9" "it did not come back"
 
