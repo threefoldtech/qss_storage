@@ -1,6 +1,6 @@
 # The Database Takes the Fast Disk: Tiered Store Roots
 
-**Status**: Proposed, all four review asks APPROVED (owner, 2026-08-01):
+**Status**: Accepted, all four review asks APPROVED (owner, 2026-08-01):
 automatic adoption at first open; recovery via fsck's explicit re-pair
 verb only, no daemon override; paths stay CLI-only with the two roots as
 the whole placement mechanism; no third `--blocks-db-path` knob until a
