@@ -1,10 +1,11 @@
 # The Database Takes the Fast Disk: Tiered Store Roots
 
-**Status**: Accepted, all four review asks APPROVED (owner, 2026-08-01):
-automatic adoption at first open; recovery via fsck's explicit re-pair
-verb only, no daemon override; paths stay CLI-only with the two roots as
-the whole placement mechanism; no third `--blocks-db-path` knob until a
-workload asks. Ready for implementation.
+**Status**: Implemented (2026-08-01). All four review asks APPROVED
+(owner, 2026-08-01): automatic adoption at first open; recovery via
+fsck's explicit re-pair verb only, no daemon override; paths stay
+CLI-only with the two roots as the whole placement mechanism; no third
+`--blocks-db-path` knob until a workload asks. Deviations and choices the
+plan left open are in "As Built" at the end.
 **Date**: 2026-08-01
 
 ---
@@ -321,4 +322,74 @@ whole shape end to end.
       are opened through the same paired root.
 
 **Polish**
-- Marker filename `.store-id`: proposed as written.
+- Marker filename `.store-id`: proposed as written, and built as written.
+
+---
+
+## As Built (2026-08-01)
+
+Where the code differs from the plan above, or decided something the plan
+left open. Everything else landed as written.
+
+**The id lives in the header's reserved bytes.** `store_id: [u8; 16]`
+took the 16 bytes the record already reserved
+(`cas-storage/src/metastore/store_header.rs`), so `STORE_HEADER_SIZE`
+stays 32 and the format version stays 3 -- which is what makes old stores
+open at all: a pre-0012 header reads as the all-zero pattern, and
+all-zero is the on-disk spelling of "no id" (`StoreId::from_bytes`
+rejects it; a v4 UUID is never zero). The cost is that the record now has
+no spare bytes: the next field is a version bump. Recorded in
+`docs/as-built/02-storage-model.md`.
+
+**Every database mints an id, only one is ever compared.**
+`StoreHeader::create` mints for the blocks DB, each namespace DB and
+respd's DB alike -- the header code has no idea which kind it is writing.
+Only the blocks DB's id is compared against a marker, which is the
+open question's "store-level covers them" answer as built: namespace DBs
+are opened through the already-paired meta root and carry no pairing of
+their own. respd stays out of scope.
+
+**Six pairing states, not four.** `pair_the_roots`
+(`cas-storage/src/cas/shared_block_store.rs`) resolves the full cross
+product, and two rows needed a ruling the ADR does not give:
+
+- *header absent, marker present*: the marker's id is taken INTO the
+  header rather than a new one minted over it. "The header is
+  authoritative" cannot apply to a header that claims nothing, and
+  minting would erase the identity of whatever store that blocks root
+  really belongs to -- the destructive choice of the two.
+- *marker present but unparseable*: treated as a claim of nothing
+  (rewritten from the header), not as a mismatch. Truncated junk names no
+  store, so there is nothing to refuse against. The mismatch refusal is
+  reserved for a marker that is a valid id and a different one.
+
+**The marker write always fsyncs**, whatever `--durability` says. One
+write per store lifetime, and the thing it protects is identity rather
+than data.
+
+**`MetaError::StorePairing` is boxed.** Four inline fields pushed
+`MetaError` past clippy's `result_large_err` threshold, and every
+`Result<_, MetaError>` in the crate pays for the largest variant. The
+payload is `StorePairingMismatch` (`metastore/errors.rs`), which carries
+both paths and both ids and renders the refusal.
+
+**fsck's pairing check is the store open, not a separate pass.** It runs
+first in every run because nothing can run before the open; a mispaired
+store surfaces as could-not-run (exit 3) with the refusal's own message.
+`cas_storage::scrub::pairing::read_pairing` exists beside it for tools
+that want to REPORT a pairing without performing the open's adoption.
+
+**`--re-pair` details.** `--meta-root` and `--fs-root` lost their clap
+defaults (they default to `.` in code instead), so the verb can tell "the
+operator typed this path" from "nobody said anything": it requires both
+spelled out. It conflicts with `--repair`, `--scrub` and `--json` -- it
+runs no passes and there is no JSON form of it -- refuses a store whose
+header has no id yet (open it once; adoption mints one), and is
+idempotent.
+
+**Not built here, on purpose.** The harness's tiered rail (the ADR names
+it as its own planned work) and respd's `--data-dir` pairing (deferred by
+the open question) are untouched. The existing harness needs no change:
+`--fresh` only inspects the store root's top-level entries, and
+`qssrt_block_files` matches block files by shape, which a dot-prefixed
+name cannot satisfy.
