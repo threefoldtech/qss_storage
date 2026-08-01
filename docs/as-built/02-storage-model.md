@@ -56,11 +56,11 @@ under a single fixed key, written through `MetaStore::open_or_create`:
 
 ```
 [ magic: "QSST"           ]  4 bytes
-[ version: u16 LE         ]  2 bytes   currently 2
+[ version: u16 LE         ]  2 bytes   currently 3
 [ hash_algo: u8           ]  1 byte    blake3 = 1
 [ hash_width: u8          ]  1 byte    16 or 32
 [ created_at: u64 LE      ]  8 bytes   unix seconds
-[ reserved                ]  16 bytes  written zeroed
+[ store_id                ]  16 bytes  v4 UUID; all-zero means absent
 ```
 
 The header lives at `MetaStore` level rather than in the CAS layer, so a store
@@ -81,10 +81,12 @@ Semantics:
   opens it, since opening is what would create it.
 - A byte-for-byte sidecar copy, `store_header.bin`, is written next to the db
   directory at creation. Recovery from it is a manual operation.
-- The 16 reserved bytes round-trip untouched and are not rejected when a
-  future version puts something there. Changing the meaning of an existing
-  field requires a version bump instead. This is where a salt or key id would
-  go if the question reopens (ADR 0002 resolved it as not implemented).
+- The last 16 bytes were reserved until ADR 0012 spent them on the `store_id`
+  (see below). Whatever pattern they hold round-trips untouched, so a build
+  that only passes a header through neither rejects nor drops an id it did not
+  mint; there are no spare bytes left, so a new field means a version bump. A
+  salt or key id, if that question reopens (ADR 0002 resolved it as not
+  implemented), would need one.
 - Bucket names starting with `_` are refused at creation, so a bucket can
   never collide with `_STORE_HEADER`, `_BLOCKS`, `_MULTIPART_PARTS` or
   `_UPLOADS`.
@@ -103,6 +105,86 @@ read at creation only: on open the header on disk wins, and a config that
 disagrees with the store it opened gets a warning at startup rather than a
 silent reinterpretation. Changing the block hash of a deployment means
 creating a new store.
+
+## Tiered store roots and pairing identity (ADR 0012, as built 2026-08-01)
+
+A store has two roots and they may be two disks. `--meta-root` holds every
+database; `--fs-root` holds every block file. Nothing about the split is new
+plumbing -- the paths already flowed separately -- but it is now a declared,
+checked store shape rather than an accident of two flags:
+
+```
+--meta-root (NVMe)                     --fs-root (HDD)
+  db/                namespace DB        blocks/aa/../<hash>   block files
+  blocks/.db/        blocks DB           blocks/.tmp/          staging (same fs)
+  store_header.bin   sidecars            blocks/.store-id      pairing marker
+  blocks/store_header.bin
+
+journal persists, compactions,         1 MiB whole-file writes, fdatasync
+dedup point reads, record walks        waves, fanout dirsyncs, block reads
+```
+
+Running both roots at the same path is unchanged and still the default; it
+simply puts the databases inside the blocks root, where the scrub knows to
+skip them.
+
+**Placement is CLI-only.** There is no toml key for either root (the config
+describes the store, the invocation places it) and no third `--blocks-db-path`:
+the blocks DB follows the meta root. The `.tmp` same-filesystem rule is
+unchanged and load-bearing -- staging lives under the blocks root, so ADR
+0006's rename atomicity never crosses a device.
+
+**Pairing identity.** Each store mints a `store_id` (v4 UUID) at creation; it
+lives in the header (record and sidecar) and, as lowercase hex, in
+`<fs_root>/blocks/.store-id`. The marker is written by the block writer's own
+temp+fsync+rename protocol, so it is never half-written.
+
+`SharedBlockStore::new` compares the two after the metastore opens, before any
+tree is touched:
+
+| header | marker | outcome |
+|--------|--------|---------|
+| id | same id | opens |
+| id | different id | **refused**: both ids and both paths in the message, no override |
+| id | absent | marker written (a crash between the two adoption writes) |
+| id | unparseable | marker rewritten; damage names no store |
+| absent | absent | adopted: id minted, header first, then marker |
+| absent | id | the root's id is taken into the header |
+
+Write order is header first, always: that is what makes the half-adopted state
+repairable without judgement. Old stores are adopted, not refused -- deliberately
+unlike the `blocks/.db` migration refusal, which protected against SHADOWING
+live records with an empty database. Adoption writes two small identity
+artifacts and shadows nothing.
+
+The store-level id covers the namespace databases too: they are opened through
+the same paired root, so there is no per-namespace pairing. (Every database
+still carries an id of its own in its header; only the blocks DB's is ever
+compared against a marker.) respd's `--data-dir` is out of scope for now.
+
+**Recovery** is one verb, in the tool that can audit the result:
+
+```
+qss-storage-fsck --re-pair --meta-root /nvme/store --fs-root /hdd/store
+```
+
+It rewrites the marker to match the database's header, prints the id it wrote
+and the one it replaced, and runs no passes. Both roots must be spelled out.
+There is no daemon override flag, on purpose: one would end up in a unit file
+and defeat the check forever. A store whose header has no id yet is refused by
+the verb (open it once; adoption mints one).
+
+**fsck's ordering.** The pairing check is the first thing that happens in any
+run, because it happens during the store open -- a mispaired store never
+reaches a walker, and cannot be "repaired" toward either side's fiction. It
+surfaces as could-not-run (exit 3).
+
+**Scrub's foreign-file table** gains `.store-id` beside `.db`, `.tmp` and
+`.quarantine` (`cas-storage/src/scrub/disk.rs::is_the_stores_own`). Those four
+names are skipped at the top of the blocks root and nowhere else; one level
+down, an entry by any of them is foreign like anything else that is not
+block-shaped. Old builds reading a new store's blocks root will report
+`.store-id` as a foreign file: harmless, and reported rather than acted on.
 
 ## Verify on read
 

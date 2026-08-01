@@ -58,10 +58,12 @@ qss-storage-fsck [--config <file>] [--meta-root <dir>] [--fs-root <dir>]
                  [--metadata-db <engine>] [--durability <level>]
                  [--inline-metadata-size <n>]
                  [--scrub] [--repair] [--json]
+qss-storage-fsck --re-pair --meta-root <dir> --fs-root <dir>
 ```
 
 `--meta-root` and `--fs-root` default to `.`, the same defaults the server
-uses. The layout they name:
+uses. They may be two different disks (ADR 0012: databases on NVMe, block
+files on rust). The layout they name:
 
 ```
 <meta_root>/db/              namespace DB: the bucket (object) trees
@@ -71,6 +73,7 @@ uses. The layout they name:
 <fs_root>/blocks/            block data files (fanout dirs, full-hex names)
 <fs_root>/blocks/.tmp/       write staging, purged at open
 <fs_root>/blocks/.quarantine/ what a --repair set aside
+<fs_root>/blocks/.store-id   which store this blocks root belongs to
 ```
 
 `--metadata-db`, `--durability` and `--inline-metadata-size` are resolved
@@ -90,6 +93,37 @@ anything is constructed, and a path that is not already a store is refused
 with `no store at <path>` and exit 3. The opposite behaviour -- creating an
 empty store at a mistyped `--meta-root` and reporting it clean -- is the
 loudest possible wrong answer from a tool whose job is finding damage.
+
+### The pairing check, and `--re-pair`
+
+The first thing any run does is open the store, and the open compares the
+blocks database's `store_id` with the `.store-id` marker in the blocks root
+(ADR 0012). Two halves that name different stores are refused there --
+before a single pass runs, with both ids and both paths in the message and
+exit 3. That ordering is the point: a mispaired store must not be
+"repaired" toward either side's fiction, because every finding would be
+about a store that does not exist.
+
+A store made before ADR 0012 has no id anywhere. It is adopted at the first
+open by a build that knows about them (id minted, header written, then the
+marker), not refused; a crash between those two writes is completed by the
+next open.
+
+When a pairing really is the intended one and the marker disagrees -- a data
+directory restored from a backup taken under a different database, most
+often -- the recovery is one verb:
+
+```
+qss-storage-fsck --re-pair --meta-root /nvme/store --fs-root /hdd/store
+```
+
+It rewrites the marker under `--fs-root` to match the header under
+`--meta-root`, prints the id it wrote and the one it replaced, and runs no
+passes. It is idempotent (a second run says `already paired`), it refuses a
+store that has no id yet, and it insists on both roots being spelled out --
+a default of `.` is not a pairing anybody meant. There is deliberately no
+daemon-side override: a `--force-pair` on the server would end up in a unit
+file and disable the check forever.
 
 ## The passes
 
@@ -374,9 +408,14 @@ blocks database and its header sidecar live at `<meta_root>/blocks/.db` and
 the tree the disk walk walks. The walker skips the store's own paths,
 declared by the opener (the binary knows which paths it opened; the library
 does not guess), and `.db` is additionally skipped by name at the top
-level, like `.tmp` and `.quarantine`. Without that, every run would report
-the live database as a foreign file, and `--repair` would rename it into
-quarantine.
+level, like `.tmp`, `.quarantine` and `.store-id`. Without that, every run
+would report the live database as a foreign file, and `--repair` would
+rename it into quarantine.
+
+Those four names are the whole table, and they are skipped at the top of the
+blocks root only. One level down, `ab/.db` or `ab/.store-id` is not a fanout
+directory and is reported foreign like anything else that is not
+block-shaped.
 
 The dot in `.db` is load-bearing: the database used to live at bare
 `blocks/db`, which is also the fanout directory for every block whose hash
@@ -534,6 +573,20 @@ Machine-readable, one line per finding:
 ```sh
 qss-storage-fsck --meta-root /srv/qss --fs-root /srv/qss --json \
   | jq -r '.findings[] | "\(.severity)\t\(.class)\t\(.block // .path // "-")"'
+```
+
+A tiered store, databases on the NVMe and blocks on the array:
+
+```sh
+qss-storage-fsck --meta-root /nvme/qss --fs-root /hdd/qss
+```
+
+The same store after its data directory was restored from a backup taken
+under a different database -- the open refuses, and this is the way out:
+
+```sh
+qss-storage-fsck --re-pair --meta-root /nvme/qss --fs-root /hdd/qss
+qss-storage-fsck --meta-root /nvme/qss --fs-root /hdd/qss --scrub
 ```
 
 Just the verdict, for a cron job:

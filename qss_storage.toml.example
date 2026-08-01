@@ -182,7 +182,36 @@ access_key = "CHANGE_ME"
 secret_key = "CHANGE_ME"
 
 # s3cas reads --fs-root and --meta-root from the command line only; they have
-# no key here.
+# no key here. That is the design ruling, not an omission: the config file
+# describes the store, the invocation places it, and a stale toml on the wrong
+# host is exactly the accident the placement rules below exist to catch.
+#
+# The tiered layout (ADR 0012). The two roots ARE the placement mechanism, and
+# putting them on different disks is a supported store shape:
+#
+#   --meta-root /nvme/store    the namespace databases (<meta>/db), the shared
+#                              blocks database (<meta>/blocks/.db), and the
+#                              header sidecars. Journal persists, compactions,
+#                              dedup point reads, record walks: seek-heavy,
+#                              small, and what an NVMe is for.
+#   --fs-root   /hdd/store     the block files (<fs>/blocks/<aa>/../<hash>) and
+#                              their staging directory. Whole 1 MiB files
+#                              written once and streamed back: as sequential as
+#                              object storage gets, which is what spinning rust
+#                              is good at.
+#
+# One root for both (the default, --meta-root . --fs-root .) is unchanged and
+# still correct; it just puts the databases inside the blocks root.
+#
+# The pairing is checked, not assumed. Each store has an id in its header, and
+# the blocks root carries a copy in blocks/.store-id. A database opened against
+# the WRONG data directory -- yesterday's, a sibling store's, a disk that
+# failed to mount -- is refused at startup with both ids and both paths, and
+# there is no override flag. A store made before this existed is adopted at
+# first open (one log line, no action needed). If a pairing really is the one
+# you meant and the marker disagrees, make it official with:
+#
+#   qss-storage-fsck --re-pair --meta-root /nvme/store --fs-root /hdd/store
 
 # ---------------------------------------------------------------------------
 # [s3.metrics] -- the prometheus endpoint, served by s3cas at /metrics.
