@@ -68,20 +68,20 @@ remaining=$(s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/nul
     tr '\t' '\n' | grep -c . || true)
 assert_eq "list-buckets is empty after teardown" 0 "${remaining:-0}"
 
-# --- respd: flush its namespace through its client ----------------------
+# --- respcas: flush its namespace through its client ----------------------
 
 if qssrt_have "$QSSRT_VALKEY_CLI"; then
-    respd_ensure_running || check_find "respd is up for its teardown" \
+    respcas_ensure_running || check_find "respcas is up for its teardown" \
         "it would not start; its store is untouched"
-    if respd_running || respd_adopt; then
+    if respcas_running || respcas_adopt; then
         vk_ns "$QSSRT_RESP_NAMESPACE" FLUSH >/dev/null 2>&1
         after_flush=$(vk_ns "$QSSRT_RESP_NAMESPACE" DBSIZE 2>/dev/null | tail -n 1)
-        assert_eq_find "respd's namespace is empty after FLUSH" 0 \
+        assert_eq_find "respcas's namespace is empty after FLUSH" 0 \
             "$(printf '%s' "$after_flush" | grep -oE '[0-9]+' | head -n 1)"
-        respd_ensure_stopped
+        respcas_ensure_stopped
     fi
 else
-    check_skip "respd's namespace is flushed" "$QSSRT_VALKEY_CLI is not installed"
+    check_skip "respcas's namespace is flushed" "$QSSRT_VALKEY_CLI is not installed"
 fi
 
 kill "$sampler_pid" 2>/dev/null

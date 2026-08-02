@@ -13,7 +13,7 @@ set -uo pipefail
 phase_begin 08 scrub
 
 s3d_ensure_stopped
-respd_ensure_stopped
+respcas_ensure_stopped
 
 store_bytes=$(qssrt_block_bytes "$QSSRT_S3_STORE")
 store_files=$(qssrt_block_file_count "$QSSRT_S3_STORE")

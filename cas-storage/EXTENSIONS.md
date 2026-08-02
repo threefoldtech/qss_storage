@@ -10,26 +10,28 @@
 > renaming pass (tfstor -> qss) is planned separately.
 
 > Naming note: `tfstor` is the former name of this repository (renamed to
-> `qss_storage` in 2026-07).
+> `qss_storage` in 2026-07). `respd` is the former name of the `respcas`
+> crate and binary (renamed 2026-08-02); documents written before that date
+> keep the old name.
 
 This `cas-storage/` was originally vendored from
 `https://github.com/threefoldtech/s3-cas` at commit **`b28eac0`** (2026-05),
-then extended for the `respd` Redis-protocol frontend and subsequently
+then extended for the `respcas` Redis-protocol frontend and subsequently
 fixed and refactored in place (see "What was fixed" below).
 
 ## What was added
 
 ### `metastore::traits::BaseMetaTree::len` / `is_empty`
-Upstream marks both as `#[cfg(test)]`. We need them at runtime for respd
+Upstream marks both as `#[cfg(test)]`. We need them at runtime for respcas
 commands (`LENGTH`, `DBSIZE`). Promoted out of `cfg(test)`; default impl
 of `is_empty` retained.
 
 ### `metastore::traits::MetaTreeExt::iter_kv(start_after)`
-Forward iteration from an arbitrary key (used by respd `SCAN` cursor).
+Forward iteration from an arbitrary key (used by respcas `SCAN` cursor).
 Upstream only has `iter_all()` (== `iter_kv(None)`).
 
 ### `metastore::traits::MetaTreeExt::iter_kv_backward(start_key)`
-Backward iteration from an arbitrary key (used by respd `RSCAN`).
+Backward iteration from an arbitrary key (used by respcas `RSCAN`).
 No upstream equivalent.
 
 ## What was fixed
@@ -126,7 +128,7 @@ metadata, strongest; `Fdatasync` = data only, weaker), but the mapping onto
 fjall was crossed: `Fsync` -> `SyncData`, `Fdatasync` -> `SyncAll`, with
 `Fdatasync` as the default. Swapped so the names tell the truth
 (`Fsync` -> `SyncAll`, `Fdatasync` -> `SyncData`) and the defaults (library,
-respd, s3cas CLI) moved from `Fdatasync` to `Fsync` -- so the default persist
+respcas, s3cas CLI) moved from `Fdatasync` to `Fsync` -- so the default persist
 behavior is bit-for-bit unchanged, and only explicit flag users see a change:
 they now get what the flag name promised.
 
@@ -243,10 +245,10 @@ threefoldtech/s3-cas would have:
 2. Drop the `#[cfg(test)]` on `BaseMetaTree::len` and `is_empty`.
 3. Port the `fjall.rs` impl (copy from this fork; `fjall_notx.rs` was
    removed here by ADR 0007, so upstream's copy would need its own port).
-4. Reference respd's RSCAN/SCAN/DBSIZE use cases as motivation.
+4. Reference respcas's RSCAN/SCAN/DBSIZE use cases as motivation.
 
 The `num_keys` fixes are worth a separate, smaller PR that stands on its own
-(no respd context needed): implement `FjallStore::num_keys`, make
+(no respcas context needed): implement `FjallStore::num_keys`, make
 `MetaStore::num_keys` fallible, add `test_num_keys` to the shared backend
 test battery.
 
@@ -254,7 +256,7 @@ The `unsafe` cleanup (checked UTF-8, the transmute `SAFETY` argument, and the
 two deleted `unsafe impl Sync`s) is a third PR candidate, and the most
 obviously upstreamable of the three: it removes undefined behaviour on
 corrupt input, deletes two `unsafe` impls the compiler proves unnecessary, and
-adds no API surface. Nothing in it depends on respd or on anything else in
+adds no API surface. Nothing in it depends on respcas or on anything else in
 this fork. The only judgement call a reviewer might push back on is the
 skip-and-log behaviour for non-UTF-8 keys in `range_filter`; the alternative
 is making that trait method fallible, which is a breaking change and belongs

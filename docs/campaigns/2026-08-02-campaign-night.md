@@ -301,3 +301,12 @@ The aws-cli upstream report (the mp-80 capture); respd ECHO (fifteen
 lines, turns the campaign's last two findings into passes); the
 tiered-store harness rail; ADR 0004; the 3 Dependabot alerts; and
 fstrim.timer above.
+
+**Closed 2026-08-02 (later the same day):** ECHO landed, and it was not
+fifteen lines. ECHO alone would not have turned those two findings into
+passes: `valkey-cli --pipe` passes its stdin through untouched, so its
+commands arrive as inline text and its terminator is a bare CRLF before
+the ECHO frame -- neither of which the parser accepted. Inline commands
+are parsed now, a malformed frame is answered and hung up on instead of
+silently wedging the connection, and the daemon was renamed `respcas`
+in the same series. Phase 04 grades --pipe as a violation from here on.

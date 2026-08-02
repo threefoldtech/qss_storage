@@ -2,10 +2,10 @@
 //! this format, addressed by this hash function".
 //!
 //! Every fjall database this codebase creates -- the shared block DB, every
-//! namespace DB, respd's key-value DB -- carries one 32 byte header in its own
+//! namespace DB, respcas's key-value DB -- carries one 32 byte header in its own
 //! `_STORE_HEADER` partition under a single fixed key. The header lives at the
 //! `MetaStore` level rather than in the CAS layer so that a store which never
-//! addresses a block (respd's) still gets format versioning; the hash fields
+//! addresses a block (respcas's) still gets format versioning; the hash fields
 //! are written everywhere and consulted only by `SharedBlockStore`.
 //!
 //! On-disk layout, little-endian, exactly [`STORE_HEADER_SIZE`] bytes:

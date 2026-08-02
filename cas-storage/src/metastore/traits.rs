@@ -49,7 +49,7 @@ pub trait BaseMetaTree: Send + Sync {
 
     // ---- tfstor-extension: BEGIN ----
     // Upstream marks `len`/`is_empty` as `#[cfg(test)]`. We need them at
-    // runtime for respd's LENGTH (key size) and DBSIZE (namespace size)
+    // runtime for respcas's LENGTH (key size) and DBSIZE (namespace size)
     // commands. Drop these markers and the cfg gate once upstreamed.
     /// Returns the number of key-value pairs in the tree.
     fn len(&self) -> Result<usize, MetaError>;
@@ -76,7 +76,7 @@ pub trait MetaTreeExt: BaseMetaTree {
     fn iter_all(&self) -> KeyValuePairs;
 
     // ---- tfstor-extension: BEGIN ----
-    // respd needs forward iteration from an arbitrary key (SCAN cursor) and
+    // respcas needs forward iteration from an arbitrary key (SCAN cursor) and
     // backward iteration from an arbitrary key (RSCAN). Upstream's iter_all
     // is a strict subset (iter_kv(None) == iter_all()).
 

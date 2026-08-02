@@ -21,14 +21,14 @@ layouts.** `main` still ships a separate `metastore` crate and an
 |----------|----------|
 | [01-architecture.md](./01-architecture.md) | Crate topology, process model, request paths, vendored-fork status |
 | [02-storage-model.md](./02-storage-model.md) | On-disk format, block addressing, refcounting, keyspaces, durability |
-| [03-crates.md](./03-crates.md) | Per-crate detail: cas-storage, s3cas, respd, benches |
+| [03-crates.md](./03-crates.md) | Per-crate detail: cas-storage, s3cas, respcas, benches |
 | [04-code-health.md](./04-code-health.md) | Bloat and smell findings, prioritized, with locations |
 
 ## Executive summary
 
 qss_storage is a three-crate Rust workspace: one shared content-addressed
 storage library (`cas-storage`, 4884 lines) and two independent protocol
-frontends over it -- `s3cas` (S3 API, 2368 lines) and `respd` (Redis/RESP
+frontends over it -- `s3cas` (S3 API, 2368 lines) and `respcas` (Redis/RESP
 subset, 4058 lines). Objects are chunked into 1 MiB blocks, addressed by BLAKE3
 (ADR 0002; the S3 ETag stays MD5), deduplicated, and reference counted.
 Metadata lives in fjall 3.x, behind a `Store` trait with one
@@ -77,7 +77,7 @@ of [04-code-health.md](./04-code-health.md#suggested-order-of-work).
 **Update 2026-07-30:** a remediation pass on the `development` branch fixed
 H1, H2, H5, H6, H8, B2, B3, P3, P4, and P6, recorded H3/H4 in ADR 0002, and
 additionally revived the dead benchmark suite and fixed a port race in the
-respd test harness. Live status table at the top of
+respcas test harness. Live status table at the top of
 [04-code-health.md](./04-code-health.md#resolution-status-2026-07-30-branch-development).
 
 Verification state at time of writing, on this branch:

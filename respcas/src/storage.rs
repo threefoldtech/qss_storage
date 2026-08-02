@@ -21,7 +21,7 @@ impl Storage {
     /// Create a new MetaStorage instance, or open the one already at
     /// `data_dir`.
     ///
-    /// respd never addresses a block, but its DB carries the same QSST header
+    /// respcas never addresses a block, but its DB carries the same QSST header
     /// as every other store in this workspace: that is what gives it format
     /// versioning, and what makes a store from before the format refuse to
     /// open instead of being read as garbage.
@@ -36,7 +36,7 @@ impl Storage {
     /// not open; the message names the store and the reason.
     ///
     /// [`MetaError::StoreLocked`] if another process already has the data
-    /// directory open -- a second respd on the same `--data-dir`. Both errors
+    /// directory open -- a second respcas on the same `--data-dir`. Both errors
     /// reach `main`, which reports them and exits nonzero rather than
     /// panicking.
     pub fn new(

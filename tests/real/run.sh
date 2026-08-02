@@ -216,7 +216,7 @@ s3_setup_client
     printf 'aws\t%s\n' "$("$QSSRT_AWS" --version 2>&1 | head -n 1)"
     printf 'valkey-cli\t%s\n' "$("$QSSRT_VALKEY_CLI" --version 2>&1 | head -n 1)"
     printf 'bash\t%s\n' "$BASH_VERSION"
-    for b in s3cas respd qss-storage-fsck; do
+    for b in s3cas respcas qss-storage-fsck; do
         printf 'bin_%s\t%s\n' "$b" \
             "$(stat -c '%n %s %y' "$QSSRT_BIN_DIR/$b" 2>/dev/null || echo MISSING)"
     done
@@ -263,7 +263,7 @@ done
 QSSRT_PHASE_DIR="$QSSRT_RUN_DIR" \
     QSSRT_PHASE_CHECKS="$QSSRT_RUN_DIR/teardown.tsv" \
     s3d_ensure_stopped
-respd_ensure_stopped
+respcas_ensure_stopped
 
 code=$(verdict_render "$QSSRT_RUN_DIR")
 printf '\n%s\n' "$(head -n 3 "$QSSRT_RUN_DIR/verdict.md" | tail -n 1)"

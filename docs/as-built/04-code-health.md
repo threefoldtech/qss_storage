@@ -41,7 +41,7 @@ status. Commits are on `development`.
 | B1 duplicated backends | **Fixed** -- shared half extracted to `stores/fjall_common.rs`, generic over a `FjallFlavor` trait; the two stores are aliases of it with unchanged public API. The rebase argument is moot per the ownership decision at the top of `cas-storage/EXTENSIONS.md` | `541cc5d` |
 | B2 oversized functions | **Fixed** -- `from_frame` 388 -> 47-line dispatch table with per-command parsers; `process` -> 10-line delegate to `Session` | `721b53a`, `cfb271b` |
 | B3 edition split / toolchain | **Fixed** -- workspace on edition 2024, toolchain pinned 1.97 | `e4a795b`, `0777c36` |
-| B4 pedantic backlog | **Substantives cleared** -- respd handlers/execute/dispatch de-async'd (fjall is sync; the async was decorative), `unnecessary_wraps` and `unused_self` sites fixed, `once_cell::Lazy` -> `std::sync::LazyLock`, dead internal macros deleted (only `try_!` was used), bucket-count FIXME fixed (real count at startup), `CreateBucketOutput.location` filled. Left open as design decisions: metrics double-registration (single-instance by design), `list_buckets` pagination, `bucket_delete` optimization. Stylistic pedantic noise stays unchased | -- |
+| B4 pedantic backlog | **Substantives cleared** -- respcas handlers/execute/dispatch de-async'd (fjall is sync; the async was decorative), `unnecessary_wraps` and `unused_self` sites fixed, `once_cell::Lazy` -> `std::sync::LazyLock`, dead internal macros deleted (only `try_!` was used), bucket-count FIXME fixed (real count at startup), `CreateBucketOutput.location` filled. Left open as design decisions: metrics double-registration (single-instance by design), `list_buckets` pagination, `bucket_delete` optimization. Stylistic pedantic noise stays unchased | -- |
 | P1 ADRs describe unmerged layout | **Resolved on `development`** -- merged at `9a2d8c8`; `main` stays stale until development merges back | `9a2d8c8` |
 | P2 main red in CI | Same as P1 -- green on `development` | `9a2d8c8` |
 | P3 missing CI gates | **Fixed** -- fmt gate added, toolchain pin honored, CI runs on development, stray checkout dropped; `release.yaml` now runs `cargo test --workspace` before building and lost its deprecated `actions-rs` stable-override (the pin in rust-toolchain.toml applies) | `0777c36`, `50ec0ec` |
@@ -55,7 +55,7 @@ Found and fixed during the pass, beyond the original findings:
   `[[bench]]` target anywhere, still importing pre-refactor paths. Now a
   `qss-benches` workspace member crate; both binaries compile, run, and are
   covered by the clippy gate (`cd535e3`).
-- respd's integration test harness had a real port-allocation race
+- respcas's integration test harness had a real port-allocation race
   (bind-drop-rebind), the cause of a rare one-in-N test failure. The listener
   is now bound once and moved into the server thread; sleep-based readiness
   waits removed. Suite wall time 19s -> ~1s (`cfb271b`).
@@ -125,8 +125,8 @@ fn len(&self) -> Result<usize, MetaError> {
 So the fix is to open the named partition and delegate to `read_tx().len()`,
 mirroring `FjallStoreNotx::num_keys`. No fjall limitation is involved.
 
-Scope is limited to the CLI. `respd`'s `DBSIZE` takes a different route
-(`respd/src/namespace.rs::num_keys` -> `BaseMetaTree::len`) and does **not**
+Scope is limited to the CLI. `respcas`'s `DBSIZE` takes a different route
+(`respcas/src/namespace.rs::num_keys` -> `BaseMetaTree::len`) and does **not**
 hit this, so there is no network-reachable panic here. Verified by reading both
 paths.
 
@@ -375,16 +375,16 @@ Measured by brace matching, production code only:
 
 | Lines | Location |
 |-------|----------|
-| 388 | `respd/src/cmd.rs::from_frame` |
-| 212 | `respd/src/server.rs::process` |
+| 388 | `respcas/src/cmd.rs::from_frame` |
+| 212 | `respcas/src/server.rs::process` |
 | 161 | `cas-storage/src/cas/write_path.rs::store_object` |
 | 147 | `cas-storage/src/cas/block_stream.rs::poll_next` |
 | 131 | `s3cas/src/main.rs::run` |
 
 `from_frame` is the clear outlier: one `match` handling arity checks, type
-coercion, and construction for all twenty respd commands. It is the natural
+coercion, and construction for all twenty respcas commands. It is the natural
 place for a per-command parse trait or a table-driven arity/type spec, and it
-is not vendored code -- `respd` is this repository's own, so there is no rebase
+is not vendored code -- `respcas` is this repository's own, so there is no rebase
 argument against fixing it.
 
 `poll_next` at 147 lines is a hand-rolled state machine and carries the
@@ -399,7 +399,7 @@ workspace's bluntest comment (`block_stream.rs:117`, `// TODO: Fix this crap`).
 | workspace `[workspace.package]` | 2018 |
 | `cas-storage` | 2024 (explicit override) |
 | `s3cas` | 2018 (inherited) |
-| `respd` | 2018 (inherited) |
+| `respcas` | 2018 (inherited) |
 
 The refactor moved `cas-storage` to 2024 but left the workspace default and
 both frontends on 2018 -- an edition that predates `async`/`await` stabilizing

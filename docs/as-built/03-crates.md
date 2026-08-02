@@ -111,7 +111,7 @@ Integration tests are parameterized over both storage engines
   forced by the `s3s` crate's trait definition and cannot be removed locally.
   The `metrics.rs` one is local and likely removable -- finding H9.
 
-## respd
+## respcas
 
 Binary crate, 4058 lines across 12 files, edition 2018. A Redis/RESP2 subset
 server backed by `cas-storage`.
@@ -149,7 +149,7 @@ drive the promotion of `BaseMetaTree::len` out of `#[cfg(test)]`.
 Namespaces map onto `cas-storage` buckets, with properties held in
 `property.rs`. The test suite exercises three protection modes -- password
 (`password_test.rs`), WORM (`test_worm_protection`), and locking
-(`test_lock_protection`) -- which are respd-level policies, not enforced by
+(`test_lock_protection`) -- which are respcas-level policies, not enforced by
 `cas-storage`.
 
 ### Structural concerns

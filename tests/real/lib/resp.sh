@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # valkey-cli wrappers.
 #
-# respd's surface is thinner than S3's -- inline-only storage, no multipart,
+# respcas's surface is thinner than S3's -- inline-only storage, no multipart,
 # no GC -- so this file is thinner too. What it does carry is the binary
 # safety plumbing: RESP values are bytes, and a wrapper that round-trips
 # them through a shell variable would quietly stop testing that.
@@ -44,7 +44,7 @@ vk_pipe() {
     "$QSSRT_VALKEY_CLI" -h "$QSSRT_RESP_HOST" -p "$QSSRT_RESP_PORT" --pipe
 }
 
-# respd's dispatch surface, re-derived from the source at run time.
+# respcas's dispatch surface, re-derived from the source at run time.
 #
 # The ADR asks for the enumeration to be a tripwire: "if respd grows
 # block-backed values, the phase grows with it -- the enumeration step at
@@ -52,6 +52,6 @@ vk_pipe() {
 # dispatch table is the only way that tripwire can fire without a human
 # noticing first.
 resp_surface_from_source() {
-    grep -oE '^[[:space:]]*"[A-Z]+" =>' "$QSSRT_REPO_ROOT/respd/src/cmd.rs" |
+    grep -oE '^[[:space:]]*"[A-Z]+" =>' "$QSSRT_REPO_ROOT/respcas/src/cmd.rs" |
         tr -d ' "=>' | sort | tr '\n' ' ' | sed 's/ $//'
 }

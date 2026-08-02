@@ -63,7 +63,7 @@ record "bash" "$BASH_VERSION"
 
 # --- the binaries ------------------------------------------------------
 
-for bin in s3cas respd qss-storage-fsck; do
+for bin in s3cas respcas qss-storage-fsck; do
     if [ -x "$QSSRT_BIN_DIR/$bin" ]; then
         check_pass "$bin is built" "$(stat -c '%s bytes, %y' "$QSSRT_BIN_DIR/$bin")"
     else

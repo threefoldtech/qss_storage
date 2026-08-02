@@ -17,7 +17,7 @@
 //! was configured with, which reaches the kernel (so `kill -9` cannot take
 //! it) but never fsyncs (so a power cut can). Every ack-carrying write that
 //! did not go through a transaction -- `CreateBucket`,
-//! `CreateMultipartUpload`, `UploadPart`, respd's `SET` and `DEL` -- was
+//! `CreateMultipartUpload`, `UploadPart`, respcas's `SET` and `DEL` -- was
 //! therefore page-cache-only even at `fsync` durability.
 
 use std::collections::HashMap;
@@ -212,7 +212,7 @@ impl FjallStore {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AckPersist {
     /// Loss after the ack would be silent or terminal (object records,
-    /// bucket metadata, respd's SET/DEL): persist at the store's
+    /// bucket metadata, respcas's SET/DEL): persist at the store's
     /// configured durability before returning.
     Contract,
     /// Loss after the ack is caught loudly by a mandatory later step of
@@ -373,7 +373,7 @@ impl BaseMetaTree for FjallTree {
     ///
     /// Callers acknowledge on the strength of this returning `Ok`:
     /// `CreateBucket`, `CreateMultipartUpload`, `UploadPart`'s ETag and
-    /// respd's `SET` all come through here rather than through a
+    /// respcas's `SET` all come through here rather than through a
     /// transaction. What that ack promises is the tree's [`AckPersist`]
     /// class (ADR 0013):
     ///
@@ -401,8 +401,8 @@ impl BaseMetaTree for FjallTree {
     /// # Durability
     ///
     /// Same class split as [`insert`](Self::insert). A removal a client
-    /// was told succeeded -- respd's `DEL` -- must not come back, and
-    /// respd's trees are `Contract` class.
+    /// was told succeeded -- respcas's `DEL` -- must not come back, and
+    /// respcas's trees are `Contract` class.
     fn remove(&self, key: &[u8]) -> Result<bool, MetaError> {
         // fjall's remove does not say whether the key was there, so the
         // existence is probed first; the two ops are not one transaction,
@@ -782,7 +782,7 @@ mod tests {
     ///
     /// The ADR 0011 rider's pin at the layer the rider changed. `insert` and
     /// `remove` are the ack-carrying non-transactional surface --
-    /// `CreateBucket`, `CreateMultipartUpload`, `UploadPart`, respd's `SET`
+    /// `CreateBucket`, `CreateMultipartUpload`, `UploadPart`, respcas's `SET`
     /// and `DEL` -- and what a client is told about them has to be true of
     /// the file on disk, not of a userspace buffer.
     ///
@@ -844,7 +844,7 @@ mod tests {
     }
 
     /// The ADR 0013 contract table: exactly the two multipart state trees
-    /// are recoverable-class, everything else -- bucket trees, respd
+    /// are recoverable-class, everything else -- bucket trees, respcas
     /// namespaces, anything future -- persists per ack.
     #[test]
     fn the_ack_persist_table_is_exactly_the_multipart_state_trees() {
@@ -853,7 +853,7 @@ mod tests {
             AckPersist::Recoverable
         );
         assert_eq!(ack_persist_for(UPLOADS_TREE), AckPersist::Recoverable);
-        for contract in ["some-bucket", "_BLOCKS", "acked", "respd-ns"] {
+        for contract in ["some-bucket", "_BLOCKS", "acked", "respcas-ns"] {
             assert_eq!(
                 ack_persist_for(contract),
                 AckPersist::Contract,

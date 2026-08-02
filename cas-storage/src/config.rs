@@ -119,17 +119,17 @@ pub const DEFAULT_METRICS_HOST: &str = "localhost";
 /// Port the prometheus endpoint binds by default.
 pub const DEFAULT_METRICS_PORT: u16 = 9100;
 
-/// Address respd binds by default.
+/// Address respcas binds by default.
 pub const DEFAULT_RESP_HOST: &str = "127.0.0.1";
 
-/// Port respd binds by default (the Redis port).
+/// Port respcas binds by default (the Redis port).
 pub const DEFAULT_RESP_PORT: u16 = 6379;
 
-/// Data directory respd uses by default.
+/// Data directory respcas uses by default.
 pub const DEFAULT_RESP_DATA_DIR: &str = "./data";
 
-/// respd inlines every value it can: a 1 byte threshold means "inline
-/// everything that fits", which is how respd has always run.
+/// respcas inlines every value it can: a 1 byte threshold means "inline
+/// everything that fits", which is how respcas has always run.
 pub const DEFAULT_RESP_INLINE_METADATA_SIZE: usize = 1;
 
 /// Days an unfinished multipart upload survives before the stale-upload GC
@@ -156,7 +156,7 @@ pub struct QssStorageConfig {
     /// the STORE (how long abandoned uploads keep their blocks), and fsck
     /// reports against the same ages.
     pub multipart: Option<MultipartConfig>,
-    /// respd-only settings.
+    /// respcas-only settings.
     pub resp: Option<RespConfig>,
 }
 
@@ -351,7 +351,7 @@ pub struct S3Config {
 
 /// The `[s3.metrics]` table: where the prometheus endpoint listens.
 ///
-/// Consumed by s3cas only; respd exports no metrics.
+/// Consumed by s3cas only; respcas exports no metrics.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -361,15 +361,15 @@ pub struct MetricsConfig {
     pub port: Option<u16>,
 }
 
-/// The `[resp]` table: respd server settings.
+/// The `[resp]` table: respcas server settings.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RespConfig {
-    /// Address respd binds.
+    /// Address respcas binds.
     pub host: Option<String>,
-    /// Port respd binds.
+    /// Port respcas binds.
     pub port: Option<u16>,
-    /// Directory holding respd's database.
+    /// Directory holding respcas's database.
     pub data_dir: Option<PathBuf>,
     /// Password required for admin commands. Absent means every connection is
     /// granted admin privileges.
@@ -601,7 +601,7 @@ stale_ttl_days = 14
 [resp]
 host = "0.0.0.0"
 port = 6380
-data_dir = "/var/lib/respd"
+data_dir = "/var/lib/respcas"
 admin_password = "hunter2"
 "#;
 
@@ -644,7 +644,7 @@ admin_password = "hunter2"
         let resp = config.resp.expect("[resp] must parse");
         assert_eq!(resp.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(resp.port, Some(6380));
-        assert_eq!(resp.data_dir, Some(PathBuf::from("/var/lib/respd")));
+        assert_eq!(resp.data_dir, Some(PathBuf::from("/var/lib/respcas")));
         assert_eq!(resp.admin_password.as_deref(), Some("hunter2"));
     }
 

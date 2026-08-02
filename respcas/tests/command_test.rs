@@ -1,5 +1,5 @@
 use redis_protocol::resp2::types::OwnedFrame as Frame;
-use respd::cmd::{Command, CommandError};
+use respcas::cmd::{Command, CommandError};
 
 #[test]
 fn test_select_command_parsing() {

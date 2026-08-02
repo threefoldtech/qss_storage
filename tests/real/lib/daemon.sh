@@ -11,11 +11,11 @@
 # including, for the crash phases, whatever it wrote as it died.
 
 QSSRT_S3_PID=""
-QSSRT_RESPD_PID=""
+QSSRT_RESPCAS_PID=""
 
 qssrt_daemon_dir() { printf '%s/daemon' "$QSSRT_RUN_DIR"; }
 qssrt_s3_log() { printf '%s/s3cas.log' "$(qssrt_daemon_dir)"; }
-qssrt_respd_log() { printf '%s/respd.log' "$(qssrt_daemon_dir)"; }
+qssrt_respcas_log() { printf '%s/respcas.log' "$(qssrt_daemon_dir)"; }
 
 # --- s3cas -------------------------------------------------------------
 
@@ -178,81 +178,81 @@ s3d_ensure_stopped() {
     return 0
 }
 
-# --- respd -------------------------------------------------------------
+# --- respcas -------------------------------------------------------------
 
-respd_tcp_ready() {
+respcas_tcp_ready() {
     (exec 3<>"/dev/tcp/$QSSRT_RESP_HOST/$QSSRT_RESP_PORT") 2>/dev/null
 }
 
-respd_start() {
+respcas_start() {
     mkdir -p "$(qssrt_daemon_dir)" "$QSSRT_RESP_STORE"
-    if respd_tcp_ready; then
-        check_fail "the RESP port is free before respd starts" \
+    if respcas_tcp_ready; then
+        check_fail "the RESP port is free before respcas starts" \
             "something is already listening on $QSSRT_RESP_HOST:$QSSRT_RESP_PORT"
         return 1
     fi
-    "$QSSRT_BIN_DIR/respd" \
+    "$QSSRT_BIN_DIR/respcas" \
         --config "$QSSRT_DAEMON_CONFIG" \
         --data-dir "$QSSRT_RESP_STORE" \
         --host "$QSSRT_RESP_HOST" \
         --port "$QSSRT_RESP_PORT" \
-        >>"$(qssrt_respd_log)" 2>&1 &
-    QSSRT_RESPD_PID=$!
-    printf '%s' "$QSSRT_RESPD_PID" >"$(qssrt_daemon_dir)/respd.pid"
+        >>"$(qssrt_respcas_log)" 2>&1 &
+    QSSRT_RESPCAS_PID=$!
+    printf '%s' "$QSSRT_RESPCAS_PID" >"$(qssrt_daemon_dir)/respcas.pid"
     qssrt_wait_for "${QSSRT_DAEMON_START_TIMEOUT:-60}" \
         "$QSSRT_VALKEY_CLI" -h "$QSSRT_RESP_HOST" -p "$QSSRT_RESP_PORT" PING
 }
 
-respd_running() {
-    [ -n "$QSSRT_RESPD_PID" ] && kill -0 "$QSSRT_RESPD_PID" 2>/dev/null
+respcas_running() {
+    [ -n "$QSSRT_RESPCAS_PID" ] && kill -0 "$QSSRT_RESPCAS_PID" 2>/dev/null
 }
 
-respd_adopt() {
-    local pid_file="$(qssrt_daemon_dir)/respd.pid" pid
+respcas_adopt() {
+    local pid_file="$(qssrt_daemon_dir)/respcas.pid" pid
     [ -f "$pid_file" ] || return 1
     pid=$(cat "$pid_file" 2>/dev/null)
     [ -n "$pid" ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
-    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "respd" ] || return 1
-    QSSRT_RESPD_PID="$pid"
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "respcas" ] || return 1
+    QSSRT_RESPCAS_PID="$pid"
     return 0
 }
 
-respd_ensure_running() {
-    respd_running && return 0
-    respd_adopt && return 0
-    respd_start
+respcas_ensure_running() {
+    respcas_running && return 0
+    respcas_adopt && return 0
+    respcas_start
 }
 
-respd_ensure_stopped() {
-    respd_running || respd_adopt || return 0
-    respd_stop
+respcas_ensure_stopped() {
+    respcas_running || respcas_adopt || return 0
+    respcas_stop
     return 0
 }
 
 # SIGTERM, not SIGINT.
 #
-# respd installs no ctrl-c handler, and a background job of a
-# non-interactive shell inherits SIGINT as ignored -- so a SIGINT to respd
+# respcas installs no ctrl-c handler, and a background job of a
+# non-interactive shell inherits SIGINT as ignored -- so a SIGINT to respcas
 # is a no-op, and the daemon outlives the run holding its port. (s3cas does
-# install one, which is why it stops on SIGINT and respd does not.) SIGTERM
+# install one, which is why it stops on SIGINT and respcas does not.) SIGTERM
 # has no such inheritance rule and its default action ends the process.
-respd_stop() {
-    respd_running || {
-        QSSRT_RESPD_PID=""
+respcas_stop() {
+    respcas_running || {
+        QSSRT_RESPCAS_PID=""
         return 0
     }
-    kill -TERM "$QSSRT_RESPD_PID" 2>/dev/null
+    kill -TERM "$QSSRT_RESPCAS_PID" 2>/dev/null
     local deadline=$((SECONDS + 15))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        respd_running || {
-            QSSRT_RESPD_PID=""
+        respcas_running || {
+            QSSRT_RESPCAS_PID=""
             return 0
         }
         sleep 0.2
     done
-    kill -9 "$QSSRT_RESPD_PID" 2>/dev/null
-    QSSRT_RESPD_PID=""
+    kill -9 "$QSSRT_RESPCAS_PID" 2>/dev/null
+    QSSRT_RESPCAS_PID=""
     return 0
 }
 
@@ -278,7 +278,7 @@ daemon_sample() {
 # was written while it ran.
 daemon_log_mark() {
     local log
-    for log in "$(qssrt_s3_log)" "$(qssrt_respd_log)"; do
+    for log in "$(qssrt_s3_log)" "$(qssrt_respcas_log)"; do
         [ -f "$log" ] || continue
         stat -c %s "$log" >"${log}.mark"
     done
@@ -304,7 +304,7 @@ daemon_expect() {
 # phase regardless of the client verdict.
 daemon_gate() {
     local log slice_file unexpected=0 total=0 line pattern matched logs=0
-    for log in "$(qssrt_s3_log)" "$(qssrt_respd_log)"; do
+    for log in "$(qssrt_s3_log)" "$(qssrt_respcas_log)"; do
         [ -f "$log" ] || continue
         logs=$((logs + 1))
         slice_file="$QSSRT_PHASE_DIR/$(basename "$log")"

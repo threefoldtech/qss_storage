@@ -39,7 +39,7 @@ impl TestServer {
             .local_addr()
             .expect("Failed to get local address")
             .port();
-        println!("Starting respd server on port {}", port);
+        println!("Starting respcas server on port {}", port);
 
         // Create a shutdown channel
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -56,7 +56,7 @@ impl TestServer {
 
                 // Create a shared storage instance
                 let storage = Arc::new(
-                    respd::storage::Storage::new(
+                    respcas::storage::Storage::new(
                         thread_data_dir,
                         None,
                         cas_storage::Durability::Fsync,
@@ -66,7 +66,7 @@ impl TestServer {
                 );
 
                 // Create a shared namespace cache
-                let namespace_cache = Arc::new(respd::namespace::NamespaceCache::new(storage.clone()));
+                let namespace_cache = Arc::new(respcas::namespace::NamespaceCache::new(storage.clone()));
 
                 // Convert to tokio TcpListener
                 let listener = tokio::net::TcpListener::from_std(listener).expect("Failed to convert listener");
@@ -99,7 +99,7 @@ impl TestServer {
                                     let admin_password = thread_admin_password.clone();
                                     tokio::spawn(async move {
                                         // Pass admin_password to the process function
-                                        if let Err(e) = respd::server::process(socket, storage, namespace_cache, admin_password).await {
+                                        if let Err(e) = respcas::server::process(socket, storage, namespace_cache, admin_password).await {
                                             eprintln!("Error processing connection: {}", e);
                                         }
                                     });

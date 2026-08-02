@@ -66,7 +66,7 @@ under a single fixed key, written through `MetaStore::open_or_create`:
 The header lives at `MetaStore` level rather than in the CAS layer, so a store
 that never addresses a block gets format versioning too: the shared block DB,
 every namespace DB (`CasFS::single_namespace` therefore creates two headered
-databases), and respd's key-value DB all have one. The hash fields are written
+databases), and respcas's key-value DB all have one. The hash fields are written
 everywhere and consulted only by `SharedBlockStore`, which decodes them into
 its `Hasher` at open.
 
@@ -160,7 +160,7 @@ artifacts and shadows nothing.
 The store-level id covers the namespace databases too: they are opened through
 the same paired root, so there is no per-namespace pairing. (Every database
 still carries an id of its own in its header; only the blocks DB's is ever
-compared against a marker.) respd's `--data-dir` is out of scope for now.
+compared against a marker.) respcas's `--data-dir` is out of scope for now.
 
 **Recovery** is one verb, in the tool that can audit the result:
 

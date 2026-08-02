@@ -1,20 +1,20 @@
-# respd
+# respcas
 
-`respd` is a Redis-compatible server using metastore as its backend. It is designed to work seamlessly with Redis clients and supports a subset of Redis commands, along with namespace management features.
+`respcas` is a Redis-compatible server using metastore as its backend. It is designed to work seamlessly with Redis clients and supports a subset of Redis commands, along with namespace management features.
 
-## Running respd
+## Running respcas
 
 ```console
-respd --data-dir=/tmp/respd/data
+respcas --data-dir=/tmp/respcas/data
 ```
 
 With admin authentication:
 
 ```console
-respd --data-dir=/tmp/respd/data --admin=mypassword
+respcas --data-dir=/tmp/respcas/data --admin=mypassword
 ```
 
-By default, respd listens on `127.0.0.1:6379` and can be accessed using any Redis client.
+By default, respcas listens on `127.0.0.1:6379` and can be accessed using any Redis client.
 
 ## Supported Commands
 

@@ -2,7 +2,7 @@
 members = [
     "cas-storage",
     "s3cas",
-    "respd",
+    "respcas",
     "benches",
     "qss-storage-fsck",
 ]

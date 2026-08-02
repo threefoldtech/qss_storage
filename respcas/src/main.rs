@@ -17,7 +17,7 @@ mod resp;
 mod server;
 mod storage;
 
-/// respd's flags.
+/// respcas's flags.
 ///
 /// Everything the config file can also supply is an `Option` without a
 /// `default_value`: clap cannot tell a flag the operator passed from one it
@@ -25,7 +25,7 @@ mod storage;
 /// file. The defaults live in `cas_storage::config` and are applied by
 /// [`resolve`].
 #[derive(Parser, Debug, Default)]
-#[clap(name = "respd", about = "Redis-compatible server using metastore")]
+#[clap(name = "respcas", about = "Redis-compatible server using metastore")]
 struct Opt {
     /// Path to qss_storage.toml
     /// (default: ./qss_storage.toml, then /etc/qss_storage/qss_storage.toml)
@@ -64,14 +64,14 @@ struct ResolvedConfig {
 
 /// Merges the flags over the config file over the built-in defaults.
 ///
-/// `store.verify_on_read` and `store.metadata_db` are not consulted: respd
+/// `store.verify_on_read` and `store.metadata_db` are not consulted: respcas
 /// stores no blocks, so there is nothing to verify on read, and it is
 /// fjall-only.
 ///
 /// # Errors
 ///
 /// [`config::ConfigError`] if `store.hash` does not name a hash this build
-/// has. respd never addresses a block, but its database carries the same
+/// has. respcas never addresses a block, but its database carries the same
 /// header as every other store here, so the section still has to resolve.
 fn resolve(flags: Opt, config: &QssStorageConfig) -> Result<ResolvedConfig, config::ConfigError> {
     let resp = config.resp.clone().unwrap_or_default();
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     )?;
 
     // Start server
-    info!("Starting respd server on {}:{}", cfg.host, cfg.port);
+    info!("Starting respcas server on {}:{}", cfg.host, cfg.port);
     if cfg.admin.is_some() {
         info!("Admin authentication is required");
     } else {
@@ -173,11 +173,11 @@ mod tests {
             "[store]\ndurability = \"buffer\"\ninline_metadata_size = 64\n\n\
              [store.hash]\nwidth = 16\n\n\
              [resp]\nhost = \"0.0.0.0\"\nport = 6380\n\
-             data_dir = \"/var/lib/respd\"\nadmin_password = \"hunter2\"\n",
+             data_dir = \"/var/lib/respcas\"\nadmin_password = \"hunter2\"\n",
         );
         let cfg = resolve(Opt::default(), &file).unwrap();
 
-        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/respd"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/respcas"));
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 6380);
         assert_eq!(cfg.admin.as_deref(), Some("hunter2"));
@@ -190,12 +190,12 @@ mod tests {
     fn a_flag_beats_the_config_file() {
         let file = config(
             "[resp]\nhost = \"0.0.0.0\"\nport = 6380\n\
-             data_dir = \"/var/lib/respd\"\nadmin_password = \"hunter2\"\n",
+             data_dir = \"/var/lib/respcas\"\nadmin_password = \"hunter2\"\n",
         );
         let flags = Opt {
             port: Some(7000),
             host: Some("127.0.0.2".to_string()),
-            data_dir: Some(PathBuf::from("/tmp/respd")),
+            data_dir: Some(PathBuf::from("/tmp/respcas")),
             admin: Some("flagpass".to_string()),
             ..Opt::default()
         };
@@ -203,7 +203,7 @@ mod tests {
 
         assert_eq!(cfg.port, 7000);
         assert_eq!(cfg.host, "127.0.0.2");
-        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/respd"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/respcas"));
         assert_eq!(cfg.admin.as_deref(), Some("flagpass"));
     }
 }

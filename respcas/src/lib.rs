@@ -1,4 +1,4 @@
-//! Redis-compatible server (respd) using metastore as backend
+//! Redis-compatible server (respcas) using metastore as backend
 
 // Re-export modules for use in integration tests
 pub mod cmd;

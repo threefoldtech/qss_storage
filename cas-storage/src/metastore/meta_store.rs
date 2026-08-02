@@ -287,7 +287,7 @@ impl MetaStore {
     /// with the store's internal trees (`_STORE_HEADER`, `_BUCKETS`,
     /// `_BLOCKS`, `_MULTIPART_PARTS`, `_UPLOADS`) and hand a client the store's
     /// own bookkeeping. S3 bucket naming forbids these names anyway; this is
-    /// the store enforcing it for every caller, respd included.
+    /// the store enforcing it for every caller, respcas included.
     pub fn insert_bucket(&self, bucket_name: &str, raw_bucket: Vec<u8>) -> Result<(), MetaError> {
         if bucket_name.starts_with('_') {
             return Err(MetaError::ReservedBucketName(bucket_name.to_string()));

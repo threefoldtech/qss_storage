@@ -1,5 +1,5 @@
 [package]
-name = "respd"
+name = "respcas"
 version = { workspace = true }
 edition = { workspace = true }
 authors = { workspace = true }
@@ -7,11 +7,11 @@ description = "A Redis-compatible server using cas-storage as backend"
 
 # Expose the modules as a library
 [lib]
-name = "respd"
+name = "respcas"
 path = "src/lib.rs"
 
 [[bin]]
-name = "respd"
+name = "respcas"
 path = "src/main.rs"
 
 [dependencies]

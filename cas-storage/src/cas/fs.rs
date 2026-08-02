@@ -1090,8 +1090,8 @@ mod tests {
 
     /// Inline over inline: neither record holds a reference, so there is
     /// nothing to release and the overwrite is a plain record replacement.
-    /// This is the shape respd's `set` has (through its own tree, not this
-    /// path -- respd carries no block store at all).
+    /// This is the shape respcas's `set` has (through its own tree, not this
+    /// path -- respcas carries no block store at all).
     #[tokio::test]
     async fn inline_over_inline_releases_nothing() {
         let (fs, _dir) = setup_test_fs(StorageEngine::Fjall, Hasher::Blake3W32);

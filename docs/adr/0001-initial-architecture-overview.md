@@ -4,6 +4,10 @@
 **Date**: 2026-05-26
 **Updated**: 2026-05-26 (resolved fjall_notx and migration questions; clarified MD5/BLAKE3 path and SharedBlockStore cross-protocol semantics)
 
+> Naming note (2026-08-02): the RESP daemon this and every earlier ADR calls
+> `respd` is now the `respcas` crate and binary. The old name is left as
+> written wherever it appears in an accepted decision, the way `tfstor` is.
+
 ---
 
 ## Context

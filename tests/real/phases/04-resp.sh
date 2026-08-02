@@ -8,8 +8,10 @@
 # bytes), wrong-type/absent-key errors, pipelined batches (valkey-cli
 # --pipe), concurrent clients."
 #
+# The ADRs quoted here predate the rename: respd is respcas now.
+#
 # The enumeration is the tripwire the ADR asks for: the pinned list below is
-# compared against the dispatch table in respd's source at run time, so a
+# compared against the dispatch table in respcas's source at run time, so a
 # command added without a test here fails this phase rather than going
 # quietly untested.
 
@@ -24,8 +26,8 @@ if ! qssrt_have "$QSSRT_VALKEY_CLI"; then
     exit $?
 fi
 
-respd_ensure_running || {
-    check_fail "respd is up" "it would not start"
+respcas_ensure_running || {
+    check_fail "respcas is up" "it would not start"
     phase_end
     exit $?
 }
@@ -36,10 +38,10 @@ PINNED="AUTH CHECK DBSIZE DEL ECHO EXISTS FLUSH GET KEYTIME LENGTH MGET NSINFO N
 actual=$(resp_surface_from_source)
 record "resp-surface" "$actual"
 if [ "$PINNED" = "$actual" ]; then
-    check_pass "respd's command surface is the one this phase covers" \
+    check_pass "respcas's command surface is the one this phase covers" \
         "$(printf '%s' "$PINNED" | wc -w) commands"
 else
-    check_fail "respd's command surface is the one this phase covers" \
+    check_fail "respcas's command surface is the one this phase covers" \
         "pinned [$PINNED] but the dispatch table says [$actual]: grow this phase with it"
 fi
 
@@ -246,7 +248,7 @@ fi
 # spawn per second.
 #
 # The wait below names the client pids. A bare wait would also wait for
-# respd, which this same shell started as a background job -- and respd
+# respcas, which this same shell started as a background job -- and respcas
 # does not exit, so the phase would hang here forever.
 conc_pids=()
 for w in 1 2 3 4; do

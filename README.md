@@ -9,7 +9,12 @@ QSS Storage is a storage subsystem that provides content-addressed storage backe
 ## What this repository contains
 
 1. **[s3cas](./s3cas/README.md)** — An S3-compatible API server using content-addressed storage. [Read more about s3cas →](./s3cas/README.md)
-2. **[respd](./respd/README.md)** — A Redis-compatible server using metastore as backend. [Read more about respd →](./respd/README.md)
+2. **[respcas](./respcas/README.md)** — A Redis-compatible server using metastore as backend. [Read more about respcas →](./respcas/README.md)
+
+The RESP server was called `respd` until 2026-08-02. The crate, the binary,
+the `--data-dir` layout and the `[resp]` config table are otherwise
+unchanged, so an existing store opens as it did; only the command that
+starts it has a new name.
 
 ## Role in the stack
 
@@ -40,7 +45,7 @@ cargo build --release
 
 # Or build individual components
 cargo build --release -p s3cas
-cargo build --release -p respd
+cargo build --release -p respcas
 ```
 
 ## Content addressing
@@ -89,7 +94,7 @@ key and its default:
 cp qss_storage.toml.example qss_storage.toml
 $EDITOR qss_storage.toml
 cargo run -p s3cas -- server          # no flags needed
-cargo run -p respd
+cargo run -p respcas
 ```
 
 Settings are resolved per field, highest precedence first:
@@ -106,14 +111,14 @@ An unknown key anywhere in the file is a startup error: a misspelled setting
 should stop the daemon, not be silently ignored.
 
 The `[store]` table is shared by both binaries; `[s3]` is read by s3cas only
-and `[resp]` by respd only. `[store.hash]` applies when a store is *created*:
+and `[resp]` by respcas only. `[store.hash]` applies when a store is *created*:
 an existing store is addressed by the hash recorded in its immutable header, so
 a config that disagrees with the store it opened gets a warning at startup, and
 changing the block hash of a deployment means creating a new store.
 
-## respd Features
+## respcas Features
 
-The respd server implements some basic Redis commands and also provides additional commands for namespace and data management that are not part of the standard Redis protocol.
+The respcas server implements some basic Redis commands and also provides additional commands for namespace and data management that are not part of the standard Redis protocol.
 
 ## Known issues
 
@@ -121,7 +126,7 @@ The respd server implements some basic Redis commands and also provides addition
 - Only the basic S3 API is implemented (no copy between servers)
 - Single key only, no support to add multiple keys with different permissions
 
-### respd
+### respcas
 - Limited subset of Redis commands implemented
 
 ## License

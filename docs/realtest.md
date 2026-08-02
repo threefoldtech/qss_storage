@@ -93,7 +93,7 @@ harness, not the disk.
 | 1 s3-functional | the S3 surface as aws-cli actually drives it: CRUD to 4 GiB, ETags, three listing drivers over >1000 keys, ranges, error paths, the on-disk layout |
 | 2 multipart | client-driven and hand-driven multipart, out-of-order parts, the ETag convention, abort, the retryable failed complete |
 | 3 gc | stale-upload GC: configuration, visibility, reclamation via abort; the sweep timer itself needs ~25h (below) |
-| 4 resp | respd's pinned 20-command surface, binary-safe, pipelined, concurrent |
+| 4 resp | respcas's pinned 20-command surface, binary-safe, pipelined, concurrent |
 | 5 stress | sustained mixed load; the ADR 0008 overwrite storms; fd/RSS curves; a clean recount with no crash having happened |
 | 6 crash | kill -9 mid-storm at fsync, three cycles: acknowledged writes survive, residue is leak-class only, repair converges |
 | 7 durability-matrix | the same cycles at `durability = buffer`: the difference must be residue volume, never loss |

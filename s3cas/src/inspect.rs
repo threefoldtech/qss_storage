@@ -133,7 +133,7 @@ pub struct DiskSpace {
     /// Bytes used by the namespace DB (`<meta_root>/db`).
     pub namespace: u64,
     /// Bytes used by the shared block DB (`<meta_root>/blocks/.db`), `None`
-    /// when the store has none -- a respd-style store is a single database.
+    /// when the store has none -- a respcas-style store is a single database.
     pub blocks: Option<u64>,
 }
 
@@ -213,7 +213,7 @@ fn humanize(created_at: u64) -> String {
 /// Headers of every metadata database under `meta_root`.
 ///
 /// The namespace DB must be there; the blocks DB is reported only if it
-/// exists, since a store written by respd has a single database and no block
+/// exists, since a store written by respcas has a single database and no block
 /// metadata at all.
 pub fn headers(meta_root: PathBuf, store: &StoreOptions) -> Result<Vec<LabelledHeader>> {
     let mut out = Vec::with_capacity(2);

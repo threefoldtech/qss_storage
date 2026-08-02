@@ -13,7 +13,7 @@ qss_storage/  (workspace, edition 2018 at the workspace level)
 |     S3-compatible HTTP server + inspect/check/retrieve CLI.
 |     Depends on cas-storage and the s3s crate.
 |
-+-- respd/         bin, edition 2018   4058 lines / 12 files
++-- respcas/         bin, edition 2018   4058 lines / 12 files
 |     Redis/RESP2 server. Depends on cas-storage.
 |
 +-- benches/                            591 lines /  2 files
@@ -22,7 +22,7 @@ qss_storage/  (workspace, edition 2018 at the workspace level)
 
 Dependency direction is strictly one-way: both frontends depend on
 `cas-storage`, and `cas-storage` depends on neither. There is no shared code
-between `s3cas` and `respd` other than through the library. cmm's boundary
+between `s3cas` and `respcas` other than through the library. cmm's boundary
 analysis agrees, classifying `src` as `core` with fan-in 71 and fan-out 1.
 
 ## The vendored-fork boundary
@@ -36,12 +36,12 @@ copied wholesale from `github.com/threefoldtech/s3-cas` at commit `b28eac0`
 upstream snapshot **except** for four explicitly fenced additions, so a future
 upstream rebase is a directory swap plus re-application of the fences.
 
-The four extension blocks, all added to serve `respd`:
+The four extension blocks, all added to serve `respcas`:
 
 | Location | Addition | Consumer |
 |----------|----------|----------|
-| `metastore/traits.rs:48-59` | `BaseMetaTree::len` / `is_empty` promoted out of `#[cfg(test)]` | respd `LENGTH`, `DBSIZE` |
-| `metastore/traits.rs:76-88` | `MetaTreeExt::iter_kv(start_after)` | respd `SCAN` cursor |
+| `metastore/traits.rs:48-59` | `BaseMetaTree::len` / `is_empty` promoted out of `#[cfg(test)]` | respcas `LENGTH`, `DBSIZE` |
+| `metastore/traits.rs:76-88` | `MetaTreeExt::iter_kv(start_after)` | respcas `SCAN` cursor |
 | `metastore/stores/fjall.rs:275-335` | impl of the above, transactional backend | -- |
 | `metastore/stores/fjall_notx.rs` (removed by ADR 0007) | impl of the above, non-transactional backend | -- |
 
@@ -82,10 +82,10 @@ coordinating daemon.
   against its ETag.
 - `retrieve` -- object extraction (`s3cas/src/retrieve.rs`).
 
-**respd** (`respd/src/main.rs`) is a tokio TCP server speaking RESP2.
-`respd/src/server.rs::process` (212 lines) owns the per-connection loop;
-`respd/src/conn.rs` frames, `respd/src/resp.rs` encodes/decodes,
-`respd/src/cmd.rs` parses and dispatches.
+**respcas** (`respcas/src/main.rs`) is a tokio TCP server speaking RESP2.
+`respcas/src/server.rs::process` (212 lines) owns the per-connection loop;
+`respcas/src/conn.rs` frames, `respcas/src/resp.rs` encodes/decodes,
+`respcas/src/cmd.rs` parses and dispatches.
 
 ## Request paths
 
@@ -114,16 +114,16 @@ S3FS::get_object -> parse_range_request (cas-storage/src/cas/range_request.rs)
         and seeks within the first block to honour the range start.
 ```
 
-### respd SET / GET
+### respcas SET / GET
 
 ```
-tokio TCP -> conn framing -> Command::from_frame (respd/src/cmd.rs, 388 lines)
-  -> Namespace (respd/src/namespace.rs) -> Storage (respd/src/storage.rs)
+tokio TCP -> conn framing -> Command::from_frame (respcas/src/cmd.rs, 388 lines)
+  -> Namespace (respcas/src/namespace.rs) -> Storage (respcas/src/storage.rs)
      -> CasFS / MetaStore
 ```
 
-`respd` adds a namespace layer that `s3cas` does not have: namespaces map onto
-buckets, with per-namespace properties (`respd/src/property.rs`) covering
+`respcas` adds a namespace layer that `s3cas` does not have: namespaces map onto
+buckets, with per-namespace properties (`respcas/src/property.rs`) covering
 password protection, WORM, and locking.
 
 ## Multi-tenancy: SharedBlockStore
@@ -157,7 +157,7 @@ A clean two-layer split, not duplication despite the two files named
   `SharedMetrics` and a `CasMetricsAdapter` that implements
   `cas_storage::MetricsCollector` over it.
 
-`respd` does not wire metrics; it gets `NoOpMetrics` by default.
+`respcas` does not wire metrics; it gets `NoOpMetrics` by default.
 
 ## Storage backend abstraction
 
@@ -191,7 +191,7 @@ cargo clippy --workspace --all-features -- -Dwarnings
 cargo test --workspace
 ```
 
-`.github/workflows/release.yaml` builds `-p s3cas` and `-p respd` in release
+`.github/workflows/release.yaml` builds `-p s3cas` and `-p respcas` in release
 mode. `[profile.release]` sets `lto = true` and `codegen-units = 1`.
 
 There is no `cargo fmt --check` gate in CI, and no `rust-toolchain.toml`
