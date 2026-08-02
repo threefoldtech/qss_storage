@@ -310,3 +310,9 @@ the ECHO frame -- neither of which the parser accepted. Inline commands
 are parsed now, a malformed frame is answered and hung up on instead of
 silently wedging the connection, and the daemon was renamed `respcas`
 in the same series. Phase 04 grades --pipe as a violation from here on.
+
+The smoke harness (`make realtest-smoke`, scale 4096, hardware rail
+waived -- NOT campaign grade) verdicts **PASS** on all ten phases,
+0 fail and 0 finding, run 20260802T172227. Phase 04 is 37 pass: the
+surface tripwire agrees at 21 commands and `valkey-cli --pipe` reports
+errors: 0, replies: 100. A campaign-grade run on /s3 is still owed.
