@@ -68,16 +68,24 @@ ETagged. The acknowledgement exists only client-side: the harness
 appends to acked.tsv when `aws s3 cp` exits 0, and for these four
 uploads cp exited 0 for transfers it knew were unfinished.
 
-Where the accusation against aws-cli stands, honestly: 60 idle-daemon
-kill-at-random iterations produced zero false acks (target/ack-repro),
-so the plain case is honest and the condition needs the storm --
-saturated daemon, fsync-depth latencies, kill mid-window. Phase 6 now
-runs with the mp worker instrumented (every cp's exit code, wall
-window and stderr, kept per key; opt-in via QSSRT_CRASH_MP_LOG, change
-in the working tree): one instrumented pass came back clean, and a
-capture loop was still running when this revision was written. Until a
-FAIL is caught with the audit live, "false client ack" is the only
-explanation consistent with the corpses, not yet a confessed one.
+The accusation is now a capture, not an inference. 60 idle-daemon
+kill-at-random iterations produced zero false acks (target/ack-repro)
+-- at idle the vulnerable window is milliseconds. Under the storm it is
+not: the instrumented phase 6 (every mp cp's exit code, wall window and
+stderr per key, QSSRT_CRASH_MP_LOG) caught it on its second run.
+Run 20260802T100525, cycle 2, fsync-2/mp-80: all four part records
+persisted -- they are the journal's final batches -- kill -9 lands
+inside the CompleteMultipartUpload window, the complete never executes,
+and `aws s3 cp` (aws-cli 2.36.14) exits 0 with zero bytes of stderr,
+two tenths of a second after the daemon died. The harness recorded the
+ack it was shown. The exit code was the lie.
+
+The same decoder, pointed at LAST night's buffer-7/mp-68 corpse -- the
+finding that reopened the fjall question -- found the same innocent
+shape: its create record is the final batch in the journal; the upload
+had just begun when the kill landed. The old "parts acked seconds
+pre-kill absent from journals" constraint was the substring-grep
+artifact. Both nights' losses were the same client bug.
 
 What the correction restores and reopens:
 
@@ -86,11 +94,10 @@ What the correction restores and reopens:
 - The fsync-vs-buffer "inversion" explains itself: at fsync an upload
   is in flight several times longer, so the random kill lands inside
   one far more often. Exposure time, not durability.
-- Last night's buffer-7/mp-68 corpse -- the finding that reopened the
-  fjall question -- must be re-read with the same decoder before
-  anything ships upstream: its "parts acked seconds pre-kill absent
-  from journals" constraint was built on the grep methodology that
-  tonight matched other cycles' keys. The fjall-rs report is ON HOLD.
+- Last night's buffer-7/mp-68 corpse has been re-read with the decoder:
+  create-only-at-EOF, same innocent shape. The fjall question is
+  CLOSED; docs/upstream/fjall-journal-ack-visibility.md now records the
+  resolution.
 
 Two smaller truths survive intact: the daemon's request log is
 kill-truncated (stdout block-buffering -- its silence proves nothing
@@ -170,18 +177,20 @@ all night.
 
 ## Decisions this report owes you
 
-1. **Catch the false ack in the act, then fix how the harness
-   acknowledges.** The corpses prove the store innocent; the capture
-   loop (instrumented phase 6) owes us the cp that exits 0 on an
-   unfinished transfer, stderr and all. Then the storm should record
-   an mp ack only on evidence of the complete (the returned multipart
-   ETag, not the exit code), and phase 6's four FAILs get reclassified
-   as harness findings. Until the capture lands, the reclassification
-   is provisional.
-2. **The fjall-rs report is ON HOLD.** Tonight's corpses no longer
-   support it, and last night's buffer-7/mp-68 -- the reopened
-   question's whole basis -- must be re-read with the journal decoder
-   before anything goes upstream.
+1. **CAPTURED -- now fix how the harness acknowledges, and tell
+   aws-cli.** The false ack was caught live (fsync-2/mp-80 above): the
+   reclassification of all six FAILs (both nights) as a client bug is
+   no longer provisional. Two actions follow: the crash storm should
+   record an mp ack only on evidence of the complete (s3api
+   complete-multipart-upload's returned ETag, not cp's exit code) --
+   ready to implement on your word -- and aws-cli deserves the
+   upstream report fjall was about to get, with the mp-80 capture as
+   the reproduction.
+2. **The fjall-rs question is CLOSED.** Both nights' corpses decode to
+   the same innocent shape, buffer-7/mp-68 included;
+   docs/upstream/fjall-journal-ack-visibility.md now records the
+   resolution and withdraws the upstream question. Only Finding 1's
+   one-line documentation suggestion remains worth sending, at leisure.
 3. **The per-ack persist fix (a9b1587) needs a scope decision, not a
    panic revert.** Its kill -9 justification evaporated with the
    correction; its power-loss rationale stands. It costs 55-71% of
@@ -207,9 +216,11 @@ all night.
   the branch tonight but this report. Nothing pushed.
 - Morning-trace artifacts: the journal decoder and the idle-daemon
   false-ack reproducer live in the session scratchpad (dump-journal.py,
-  ack-repro.sh; results at target/ack-repro); the crash_multipart_worker
-  instrumentation (QSSRT_CRASH_MP_LOG) is an uncommitted working-tree
-  change awaiting the capture loop's verdict.
-- Standing queue: fjall-rs question ON HOLD pending the mp-68 re-read
-  (decision 2), the tiered-store harness rail (ADR 0012 follow-up),
+  ack-repro.sh; results at target/ack-repro); the capture run and its
+  audit tsv at target/realtest/loss-snapshots-20260802T100525-ackaudit-r2;
+  the crash_multipart_worker instrumentation (QSSRT_CRASH_MP_LOG) is
+  committed alongside this revision.
+- Standing queue: the aws-cli upstream report (decision 1), the harness
+  ack-criterion fix (decision 1), the per-ack persist scope ADR
+  (decision 3), the tiered-store harness rail (ADR 0012 follow-up),
   ADR 0004, and the 3 Dependabot alerts (1 high).

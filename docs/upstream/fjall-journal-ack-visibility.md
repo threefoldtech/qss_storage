@@ -1,12 +1,19 @@
 # Journal write visibility vs the ack: an fjall 3.1.8 field report
 
-**Audience**: fjall-rs maintainers (eventually), and this repo's own record.
-**Status**: tech doc only -- deliberately NOT yet an issue or PR upstream.
-One finding here is confirmed-and-fixed on our side; the crash-loss
-mechanism itself is OPEN, with a preserved corpse that constrains it.
+**Audience**: this repo's record first. One paragraph still concerns
+fjall-rs (Finding 1's discoverability note); nothing in here any longer
+asks them a question.
+**Status**: RESOLVED 2026-08-02. Finding 1 (bare writes persist at
+`PersistMode::Buffer`) stands: confirmed, regression-tested, fixed on
+our side. Finding 2 -- the kill -9 losses this document existed to ask
+about -- is CLOSED: not fjall, and not our store either. A client-side
+false acknowledgement in aws-cli, caught in the act by an instrumented
+harness, compounded by a grep artifact in our own first corpse reading.
+The old Finding 2 is replaced below with the resolution.
 **Date**: 2026-08-01 (revised same day: the first draft's mechanism
-hypothesis did not survive its own regression test, and this document says
-so rather than pretending otherwise)
+hypothesis did not survive its own regression test); resolved 2026-08-02
+(the second draft's open mechanism did not survive the corpse decoder --
+this document keeps saying so rather than pretending otherwise)
 **fjall**: 3.1.8 (crates.io; source cross-checked against fjall-rs/fjall at
 tag 3.1.8, local clone at ~/prppl/fjall)
 **Consumer**: qss_storage (content-addressed S3 store; fjall via
@@ -27,12 +34,15 @@ kernel, but never fsyncing -- so an application that maps "fsync
 durability" onto bare keyspace writes silently has power-loss-vulnerable
 acks; we fixed that on our side by calling `persist(<configured mode>)` on
 every ack-carrying path, and a one-line doc note upstream would spare the
-next consumer the archaeology. OPEN: the kill -9 losses themselves are NOT
-explained by the userspace journal buffer, which was our first theory --
-the corpse of a reproduced loss (store snapshotted between kill and
-restart, before recovery) shows acknowledged records absent from the
-on-disk journal in a pattern that theory cannot produce, detailed below.
-We would value a maintainer's read on it.
+next consumer the archaeology. CLOSED (2026-08-02): the kill -9 losses
+themselves were never store losses. Decoding the corpses' journals at
+the wire level shows every "lost" upload caught mid-flight -- create
+persisted, some parts landed, CompleteMultipartUpload never executed,
+journal clean to EOF -- and an instrumented rerun caught `aws s3 cp`
+(2.36.14) exiting 0, stderr empty, for an upload whose complete the
+killed daemon never answered. The client manufactured the
+acknowledgement; fjall's journal did exactly what it claims. Details in
+Finding 2.
 
 ## The mechanism, from source (fjall 3.1.8)
 
@@ -57,8 +67,10 @@ that fjall itself persists with `PersistMode::Buffer` (see the
 writes ARE kernel-visible by the time they return. Our deterministic test
 -- ack a write, then read the journal FILES through the filesystem and
 assert the record bytes are present -- passes on unmodified fjall 3.1.8,
-at every durability level. That test killed our first theory (below) and
-now pins the boundary permanently in our suite.
+at every durability level. That test killed our first theory and now
+pins the boundary permanently in our suite. (The resolution below
+vindicates it a second time: fjall's journal did exactly what it
+claims, in every corpse, both nights.)
 
 ## Finding 1 (confirmed, fixed on our side): bare writes cap out at Buffer
 
@@ -80,63 +92,69 @@ operations are persisted at `PersistMode::Buffer`; call `persist()` for
 stronger guarantees" -- would have saved us the archaeology. The behavior
 is defensible; its discoverability is the trap.
 
-## Finding 2 (open): the kill -9 losses, and the corpse that refuses both theories
+## Finding 2 (CLOSED 2026-08-02): the kill -9 "losses" were false client acks
 
-The observations:
+The 2026-08-01 night campaign reproduced the loss shape four more times,
+now at our FSYNC level (4 of 6 cycles, two configurations), which forced
+the investigation that closed it. Two instruments settled what greps
+could not:
 
-- Three acknowledged CompleteMultipartUpload results lost across kill -9
-  at our buffer level, out of ~45 hot-storm crash cycles over two days;
-  never a plain PUT, never at our fsync level, and 492 kill-at-the-ack
-  attempts reproduce nothing.
-- The reproduction we finally captured (a `cp -a` of the store between the
-  kill and the restart, so recovery could not touch the tail): the lost
-  key appears exactly TWICE in the on-disk journals -- its
-  create-multipart-upload records -- while each surviving neighbor key
-  (acknowledged seconds earlier and seconds later) appears ~15 times. The
-  lost key's part-upload records and its object record are absent from
-  every `.jnl` file in the snapshot. No journal rotation had occurred.
+1. **A journal decoder** (fjall 3.1.8 wire format: Start/Item/End
+   batches, seqnos, full keys) replaced substring greps over the `.jnl`
+   files. The greps had a trap this document walked into on 2026-08-01:
+   the campaign's journal spans crash cycles, every cycle names its
+   objects `mp-<n>`, so a bare grep for a lost key matches OTHER cycles'
+   same-numbered keys and manufactures exactly the "created long ago,
+   parts vanished" shape the old Finding 2 reported. Decoded, every
+   corpse from both nights -- including this document's original
+   buffer-cycle7/mp-68 -- tells one story: the flagged upload's
+   CreateMultipartUpload record is the LAST (or nearly last) batch in
+   the journal, some parts' blocks follow, the CompleteMultipartUpload
+   never executed, and the journal parses clean to EOF with contiguous
+   batch seqnos. No torn tail, no elision, no reordering. The store was
+   photographed mid-upload; the daemon never acknowledged the complete.
 
-Why our first theory died: "the record was still in the 8 KiB userspace
-BufWriter when the kill landed" explains a missing TAIL. It does not
-explain this shape -- the part-upload acks happened SECONDS before the
-kill, on the busy database whose buffer rolls constantly, and (per Finding
-1's investigation) every one of those writes ends in a
-`persist(PersistMode::Buffer)` that drains the buffer to the kernel. Once
-write() returns, `kill -9` cannot unwrite it. Writes acknowledged AFTER
-the lost key's survived the same kill. An append-only, single-writer,
-mutex-serialized journal should not be able to contain later entries while
-physically missing earlier flushed ones.
+2. **A per-cp audit** in the crash storm (`QSSRT_CRASH_MP_LOG`: exit
+   code, wall window, stderr, per upload) caught the acknowledgement
+   being minted. Run 20260802T100525, cycle 2, `fsync-2/mp-80`: all
+   four part records persisted (the journal's final batches), kill -9
+   inside the CompleteMultipartUpload window, complete never executed
+   -- and `aws s3 cp` exited 0 with zero bytes of stderr, ~0.2s after
+   the daemon died. The harness appended its "acknowledged" line on
+   that exit code, as designed; the exit code was a lie.
 
-Constraints any explanation has to satisfy: process kill only (no power
-involved); the missing records span two databases (parts in one, the
-object record in the other); the corpse's journal files carry the 64 MiB
-`set_len` preallocation with the written region ending before the missing
-records; recovery afterwards behaved correctly for what the files
-contained. Things this suggests to us, none verified: something in the
-journal manager / memtable-seal path that can drop or redirect buffered
-entries under concurrency; or a write path for these specific operations
-that does not end in the persist we think it does; or an error swallowed
-somewhere that poisoned less than it should have. We know what it is NOT:
-rotation (`Writer::rotate` begins with `persist(SyncAll)` under the writer
-lock) and tx write-behind (batch commit `write_batch`es synchronously
-under the same lock) were both cleared by source reading, and the plain
-BufWriter-tail theory is refuted above.
+So: aws-cli 2.36.14 (`aws s3 cp`, multipart path) can report success
+for an upload whose CompleteMultipartUpload was never answered. At idle
+this window is milliseconds and 60 random kills never hit it; under a
+saturated fsync-level daemon the complete stretches to a fat fraction
+of the transfer and the campaign hit it 4-in-6 cycles. That asymmetry
+also explains the old "never at fsync, only at buffer" -> "suddenly at
+fsync" flip-flop: it was never durability, only how long an upload
+stays in flight at each level. The upstream report this deserves goes
+to aws-cli, not fjall-rs, with the mp-80 capture as the reproduction.
 
-Upstream suggestion 2 (really a question): does this shape ring a bell? We
-can share the corpse (pre-recovery journals + sstables + the acknowledged
-set, 4.8 MiB) and the harness that reproduced it (~1 loss per 15 hot-storm
-crash cycles).
+What this closes: the corpse question this document asked upstream is
+withdrawn -- fjall's journal contained, both nights, precisely what a
+correct append-only mutex-serialized journal should contain. Our
+store's fsync claim (every DAEMON-acknowledged write survives kill -9)
+held in every decoded corpse. Finding 1 is untouched: bare writes still
+persist at `PersistMode::Buffer` unless the application asks otherwise,
+that is still a power-loss trap, and our per-ack persist fix (and its
+regression tests) remain in place while its cost/scope is decided.
 
-## Reproduction, if wanted
+## Reproduction
 
 All in the qss_storage repo (github.com/threefoldtech/qss_storage):
 
+- The aws-cli false ack: `tests/real/run.sh --phase 6 --resume` with
+  `QSSRT_CRASH_MP_LOG=<file>` and `QSSRT_CRASH_SNAPSHOT_DIR=<dir>`;
+  grade the audit tsv against the FAIL lines. Captured first try-but-one
+  on 2026-08-02 (runs 20260802T094650 clean, 20260802T100525 captured).
 - `tests/real/tools/buffer-loss-repro.sh` -- the kill-at-ack rig; its
-  hundreds of clean kills are themselves part of the evidence.
-- `tests/real/run.sh --fresh --phase 7` with `QSSRT_CRASH_CYCLES=15` and
-  `QSSRT_CRASH_SNAPSHOT_DIR=<dir>` -- the hot-storm crash matrix with
-  pre-recovery snapshots; reproduced the loss 1-in-15 cycles on xfs.
-- The corpse: preserved outside the repo, available on request.
+  hundreds of clean kills were evidence all along: killing AT the ack
+  never loses, because daemon-acknowledged writes are really there.
+- The corpses (pre-recovery snapshots) and the journal decoder:
+  preserved outside the repo, available on request.
 - The permanent regression tests for the write-visibility boundary:
   `cas-storage/src/metastore/stores/fjall.rs` (journal-bytes assertions)
   and `cas-storage/src/cas/ack_visibility_tests.rs`.
