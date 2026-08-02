@@ -39,6 +39,9 @@ pub enum Command {
     Ping {
         message: Option<String>,
     },
+    Echo {
+        message: Bytes,
+    },
     Del {
         keys: Vec<String>,
     },
@@ -265,6 +268,19 @@ fn parse_ping(args: &Args) -> Result<Command, CommandError> {
     Ok(Command::Ping { message })
 }
 
+/// `ECHO message`
+///
+/// The payload stays `Bytes` rather than becoming a lossy `String`: a client
+/// may echo bytes that are not UTF-8, and `valkey-cli --pipe` in fact does --
+/// it ends its stream with an ECHO of twenty random bytes and waits for them
+/// back verbatim. Decoding lossily here would answer with replacement
+/// characters and leave that client waiting out its timeout.
+fn parse_echo(args: &Args) -> Result<Command, CommandError> {
+    args.arity_exact(2)?;
+    let message = args.bytes_at(1, "message")?;
+    Ok(Command::Echo { message })
+}
+
 /// `SELECT namespace [password]`
 fn parse_select(args: &Args) -> Result<Command, CommandError> {
     args.arity_range(2, 3)?;
@@ -299,6 +315,7 @@ impl Command {
             "CHECK" => parse_one_arg(&args, "key", |key| Command::Check { key }),
             "DBSIZE" => parse_no_args(&args, Command::DBSize),
             "DEL" => parse_del(&args),
+            "ECHO" => parse_echo(&args),
             "EXISTS" => parse_one_arg(&args, "key", |key| Command::Exists { key }),
             "FLUSH" => parse_no_args(&args, Command::Flush),
             "GET" => parse_one_arg(&args, "key", |key| Command::Get { key }),
@@ -375,6 +392,7 @@ impl CommandHandler {
             Command::MGet { keys } => self.handle_mget(keys),
             Command::Set { key, value } => self.handle_set(key, value),
             Command::Ping { message } => Self::handle_ping(message),
+            Command::Echo { message } => Self::handle_echo(message),
             Command::Del { keys } => self.handle_del(keys),
             Command::Exists { key } => self.handle_exists(key),
             Command::Check { key } => self.handle_check(key),
@@ -480,6 +498,15 @@ impl CommandHandler {
             Some(msg) => Frame::BulkString(msg.into_bytes()),
             None => Frame::SimpleString("PONG".into()),
         }
+    }
+
+    /// Handle ECHO command
+    ///
+    /// Needs no namespace and touches no storage, so it answers before any
+    /// authentication check -- same as PING.
+    fn handle_echo(message: Bytes) -> Frame {
+        debug!("Handling ECHO command for {} bytes", message.len());
+        Frame::BulkString(message.to_vec())
     }
 
     /// Handle DEL command

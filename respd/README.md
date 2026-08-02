@@ -26,6 +26,7 @@ By default, respd listens on `127.0.0.1:6379` and can be accessed using any Redi
 | DEL <key>         | Delete a key                             | `DEL mykey`                        |
 | EXISTS <key>      | Check if a key exists                    | `EXISTS mykey`                     |
 | PING [message]    | Ping the server (optionally with message)| `PING` or `PING hello`             |
+| ECHO <message>    | Return the message unchanged, byte for byte | `ECHO hello`                    |
 | CHECK <key>       | Verify data integrity for a key          | `CHECK mykey`                      |
 | LENGTH <key>      | Get the size (in bytes) of a key's value, returns nil if key doesn't exist | `LENGTH mykey`                     |
 | KEYTIME <key>     | Get the last-update timestamp of a key (Unix time), returns nil if key doesn't exist | `KEYTIME mykey`                    |
@@ -40,6 +41,10 @@ By default, respd listens on `127.0.0.1:6379` and can be accessed using any Redi
 | RSCAN [cursor]    | Incrementally iterate over keys in backward direction | `RSCAN 0` or `RSCAN mycursor`      |
 
 - All commands are case-insensitive.
+- Commands may be sent as RESP arrays or as inline text (`SET key value`
+  followed by a newline), the plain form a telnet session or
+  `valkey-cli --pipe` sends. Inline arguments split on whitespace, and
+  `"..."` or `'...'` group a value that contains spaces.
 - Namespace commands (`SELECT`, `NSNEW`, `NSINFO`, `NSLIST`) allow multi-tenant data separation.
 - Authentication with `AUTH` is only applicable if the server was started with the `--admin` parameter.
 - Some commands (like `NSNEW`) require admin privileges.

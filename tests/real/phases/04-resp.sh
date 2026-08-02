@@ -32,7 +32,7 @@ respd_ensure_running || {
 
 # --- the tripwire -------------------------------------------------------
 
-PINNED="AUTH CHECK DBSIZE DEL EXISTS FLUSH GET KEYTIME LENGTH MGET NSINFO NSLIST NSNEW NSSET PING RSCAN SCAN SELECT SET TIME"
+PINNED="AUTH CHECK DBSIZE DEL ECHO EXISTS FLUSH GET KEYTIME LENGTH MGET NSINFO NSLIST NSNEW NSSET PING RSCAN SCAN SELECT SET TIME"
 actual=$(resp_surface_from_source)
 record "resp-surface" "$actual"
 if [ "$PINNED" = "$actual" ]; then
@@ -161,11 +161,13 @@ assert_eq "the last key of the batch reads back" \
     "$(vk GET "$(printf 'qssrt:bulk:%06d' $((keys - 1)))" 2>/dev/null)"
 rm -f "$batch"
 
-# The pipe protocol proper. valkey-cli --pipe marks the end of its stream
-# with an ECHO of a magic payload and waits for that reply; a server without
-# ECHO leaves it waiting until --pipe-timeout. Graded as a deviation rather
-# than a violation: nothing is lost, and every value above went in through
-# an ordinary batched connection.
+# The pipe protocol proper. valkey-cli --pipe passes its stdin through
+# untouched -- so the lines below arrive as inline commands, not as RESP
+# arrays -- and marks the end of the stream with a bare CRLF followed by an
+# ECHO of twenty random bytes, which it waits for verbatim. Missing either
+# piece left the client waiting out --pipe-timeout, which is what this phase
+# used to record as a deviation. Both are now served, so a failure here is a
+# violation: it means inline parsing, ECHO, or the pipe framing broke.
 pipe="$(qssrt_scratch)/resp-pipe"
 : >"$pipe"
 i=0
@@ -179,8 +181,8 @@ record "pipe-reply" "$(qssrt_oneline "$pipe_out")"
 if printf '%s' "$pipe_out" | grep -qi 'errors: 0'; then
     check_pass "valkey-cli --pipe reports no errors" "$(qssrt_oneline "$pipe_out")"
 else
-    check_find "valkey-cli --pipe reports no errors" \
-        "$(qssrt_oneline "$pipe_out") -- the pipe protocol ends its stream with ECHO, which respd's command surface does not have"
+    check_fail "valkey-cli --pipe reports no errors" \
+        "$(qssrt_oneline "$pipe_out") -- with ECHO on the surface the pipe protocol should complete rather than time out"
 fi
 if [ "$(vk GET qssrt:piped:0000 2>/dev/null)" = "p-0000" ]; then
     check_pass "the piped values landed anyway"
@@ -263,6 +265,7 @@ assert_eq "concurrent clients do not lose writes" "v24" \
     "$(vk GET qssrt:conc:4:24 2>/dev/null)"
 
 assert_ok "PING answers" vk PING
+assert_eq "ECHO returns its message" "qssrt-echo" "$(vk ECHO qssrt-echo 2>/dev/null)"
 time_reply=$(vk TIME 2>/dev/null | head -n 1)
 if printf '%s' "$time_reply" | grep -qE '^[0-9]+$'; then
     check_pass "TIME answers with a clock" "$time_reply"

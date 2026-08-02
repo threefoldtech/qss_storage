@@ -285,6 +285,32 @@ mod test_config {
     }
 
     #[test]
+    fn test_echo() {
+        let server = TestServer::new();
+        let mut conn = server.connect();
+
+        let echoed: String = redis::cmd("ECHO")
+            .arg("hello")
+            .query(&mut conn)
+            .expect("Failed to echo");
+        assert_eq!(echoed, "hello");
+
+        // valkey-cli --pipe ends its stream with an ECHO of twenty random
+        // bytes and matches the reply against them, so the payload has to
+        // survive as bytes rather than as text.
+        let payload: Vec<u8> = vec![0x00, 0xff, 0xfe, b'a', 0x80, b'\n'];
+        let echoed: Vec<u8> = redis::cmd("ECHO")
+            .arg(payload.clone())
+            .query(&mut conn)
+            .expect("Failed to echo binary payload");
+        assert_eq!(echoed, payload);
+
+        // ECHO takes exactly one argument.
+        let bad: Result<String, _> = redis::cmd("ECHO").query(&mut conn);
+        assert!(bad.is_err(), "ECHO with no message must be an error");
+    }
+
+    #[test]
     fn test_multiple_commands() {
         let server = TestServer::new();
         let mut conn = server.connect();

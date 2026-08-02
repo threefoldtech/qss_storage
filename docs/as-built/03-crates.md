@@ -123,7 +123,7 @@ server backed by `cas-storage`.
 | `namespace.rs` | 405 | namespace abstraction over buckets |
 | `server.rs` | -- | connection accept loop, `process` (212 lines) |
 | `storage.rs` | -- | `Storage` wrapper over `CasFS` / `MetaStore` |
-| `resp.rs` | -- | RESP2 frame encode/decode |
+| `resp.rs` | -- | RESP2 frame encode/decode, plus inline-command parsing |
 | `conn.rs` | -- | connection framing |
 | `property.rs` | -- | namespace properties (password, WORM, lock) |
 | `main.rs`, `lib.rs` | -- | bootstrap |
@@ -131,9 +131,10 @@ server backed by `cas-storage`.
 
 ### Command surface
 
-Twenty commands. Standard Redis subset:
+Twenty-one commands. Standard Redis subset:
 
-`AUTH` `DBSIZE` `DEL` `EXISTS` `GET` `MGET` `PING` `SCAN` `SELECT` `SET` `TIME`
+`AUTH` `DBSIZE` `DEL` `ECHO` `EXISTS` `GET` `MGET` `PING` `SCAN` `SELECT` `SET`
+`TIME`
 
 Non-standard extensions for namespace and data management:
 

@@ -70,8 +70,13 @@ pub async fn process(
         .await
 }
 
-/// Signals that the connection can no longer be written to.
-struct WriteFailed;
+/// Why a session stopped serving a connection.
+enum SessionEnd {
+    /// The client can no longer be written to.
+    WriteFailed,
+    /// The client sent bytes that are not a command.
+    ProtocolError,
+}
 
 /// Everything one client connection owns: the socket, the handler bound to the
 /// connection's current namespace, and the shared state needed to rebind that
@@ -144,11 +149,11 @@ impl Session {
 
             let consumed = match self.serve_buffered_frames(&buffer).await {
                 Ok(consumed) => consumed,
-                // The client is unreachable (encode or socket write failed, and
-                // the error is already logged); nothing further can be
-                // delivered, so drop the connection instead of reading more
-                // commands whose replies would be lost.
-                Err(WriteFailed) => break,
+                // Either the client is unreachable (encode or socket write
+                // failed, and the error is already logged) so nothing further
+                // can be delivered, or it sent bytes RESP cannot resume from.
+                // Both end the connection rather than reading on.
+                Err(SessionEnd::WriteFailed | SessionEnd::ProtocolError) => break,
             };
 
             // Remove processed data using split_to which is zero-copy
@@ -162,10 +167,11 @@ impl Session {
     }
 
     /// Answer every complete frame sitting in `buffer`, returning how many
-    /// bytes were consumed. Stops early on a partial frame or a malformed
-    /// frame; a failed write is fatal for the session and returned as an
-    /// error so the caller drops the connection.
-    async fn serve_buffered_frames(&mut self, buffer: &[u8]) -> Result<usize, WriteFailed> {
+    /// bytes were consumed. Stops early on a partial frame, which is simply
+    /// waiting for more of itself; a malformed frame and a failed write are
+    /// both fatal for the session and returned as an error so the caller
+    /// drops the connection.
+    async fn serve_buffered_frames(&mut self, buffer: &[u8]) -> Result<usize, SessionEnd> {
         let mut pos = 0;
 
         while pos < buffer.len() {
@@ -186,7 +192,15 @@ impl Session {
                     // itself being in trouble -- it is what operators (and
                     // the campaign's daemon-log gate) alert on.
                     warn!("Error parsing frame: {}", e);
-                    break;
+
+                    // A stream has no resynchronisation point: whatever
+                    // follows a malformed frame cannot be parsed either. Say
+                    // so and hang up, as Redis does. Reading on would answer
+                    // nothing while the unparseable bytes accumulated.
+                    // `RespError::Protocol` already reads "Protocol error: ..."
+                    self.write_response(&Frame::Error(format!("ERR {}", e)))
+                        .await?;
+                    return Err(SessionEnd::ProtocolError);
                 }
             }
         }
@@ -309,18 +323,18 @@ impl Session {
     }
 
     /// Encode a reply and push it to the client.
-    async fn write_response(&mut self, response: &Frame) -> Result<(), WriteFailed> {
+    async fn write_response(&mut self, response: &Frame) -> Result<(), SessionEnd> {
         let bytes = match RespHelper::encode_frame(response) {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Error encoding response: {}", e);
-                return Err(WriteFailed);
+                return Err(SessionEnd::WriteFailed);
             }
         };
 
         if let Err(e) = self.conn.write_all(&bytes).await {
             error!("Error writing response: {}", e);
-            return Err(WriteFailed);
+            return Err(SessionEnd::WriteFailed);
         }
 
         Ok(())
