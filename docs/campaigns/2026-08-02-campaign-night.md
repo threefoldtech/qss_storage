@@ -224,3 +224,80 @@ all night.
   ack-criterion fix (decision 1), the per-ack persist scope ADR
   (decision 3), the tiered-store harness rail (ADR 0012 follow-up),
   ADR 0004, and the 3 Dependabot alerts (1 high).
+
+---
+
+## Addendum, the afternoon of 2026-08-02: ADR 0013, and the drive that cried wolf
+
+Written 15:40, after the owner's "do that with the small adr and code it,
+rerun the campaign after".
+
+### What landed
+
+ADR 0013 (the ack durability contract) written, accepted, implemented:
+bare acks split into a contract class (object records, bucket metadata,
+respd SET/DEL -- persist at configured durability, their loss would be
+silent) and a recoverable class (`_MULTIPART_PARTS`, `_UPLOADS` -- no
+explicit persist; a power cut answers with InvalidPart / NoSuchUpload,
+loud and retryable, leak-class at worst). Both classes stay
+kernel-visible before the ack; the journal-bytes regression tests now
+pin that for the recoverable trees specifically. The crash storm's mp
+client became s3api-driven and acknowledges ONLY on the complete's
+returned ETag -- the exit-code criterion that manufactured both nights'
+"losses" is gone.
+
+### The campaign, rerun (20260802T115127)
+
+**VERDICT: FINDINGS (exit 1)** -- zero FAILs anywhere; the only two
+findings are respd's documented ECHO deviations. All 12 crash cycles
+clean at both durability levels under the honest ack criterion, storm
+64.5k ops with fd/RSS steady, scrub spotless. The first full campaign
+since the false-ack bug was removed from the harness, and the store's
+fsync claim held everywhere it was tested.
+
+### The bench saga, and its resolution
+
+| run | K=6 fsync | K=6 buffer | conditions |
+| --- | --- | --- | --- |
+| ledger (night 1, pre-0011 code) | 2244 | 3224 | drive state unknown, cool |
+| night 2 (post per-ack persist) | 1009 | 928 | TRIM-starved, unknown then |
+| post-0013, before trim | 576 | 748 | starved further |
+| minutes after `fstrim` (3.6 TiB) | 475 | 854 -> 646 | FTL digesting the discards |
+| post-trim + 30 min idle | **2214** | **3318** | clean FTL, 70-74C |
+
+The collapse was the FTL all along. `rm -rf` discards nothing; ~5 TiB
+of fill-and-wipe cycles since the terabyte run starved the T700's
+flash translation layer, and the "-55% / -71% per-ack persist cost"
+in this report's own re-baseline section was measured on that starved
+drive -- the magnitude was mostly the disk, not the code. An ABA run
+(pre-0011 binaries vs post-0013, interleaved same-hour: 801 / 689 /
+646, declining monotonically through both versions) exonerates every
+code change including 0011/0012-with-group-commit-off. Temperature is
+a red herring: the parity numbers finish at 74C, the same reading the
+"throttled" runs showed. What survives of the convoy story is night
+2's fsync~=buffer flattening -- real evidence that the per-ack persist
+serialized the journal writer -- but its true price was never cleanly
+measured and, post-0013, no longer exists to measure.
+
+**ADR 0013 acceptance: met.** Campaign clean (the ECHO finding floor
+only) and K=6 at statistical parity with the pre-fix ledger at both
+durability levels, with the contract kept where loss would be silent.
+
+### Operational actions this hands you
+
+- Enable periodic TRIM on /s3 (`fstrim.timer`, weekly) or mount with
+  `discard=async`. This afternoon is what three weeks of campaigns
+  would otherwise do to the drive, permanently.
+- Benches now bracket drive temperature (smartctl); folding a
+  temperature + trim-state line into campaign preflight is queued for
+  the harness.
+- The cold-morning K=6 numbers (first load of the day, FTL clean and
+  drive at ambient) are worth collecting once, opportunistically --
+  they are the only ledger row this report could not produce.
+
+### Standing queue after this addendum
+
+The aws-cli upstream report (the mp-80 capture); respd ECHO (fifteen
+lines, turns the campaign's last two findings into passes); the
+tiered-store harness rail; ADR 0004; the 3 Dependabot alerts; and
+fstrim.timer above.
