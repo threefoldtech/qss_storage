@@ -146,25 +146,30 @@ impl RespHelper {
     ///
     /// Empty inline lines carry no command, so they are consumed and parsing
     /// continues with whatever follows.
-    pub fn parse_frame(buffer: &[u8]) -> Result<Option<(Frame, usize)>, RespError> {
+    ///
+    /// The returned count is what the caller should drop, and it is non-zero
+    /// even when no frame completed: blank lines are gone for good rather
+    /// than held against a command that may never arrive, so a client sending
+    /// nothing but newlines cannot grow the read buffer.
+    pub fn parse_frame(buffer: &[u8]) -> Result<(Option<Frame>, usize), RespError> {
         let mut consumed = 0;
 
         loop {
             let rest = &buffer[consumed..];
             let Some(&first) = rest.first() else {
-                return Ok(None);
+                return Ok((None, consumed));
             };
 
             if !FRAME_MARKERS.contains(&first) {
                 match Self::parse_inline(rest)? {
                     // No newline yet: the line is still arriving.
-                    None => return Ok(None),
+                    None => return Ok((None, consumed)),
                     // A blank line is not a command. Skip it and look at
                     // what follows in the same buffer.
                     Some((args, len)) if args.is_empty() => consumed += len,
                     Some((args, len)) => {
                         let frame = Frame::Array(args.into_iter().map(Frame::BulkString).collect());
-                        return Ok(Some((frame, consumed + len)));
+                        return Ok((Some(frame), consumed + len));
                     }
                 }
                 continue;
@@ -175,16 +180,16 @@ impl RespHelper {
             return match redis_protocol::resp2::decode::decode(rest) {
                 Ok(Some((frame, len))) => {
                     // Return the frame and how many bytes were consumed
-                    Ok(Some((frame, consumed + len)))
+                    Ok((Some(frame), consumed + len))
                 }
                 Ok(None) => {
                     // Need more data
-                    Ok(None)
+                    Ok((None, consumed))
                 }
                 Err(e) => {
                     if e.to_string().contains("incomplete") {
                         // Need more data
-                        Ok(None)
+                        Ok((None, consumed))
                     } else {
                         Err(RespError::Protocol(e.to_string()))
                     }
@@ -260,9 +265,8 @@ mod tests {
 
     /// The command name and arguments of a parsed frame, for terse assertions.
     fn parse(buffer: &[u8]) -> (Vec<Vec<u8>>, usize) {
-        let (frame, len) = RespHelper::parse_frame(buffer)
-            .expect("must parse")
-            .expect("must be a complete frame");
+        let (frame, len) = RespHelper::parse_frame(buffer).expect("must parse");
+        let frame = frame.expect("must be a complete frame");
         let Frame::Array(items) = frame else {
             panic!("inline commands parse to arrays, got {:?}", frame);
         };
@@ -309,11 +313,19 @@ mod tests {
 
     #[test]
     fn a_line_that_has_not_arrived_yet_asks_for_more() {
-        assert!(
-            RespHelper::parse_frame(b"SET key val")
-                .expect("a partial line is not an error")
-                .is_none()
-        );
+        let (frame, consumed) =
+            RespHelper::parse_frame(b"SET key val").expect("a partial line is not an error");
+        assert!(frame.is_none());
+        assert_eq!(consumed, 0, "an unfinished line is not consumed");
+    }
+
+    #[test]
+    fn blank_lines_are_consumed_even_with_no_command_behind_them() {
+        // Otherwise a client sending nothing but newlines would grow the
+        // read buffer for as long as it cared to keep sending them.
+        let (frame, consumed) = RespHelper::parse_frame(b"\r\n\r\n\n").expect("must parse");
+        assert!(frame.is_none());
+        assert_eq!(consumed, 5);
     }
 
     #[test]

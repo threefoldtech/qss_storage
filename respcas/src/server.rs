@@ -177,14 +177,20 @@ impl Session {
         while pos < buffer.len() {
             // Create a slice starting at the current position
             match RespHelper::parse_frame(&buffer[pos..]) {
-                Ok(Some((frame, len))) => {
+                Ok((Some(frame), len)) => {
                     debug!("Received frame: {:?}", frame);
                     pos += len;
 
                     let response = self.dispatch(frame);
                     self.write_response(&response).await?;
                 }
-                Ok(None) => break, // Need more data
+                // Need more data. Anything consumed on the way was blank
+                // lines, which are dropped rather than kept waiting for a
+                // command to follow them.
+                Ok((None, skipped)) => {
+                    pos += skipped;
+                    break;
+                }
                 Err(e) => {
                     // A client sending bytes that are not RESP is the
                     // client's problem, connection-scoped and answered on
