@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 use fjall::{self, KeyspaceCreateOptions, Readable, SingleWriterTxKeyspace};
 
 use crate::metastore::{
-    BaseMetaTree, Durability, KeyValuePairs, MetaError, MetaTreeExt, Object, Store, Transaction,
-    TransactionBackend,
+    BaseMetaTree, Durability, KeyValuePairs, MULTIPART_PARTS_TREE, MetaError, MetaTreeExt, Object,
+    Store, Transaction, TransactionBackend, UPLOADS_TREE,
 };
 
 /// Objects at or below this size have their data inlined in the metadata
@@ -145,6 +145,16 @@ impl FjallStore {
             Durability::Fsync => fjall::PersistMode::SyncAll,
         };
 
+        // The one line that tells an operator reading "fsync" in the config
+        // that the contract has a table (ADR 0013).
+        if durability == fjall::PersistMode::SyncAll {
+            tracing::info!(
+                "ack durability contract (ADR 0013): {MULTIPART_PARTS_TREE} and {UPLOADS_TREE} \
+                 are recoverable-class (kernel-visible, no per-ack fsync; loss is loud and \
+                 retryable); every other tree persists each ack at the configured durability"
+            );
+        }
+
         Ok(Self {
             db: TxDb {
                 db: Arc::new(db),
@@ -193,11 +203,42 @@ impl FjallStore {
     }
 }
 
+/// Which persist follows a bare acknowledged write on a tree (ADR 0013).
+///
+/// Both classes are kernel-visible before the ack returns (fjall persists
+/// bare writes at its internal `PersistMode::Buffer`, pinned by the
+/// journal-bytes tests below), so `kill -9` takes neither. They differ only
+/// against power loss, and only where the protocol would not notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AckPersist {
+    /// Loss after the ack would be silent or terminal (object records,
+    /// bucket metadata, respd's SET/DEL): persist at the store's
+    /// configured durability before returning.
+    Contract,
+    /// Loss after the ack is caught loudly by a mandatory later step of
+    /// the same protocol -- a vanished part record fails the complete
+    /// with InvalidPart, a vanished upload marker fails the next
+    /// upload-part with NoSuchUpload -- and the client recovers by
+    /// retrying. fjall's internal kernel-visible write is enough; the
+    /// per-ack fsync this skips was 55-71% of parallel ingest (the
+    /// 2026-08-02 campaign re-baseline).
+    Recoverable,
+}
+
+/// The ADR 0013 contract table, keyed by tree name.
+pub(crate) fn ack_persist_for(name: &str) -> AckPersist {
+    match name {
+        MULTIPART_PARTS_TREE | UPLOADS_TREE => AckPersist::Recoverable,
+        _ => AckPersist::Contract,
+    }
+}
+
 impl Store for FjallStore {
     fn tree_open(&self, name: &str) -> Result<Arc<dyn BaseMetaTree>, MetaError> {
         Ok(Arc::new(FjallTree::new(
             self.db.clone(),
             self.get_partition(name)?,
+            ack_persist_for(name),
         )))
     }
 
@@ -205,6 +246,7 @@ impl Store for FjallStore {
         Ok(Arc::new(FjallTree::new(
             self.db.clone(),
             self.get_partition(name)?,
+            ack_persist_for(name),
         )))
     }
 
@@ -299,11 +341,16 @@ impl Store for FjallStore {
 pub struct FjallTree {
     db: TxDb,
     partition: Arc<SingleWriterTxKeyspace>,
+    ack_persist: AckPersist,
 }
 
 impl FjallTree {
-    pub fn new(db: TxDb, partition: Arc<SingleWriterTxKeyspace>) -> Self {
-        Self { db, partition }
+    pub fn new(db: TxDb, partition: Arc<SingleWriterTxKeyspace>, ack_persist: AckPersist) -> Self {
+        Self {
+            db,
+            partition,
+            ack_persist,
+        }
     }
 
     /// Forward-ordered iterator over a key range.
@@ -324,28 +371,38 @@ impl FjallTree {
 impl BaseMetaTree for FjallTree {
     /// # Durability
     ///
-    /// Persisted at the store's durability before returning, because callers
-    /// acknowledge on the strength of this returning `Ok`: `CreateBucket`,
-    /// `CreateMultipartUpload`, `UploadPart`'s ETag and respd's `SET` all
-    /// come through here rather than through a transaction.
+    /// Callers acknowledge on the strength of this returning `Ok`:
+    /// `CreateBucket`, `CreateMultipartUpload`, `UploadPart`'s ETag and
+    /// respd's `SET` all come through here rather than through a
+    /// transaction. What that ack promises is the tree's [`AckPersist`]
+    /// class (ADR 0013):
     ///
-    /// Without that persist these writes took whatever fjall does internally
-    /// -- `PersistMode::Buffer`, unconditionally -- so at `fsync` durability
-    /// an acked `UploadPart` was page-cache-only and a power cut could take
-    /// it back. A `kill -9` cannot see that (the page cache outlives the
-    /// process), which is why the ADR 0009 campaign never caught it.
+    /// - `Contract` trees persist at the store's configured durability
+    ///   before returning, because losing the write later would be silent.
+    /// - `Recoverable` trees (`_MULTIPART_PARTS`, `_UPLOADS`) rely on
+    ///   fjall's internal kernel-visible write: a power cut can take the
+    ///   record, and the protocol answers with InvalidPart / NoSuchUpload
+    ///   -- loud, retryable, leak-class at worst (over-counted blocks the
+    ///   recount collects).
+    ///
+    /// Either way the bytes are the kernel's before the ack, so a
+    /// `kill -9` takes nothing -- the campaign's crash matrix grades that
+    /// half; the power-loss half is the contract table itself.
     fn insert(&self, key: &[u8], value: Vec<u8>) -> Result<(), MetaError> {
         self.partition
             .insert(key, value)
             .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
-        self.db.persist()
+        match self.ack_persist {
+            AckPersist::Contract => self.db.persist(),
+            AckPersist::Recoverable => Ok(()),
+        }
     }
 
     /// # Durability
     ///
-    /// Persisted at the store's durability before returning; see
-    /// [`insert`](Self::insert). A removal a client was told succeeded --
-    /// respd's `DEL` -- must not come back.
+    /// Same class split as [`insert`](Self::insert). A removal a client
+    /// was told succeeded -- respd's `DEL` -- must not come back, and
+    /// respd's trees are `Contract` class.
     fn remove(&self, key: &[u8]) -> Result<bool, MetaError> {
         // fjall's remove does not say whether the key was there, so the
         // existence is probed first; the two ops are not one transaction,
@@ -357,7 +414,10 @@ impl BaseMetaTree for FjallTree {
         self.partition
             .remove(key)
             .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
-        self.db.persist()?;
+        match self.ack_persist {
+            AckPersist::Contract => self.db.persist()?,
+            AckPersist::Recoverable => {}
+        }
         Ok(existed)
     }
 
@@ -759,6 +819,45 @@ mod tests {
             assert!(
                 journal.windows(needle.len()).any(|w| w == needle),
                 "{durability}: the removal is not in the journal on disk"
+            );
+
+            // The recoverable class (ADR 0013) skips the explicit persist,
+            // which makes THIS assertion its load-bearing dependency: the
+            // bytes must be kernel-visible purely through fjall's internal
+            // Buffer-level write, or a kill -9 could take an acked
+            // UploadPart ETag. If a fjall upgrade ever fails this, the
+            // recoverable class needs an explicit persist(Buffer) back.
+            for relaxed in [MULTIPART_PARTS_TREE, UPLOADS_TREE] {
+                let tree = store.tree_open(relaxed).unwrap();
+                let key = format!("an-acked-part-record-in-{relaxed}");
+                tree.insert(key.as_bytes(), b"value".to_vec()).unwrap();
+                let journal = journal_bytes(dir.path());
+                assert!(
+                    journal.windows(key.len()).any(|w| w == key.as_bytes()),
+                    "{durability}: an acked {relaxed} write is not in the \
+                     journal on disk despite fjall's internal Buffer persist \
+                     -- the ADR 0013 recoverable class just lost its kill -9 \
+                     safety"
+                );
+            }
+        }
+    }
+
+    /// The ADR 0013 contract table: exactly the two multipart state trees
+    /// are recoverable-class, everything else -- bucket trees, respd
+    /// namespaces, anything future -- persists per ack.
+    #[test]
+    fn the_ack_persist_table_is_exactly_the_multipart_state_trees() {
+        assert_eq!(
+            ack_persist_for(MULTIPART_PARTS_TREE),
+            AckPersist::Recoverable
+        );
+        assert_eq!(ack_persist_for(UPLOADS_TREE), AckPersist::Recoverable);
+        for contract in ["some-bucket", "_BLOCKS", "acked", "respd-ns"] {
+            assert_eq!(
+                ack_persist_for(contract),
+                AckPersist::Contract,
+                "{contract} must persist per ack: its loss would be silent"
             );
         }
     }
