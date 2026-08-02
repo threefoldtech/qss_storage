@@ -17,7 +17,6 @@ path = "src/main.rs"
 [dependencies]
 cas-storage = { path = "../cas-storage" }
 tokio = { workspace = true }
-async-trait = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
