@@ -30,10 +30,68 @@ crash_worker() {
     done
 }
 
+# crash_mp_upload <bucket> <key> <file>
+#
+# The storm's multipart client: s3api create, parallel upload-part,
+# complete. Returns 0 ONLY when complete-multipart-upload came back with
+# an ETag -- the ack is the complete's 200, never a client tool's exit
+# code. aws-cli 2.36.14's `s3 cp` exits 0 when the daemon dies during
+# the complete (captured live: fsync-2/mp-80, campaign 2026-08-02), and
+# an ack criterion built on an exit code manufactures losses no store
+# can prevent. stderr is left to the caller: the audit mode keeps it.
+crash_mp_upload() {
+    local bucket="$1" key="$2" file="$3"
+    local dir uid tag etag parts p n i rc=1 miss=0 failed=0
+    dir=$(mktemp -d "$(qssrt_scratch)/mpup.XXXXXX") || return 1
+    uid=$(s3api create-multipart-upload --bucket "$bucket" --key "$key" \
+        --query UploadId --output text)
+    if [ -n "$uid" ] && [ "$uid" != None ]; then
+        split -b "$(qssrt_bytes "$QSSRT_CRASH_MP_PART_BYTES")" -d \
+            "$file" "$dir/p"
+        local pids=() files=()
+        n=1
+        for p in "$dir"/p[0-9]*; do
+            files[$n]="$p"
+            (
+                s3api upload-part --bucket "$bucket" --key "$key" \
+                    --upload-id "$uid" --part-number "$n" --body "$p" \
+                    --query ETag --output text | tr -d '"' >"$p.etag"
+            ) &
+            pids+=($!)
+            n=$((n + 1))
+        done
+        for p in "${pids[@]}"; do wait "$p" || failed=1; done
+        if [ "$failed" = 0 ]; then
+            parts='{"Parts":['
+            i=1
+            while [ "$i" -lt "$n" ]; do
+                tag=$(cat "${files[$i]}.etag" 2>/dev/null)
+                if [ -z "$tag" ] || [ "$tag" = None ]; then
+                    miss=1
+                    break
+                fi
+                parts="$parts{\"ETag\":\"$tag\",\"PartNumber\":$i},"
+                i=$((i + 1))
+            done
+            if [ "$miss" = 0 ]; then
+                printf '%s]}' "${parts%,}" >"$dir/parts.json"
+                etag=$(s3api complete-multipart-upload --bucket "$bucket" \
+                    --key "$key" --upload-id "$uid" \
+                    --multipart-upload "file://$dir/parts.json" \
+                    --query ETag --output text | tr -d '"')
+                [ -n "$etag" ] && [ "$etag" != None ] && rc=0
+            fi
+        fi
+    fi
+    rm -rf "$dir"
+    return "$rc"
+}
+
 # crash_multipart_worker <bucket> <prefix> <size> <ack-file> <deadline-epoch>
 #
-# The same, through client-driven multipart, so the kill lands inside an
-# upload's lifetime as often as inside a PUT's.
+# The same as crash_worker, through client-driven multipart, so the kill
+# lands inside an upload's lifetime as often as inside a PUT's. Parts go
+# up in parallel, as aws-cli's transfer manager would send them.
 crash_multipart_worker() {
     local bucket="$1" prefix="$2" size="$3" ack="$4" deadline="$5" n=0 key tmp
     local rc t0 t1 mplog="${QSSRT_CRASH_MP_LOG:-}"
@@ -41,18 +99,18 @@ crash_multipart_worker() {
     while [ "$(date +%s)" -lt "$deadline" ]; do
         key="$prefix/mp-$n"
         gen_file "$key" "$size" "$tmp"
-        # Instrumented mode (2026-08-02 false-ack investigation): keep every
-        # cp's exit code, wall window, and stderr, so an acknowledgement can
-        # be audited against what the client tool actually reported.
+        # Audit mode (the 2026-08-02 false-ack capture): keep every
+        # upload's outcome, wall window, and stderr, so an acknowledgement
+        # can always be audited against what the client actually saw.
         if [ -n "$mplog" ]; then
             t0=$(date +%s.%N)
-            s3cmd cp --quiet "$tmp" "s3://$bucket/$key" \
-                >/dev/null 2>>"$mplog.err.${prefix//\//-}-mp-$n"
+            crash_mp_upload "$bucket" "$key" "$tmp" \
+                2>>"$mplog.err.${prefix//\//-}-mp-$n"
             rc=$?
             t1=$(date +%s.%N)
             printf '%s\t%s\t%s\t%s\n' "$key" "$rc" "$t0" "$t1" >>"$mplog"
         else
-            s3cmd cp --quiet "$tmp" "s3://$bucket/$key" >/dev/null 2>&1
+            crash_mp_upload "$bucket" "$key" "$tmp" 2>/dev/null
             rc=$?
         fi
         if [ "$rc" = 0 ]; then
