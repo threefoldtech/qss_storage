@@ -36,11 +36,26 @@ crash_worker() {
 # upload's lifetime as often as inside a PUT's.
 crash_multipart_worker() {
     local bucket="$1" prefix="$2" size="$3" ack="$4" deadline="$5" n=0 key tmp
+    local rc t0 t1 mplog="${QSSRT_CRASH_MP_LOG:-}"
     tmp="$(qssrt_scratch)/mp-${BASHPID:-$$}"
     while [ "$(date +%s)" -lt "$deadline" ]; do
         key="$prefix/mp-$n"
         gen_file "$key" "$size" "$tmp"
-        if s3cmd cp --quiet "$tmp" "s3://$bucket/$key" >/dev/null 2>&1; then
+        # Instrumented mode (2026-08-02 false-ack investigation): keep every
+        # cp's exit code, wall window, and stderr, so an acknowledgement can
+        # be audited against what the client tool actually reported.
+        if [ -n "$mplog" ]; then
+            t0=$(date +%s.%N)
+            s3cmd cp --quiet "$tmp" "s3://$bucket/$key" \
+                >/dev/null 2>>"$mplog.err.${prefix//\//-}-mp-$n"
+            rc=$?
+            t1=$(date +%s.%N)
+            printf '%s\t%s\t%s\t%s\n' "$key" "$rc" "$t0" "$t1" >>"$mplog"
+        else
+            s3cmd cp --quiet "$tmp" "s3://$bucket/$key" >/dev/null 2>&1
+            rc=$?
+        fi
+        if [ "$rc" = 0 ]; then
             printf '%s\t%s\n' "$key" "$size" >>"$ack"
         fi
         n=$((n + 1))
