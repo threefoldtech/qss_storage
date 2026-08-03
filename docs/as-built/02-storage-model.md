@@ -45,7 +45,7 @@ which is why `md-5` is still a `cas-storage` dependency. The type system keeps
 the two apart -- `ContentHash` (`cas-storage/src/metastore/content_hash.rs`) is
 a fixed 16-byte newtype with its own `CONTENT_HASH_SIZE`, so the serialization
 offsets for an ETag cannot follow the block width. The multipart ETag
-(`s3cas/src/s3fs.rs::calculate_multipart_hash`) is the S3 convention: MD5 over
+(`s3cas/src/api.rs::calculate_multipart_hash`) is the S3 convention: MD5 over
 the concatenated per-part MD5s, rendered `{hex}-{N}` with N the part count.
 
 ## Store header (QSST)

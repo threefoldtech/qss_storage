@@ -34,7 +34,7 @@ status. Commits are on `development`.
 | (H2 adjacent) FjallNoTransaction unsafe impls | **Fixed** -- both redundant, deleted with static assertions | `a5722c8` |
 | H7 Content-MD5 unverified | **Fixed** -- malformed headers rejected as `InvalidDigest`; mismatches return `BadDigest` (inlined path checks before storing, streamed path rolls the object back, upload_part fails before the part is registered). Bonus: missing Content-Length no longer panics `put_object` | -- |
 | H8 num_keys unwrap | **Fixed** -- returns `Result`; no in-tree caller needed changes | `58ca932` |
-| H9 async_trait in metrics | **Closed, no change** -- the finding's premise was wrong: `metrics.rs:258` is `impl S3 for MetricFs<T>`, the same upstream `#[async_trait]`-defined `s3s::S3` trait as `s3fs.rs:83`, not a local trait. Every impl must match the macro-expanded boxed-future signatures, and s3s pulls the crate in regardless. Both occurrences stay until s3s moves to native AFIT | -- |
+| H9 async_trait in metrics | **Closed, no change** -- the finding's premise was wrong: `metrics.rs:258` is `impl S3 for MetricFs<T>`, the same upstream `#[async_trait]`-defined `s3s::S3` trait as `api.rs:83`, not a local trait. Every impl must match the macro-expanded boxed-future signatures, and s3s pulls the crate in regardless. Both occurrences stay until s3s moves to native AFIT | -- |
 | H10 truncating casts | **Fixed** -- audited individually: client-influenced sites (`put_object` Content-Length, `BlockStream` range seek/read, `upload_part` size) now `try_from` with an error; provably-bounded sites carry `#[allow]` with the bounding argument; `debug_assert` comparisons flipped to the lossless direction. `-W clippy::cast_possible_truncation` is clean | -- |
 | H11 module style | **Fixed** -- `metastore/mod.rs` and `metastore/stores/mod.rs` converted to the post-2018 `metastore.rs` / `stores.rs` form via `git mv` | -- |
 | H12 Durability naming | **Fixed, then moot** -- the mapping was swapped to match POSIX semantics (`Fsync` -> `SyncAll`, `Fdatasync` -> `SyncData`) and the default moved to `fsync`; ADR 0010 then deleted the `fdatasync` level outright, so there is nothing left to name wrongly. Two levels remain: `fsync` and `buffer` | `7d61158` |
@@ -73,7 +73,7 @@ landed in fourteen steps (C1-C14) over commits `8ed2506`..`69c726e`, per
 It closes two findings from this review: **H3** (on-disk format v1, all
 length and count fields `u64`, at `a0c6471`) and **H4** (blocks addressed by
 BLAKE3, default 32 bytes, at `23ed542`). It does not touch **H7**:
-`content_md5` is still destructured and discarded in `s3cas/src/s3fs.rs`, so
+`content_md5` is still destructured and discarded in `s3cas/src/api.rs`, so
 client-supplied Content-MD5 remains unverified and that finding stays open
 (since fixed in the remediation pass; see the status table above).
 
@@ -258,7 +258,7 @@ which every one of these call sites is already positioned to return.
 
 ### H7. Client-supplied Content-MD5 accepted and ignored -- by inspection
 
-`s3cas/src/s3fs.rs:676`
+`s3cas/src/api.rs:676`
 
 ```rust
 content_md5: _, // TODO: Verify
@@ -285,19 +285,19 @@ Swallows the `Result` into a panic in a method whose doc comment says it is
 
 ### H9. `#[async_trait]` still present -- needs decision
 
-`s3cas/src/s3fs.rs:83`, `s3cas/src/metrics.rs:1,258`
+`s3cas/src/api.rs:83`, `s3cas/src/metrics.rs:1,258`
 
 House rule is native AFIT over the `async-trait` crate. Two cases, different
 verdicts:
 
-- `s3fs.rs:83` -- `impl S3 for S3FS`. The `s3s` crate defines the `S3` trait
+- `api.rs:83` -- `impl S3 for S3Cas`. The `s3s` crate defines the `S3` trait
   with `#[async_trait]`; the impl must match. Not removable without an upstream
   change to `s3s`. Leave it.
 - `metrics.rs:1,258` -- a local trait impl. Likely convertible to native
   `async fn` in trait, or to `-> impl Future` if a `dyn` bound is needed.
 
 Resolution (2026-07-30): the second verdict was wrong. `metrics.rs:258` is
-`impl S3 for MetricFs<T>` -- the same upstream `s3s::S3` trait as `s3fs.rs:83`,
+`impl S3 for MetricFs<T>` -- the same upstream `s3s::S3` trait as `api.rs:83`,
 not a local trait. Both impls must carry the macro to match its expanded
 boxed-future signatures, and `s3s` depends on `async-trait` regardless, so
 hand-writing `Pin<Box<dyn Future>>` shims would remove nothing from the
@@ -311,7 +311,7 @@ already removed there as dead weight, so the direction of travel is established.
 
 12 `clippy::cast_possible_truncation` hits under `-W clippy::pedantic`,
 including `size as u64`, `part_number as i64`, and `count as i64` in
-`s3cas/src/s3fs.rs`. In a storage system these sit on the paths that compute
+`s3cas/src/api.rs`. In a storage system these sit on the paths that compute
 object sizes, part numbers, and content ranges, where a silent truncation is a
 data-integrity bug rather than a display glitch. Worth auditing the 12
 individually and using `try_into()` with an error where the value is
@@ -426,9 +426,9 @@ rather than style:
 
 | Location | Note |
 |----------|------|
-| `s3cas/src/s3fs.rs:51` | `FIXME` -- bucket count hardcoded to 1 |
-| `s3cas/src/s3fs.rs:676` | Content-MD5 unverified (H7) |
-| `s3cas/src/s3fs.rs:200,256` | output structs returned as `default()` |
+| `s3cas/src/api.rs:51` | `FIXME` -- bucket count hardcoded to 1 |
+| `s3cas/src/api.rs:676` | Content-MD5 unverified (H7) |
+| `s3cas/src/api.rs:200,256` | output structs returned as `default()` |
 | `s3cas/src/metrics.rs:109` | may crash with multiple instances |
 | `cas-storage/src/metastore/meta_store.rs:189` | `list_buckets` should be paginated/streamed |
 | `cas-storage/src/cas/fs.rs:199` | "this is very much not optimal" |

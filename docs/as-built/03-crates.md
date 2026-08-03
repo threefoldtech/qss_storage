@@ -72,7 +72,7 @@ workspace).
 
 | File | Lines | Role |
 |------|-------|------|
-| `s3fs.rs` | 751 | `impl S3 for S3FS` -- the whole S3 verb surface |
+| `api.rs` | 751 | `impl S3 for S3Cas` -- the whole S3 verb surface |
 | `metrics.rs` | 390 | Prometheus `SharedMetrics` + `CasMetricsAdapter` |
 | `main.rs` | 278 | clap CLI, four subcommands, server bootstrap |
 | `check.rs` | -- | integrity checking |
@@ -84,13 +84,13 @@ workspace).
 
 ### Implemented S3 operations
 
-From the `impl S3 for S3FS` block: `create_bucket`, `delete_bucket`,
+From the `impl S3 for S3Cas` block: `create_bucket`, `delete_bucket`,
 `head_bucket`, `list_buckets`, `get_bucket_location`, `put_object`,
 `get_object`, `head_object`, `delete_object`, `delete_objects`,
 `list_objects`, `list_objects_v2`, `create_multipart_upload`,
 `upload_part`, `complete_multipart_upload`.
 
-`copy_object` returns `NotImplemented` (`s3fs.rs:173-180`), with a comment
+`copy_object` returns `NotImplemented` (`api.rs:173-180`), with a comment
 pointing at the upstream s3-cas implementation and noting uncertainty about
 whether it is correct. The README's "Known issues" already records this.
 
@@ -99,17 +99,22 @@ Integration tests are parameterized over both storage engines
 
 ### Notable in-code caveats
 
-- `s3fs.rs:51` -- `FIXME` on `metrics.set_bucket_count(1)`, a hardcoded bucket
+- `api.rs:51` -- `FIXME` on `metrics.set_bucket_count(1)`, a hardcoded bucket
   count standing in for a real count.
-- `s3fs.rs:200`, `s3fs.rs:256` -- `CreateBucketOutput` / `DeleteObjectOutput`
+- `api.rs:200`, `api.rs:256` -- `CreateBucketOutput` / `DeleteObjectOutput`
   returned as `default()` with "handle other fields" TODOs.
-- `s3fs.rs:676` -- `content_md5: _, // TODO: Verify`. The client-supplied
+- `api.rs:676` -- `content_md5: _, // TODO: Verify`. The client-supplied
   Content-MD5 header is accepted and ignored rather than validated.
 - `metrics.rs:109` -- TODO noting the metrics registry may crash with multiple
   instances.
-- `s3fs.rs:83` and `metrics.rs:1,258` use `#[async_trait]`. The `s3fs.rs` one is
-  forced by the `s3s` crate's trait definition and cannot be removed locally.
-  The `metrics.rs` one is local and likely removable -- finding H9.
+- `api.rs:241` and `metrics.rs:1,354` use `#[async_trait]`. Both are
+  `impl S3 for ...` -- the same upstream `s3s::S3` trait, which `s3s` declares
+  with `#[async_trait::async_trait]`, so every impl must match its expanded
+  boxed-future signatures. Neither is removable locally, and `s3s` depends on
+  the crate regardless. Finding H9 first read the `metrics.rs` one as a local
+  trait and was closed on that premise being wrong (2026-07-30); see
+  [04-code-health.md](./04-code-health.md). Revisit only if `s3s` moves to
+  native AFIT.
 
 ## respcas
 

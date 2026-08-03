@@ -102,11 +102,11 @@ static CONFIG: LazyLock<SdkConfig> = LazyLock::new(|| {
         None,  // group_commit: off, the ADR 0011 default
     )
     .expect("can construct CasFS");
-    let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
+    let s3 = s3cas::api::S3Cas::new(casfs, metrics.clone());
 
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(s3fs);
+        let mut b = S3ServiceBuilder::new(s3);
         b.set_auth(s3s::auth::SimpleAuth::from_single(
             cred.access_key_id(),
             cred.secret_access_key(),

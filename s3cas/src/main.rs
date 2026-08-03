@@ -395,8 +395,8 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
     // twice, which is what ADR 0006's one-store-one-instance rule requires.
     let gc_casfs = casfs.clone();
 
-    let s3fs = s3cas::s3fs::S3FS::new(casfs, metrics.clone());
-    let s3fs = s3cas::metrics::MetricFs::new(s3fs, metrics.clone());
+    let s3 = s3cas::api::S3Cas::new(casfs, metrics.clone());
+    let s3 = s3cas::metrics::MetricFs::new(s3, metrics.clone());
 
     let (gc_shutdown, gc_shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_task = spawn_stale_upload_gc(
@@ -408,7 +408,7 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
 
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(s3fs);
+        let mut b = S3ServiceBuilder::new(s3);
 
         // Authentication is mandatory; resolve_server refused to start
         // without a complete credential pair.

@@ -41,19 +41,19 @@ const MAX_PARTS: i32 = 1000;
 /// S3's ceiling on one `ListMultipartUploads` page, and its default.
 const MAX_UPLOADS: i32 = 1000;
 
-pub struct S3FS {
+pub struct S3Cas {
     casfs: CasFS,
     metrics: SharedMetrics,
 }
 
-impl std::fmt::Debug for S3FS {
+impl std::fmt::Debug for S3Cas {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3FS").finish_non_exhaustive()
+        f.debug_struct("S3Cas").finish_non_exhaustive()
     }
 }
 
 use cas_storage::RangeRequest;
-impl S3FS {
+impl S3Cas {
     pub fn new(casfs: CasFS, metrics: SharedMetrics) -> Self {
         match casfs.list_buckets() {
             Ok(buckets) => metrics.set_bucket_count(buckets.len()),
@@ -239,7 +239,7 @@ fn upload_to_dto(record: &UploadRecord) -> MultipartUpload {
 }
 
 #[async_trait::async_trait]
-impl S3 for S3FS {
+impl S3 for S3Cas {
     /// Claims the upload and reaps every part it holds; the loser of the
     /// claim -- and an id that never existed -- gets `NoSuchUpload` (ADR 0003
     /// decision, owner sign-off). The reaping itself (record first, blocks

@@ -70,7 +70,7 @@ coordinating daemon.
 **s3cas** (`s3cas/src/main.rs`) is a clap CLI with four subcommands:
 
 - `server` -- runs the S3 HTTP service. hyper + `hyper-util` serving an
-  `s3s::service::S3Service`, with `S3FS` (`s3cas/src/s3fs.rs`) as the `S3`
+  `s3s::service::S3Service`, with `S3Cas` (`s3cas/src/api.rs`) as the `S3`
   trait implementation. `run()` is 131 lines.
 - `inspect num-keys | disk-space | header` -- read-only metadata queries.
   `num-keys` reads the namespace DB (`<meta_root>/db`); `disk-space` and
@@ -92,7 +92,7 @@ coordinating daemon.
 ### s3cas PUT object
 
 ```
-hyper -> s3s S3Service -> S3FS::put_object (s3cas/src/s3fs.rs)
+hyper -> s3s S3Service -> S3Cas::put_object (s3cas/src/api.rs)
   -> CasFS::store_object (cas-storage/src/cas/write_path.rs::store_object, 161 lines)
      -> BufferedByteStream chunks the body into 1 MiB buffers
      -> per block: MD5 -> BlockID -> refcount insert-or-increment -> write to disk
@@ -107,7 +107,7 @@ one is not.
 ### s3cas GET object with Range
 
 ```
-S3FS::get_object -> parse_range_request (cas-storage/src/cas/range_request.rs)
+S3Cas::get_object -> parse_range_request (cas-storage/src/cas/range_request.rs)
   -> CasFS read path (cas-storage/src/cas/read_path.rs)
      -> BlockStream (cas-storage/src/cas/block_stream.rs)
         Stream impl, poll_next is 147 lines, opens block files lazily
