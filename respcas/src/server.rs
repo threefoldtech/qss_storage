@@ -8,10 +8,15 @@ use tracing::{debug, error, info, warn};
 use crate::cmd::{Command, CommandHandler};
 use crate::conn::Conn;
 use crate::namespace::NamespaceCache;
-use crate::resp::RespHelper;
+use crate::resp::{self, RespHelper};
 use crate::storage::Storage;
 
-pub async fn run(addr: String, storage: Storage, admin_password: Option<String>) -> Result<()> {
+pub async fn run(
+    addr: String,
+    storage: Storage,
+    admin_password: Option<String>,
+    max_value_size: usize,
+) -> Result<()> {
     // Initialize the default namespace if it doesn't exist
     if let Err(e) = storage.init_namespace() {
         error!("Failed to initialize namespace: {}", e);
@@ -45,8 +50,14 @@ pub async fn run(addr: String, storage: Storage, admin_password: Option<String>)
 
                 // Spawn a new task to handle this connection
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        process(socket, storage, namespace_cache.clone(), admin_password).await
+                    if let Err(e) = process(
+                        socket,
+                        storage,
+                        namespace_cache.clone(),
+                        admin_password,
+                        max_value_size,
+                    )
+                    .await
                     {
                         error!("Error processing connection: {}", e);
                     }
@@ -64,10 +75,17 @@ pub async fn process(
     storage: Arc<Storage>,
     namespace_cache: Arc<NamespaceCache>,
     admin_password: Option<String>,
+    max_value_size: usize,
 ) -> Result<()> {
-    Session::new(socket, storage, namespace_cache, admin_password)?
-        .run()
-        .await
+    Session::new(
+        socket,
+        storage,
+        namespace_cache,
+        admin_password,
+        max_value_size,
+    )?
+    .run()
+    .await
 }
 
 /// Why a session stopped serving a connection.
@@ -87,6 +105,9 @@ struct Session {
     storage: Arc<Storage>,
     namespace_cache: Arc<NamespaceCache>,
     admin_password: Option<String>,
+    /// Largest value this connection may send (ADR 0014). A command that
+    /// declares a longer one is refused before its bytes are read.
+    max_value_size: usize,
 }
 
 impl Session {
@@ -95,6 +116,7 @@ impl Session {
         storage: Arc<Storage>,
         namespace_cache: Arc<NamespaceCache>,
         admin_password: Option<String>,
+        max_value_size: usize,
     ) -> Result<Self> {
         // If no admin password is required, all connections are admin by default
         let is_admin = admin_password.is_none();
@@ -126,6 +148,7 @@ impl Session {
             storage,
             namespace_cache,
             admin_password,
+            max_value_size,
         })
     }
 
@@ -145,6 +168,28 @@ impl Session {
                     error!("Error reading from socket: {}", e);
                     break;
                 }
+            }
+
+            // Before the bytes are read: a command that declares a value
+            // over the cap is refused now, while the buffer holds only its
+            // header (ADR 0014). Answering after buffering it would have
+            // paid the memory the cap exists to bound.
+            if let Some(declared) = resp::oversized_bulk(&buffer, self.max_value_size) {
+                warn!(
+                    "refusing a {declared} byte argument: over the {} byte limit",
+                    self.max_value_size
+                );
+                let _ = self
+                    .write_response(&Frame::Error(format!(
+                        "ERR value of {declared} bytes is over the {} byte limit \
+                         (resp.max_value_size)",
+                        self.max_value_size
+                    )))
+                    .await;
+                // A stream has no resynchronisation point: the bytes that
+                // were refused are still on their way, and everything after
+                // them would be read as commands.
+                break;
             }
 
             let consumed = match self.serve_buffered_frames(&buffer).await {

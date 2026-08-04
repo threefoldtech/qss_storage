@@ -5,6 +5,7 @@
 // them uses is dead code in the others.
 #![allow(dead_code)]
 
+use cas_storage::config::DEFAULT_RESP_MAX_VALUE_SIZE;
 use redis::{Client, Connection};
 use std::fs;
 use std::net::TcpListener;
@@ -40,6 +41,16 @@ impl TestServer {
     }
 
     pub fn new_with_admin(admin_password: Option<String>) -> Self {
+        Self::start(admin_password, DEFAULT_RESP_MAX_VALUE_SIZE)
+    }
+
+    /// A daemon with the value cap set low, for the tests that check what
+    /// happens at it (ADR 0014).
+    pub fn new_with_max_value_size(max_value_size: usize) -> Self {
+        Self::start(None, max_value_size)
+    }
+
+    fn start(admin_password: Option<String>, max_value_size: usize) -> Self {
         // Create a temporary directory for the server data
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let data_dir = temp_dir.path().to_path_buf();
@@ -114,7 +125,7 @@ impl TestServer {
                                     let admin_password = thread_admin_password.clone();
                                     tokio::spawn(async move {
                                         // Pass admin_password to the process function
-                                        if let Err(e) = respcas::server::process(socket, storage, namespace_cache, admin_password).await {
+                                        if let Err(e) = respcas::server::process(socket, storage, namespace_cache, admin_password, max_value_size).await {
                                             eprintln!("Error processing connection: {}", e);
                                         }
                                     });

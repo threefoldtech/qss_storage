@@ -130,6 +130,64 @@ fn split_args(line: &[u8]) -> Result<Vec<Vec<u8>>, RespError> {
     }
 }
 
+/// Reads a `<int>\r\n` at `pos`, returning it and the index just past the
+/// newline. `None` while the line is still arriving, or if it is not a
+/// number -- a malformed frame is the decoder's to report, not this.
+fn read_len_line(buffer: &[u8], pos: usize) -> Option<(i64, usize)> {
+    let rest = buffer.get(pos..)?;
+    let newline = rest.iter().position(|&b| b == b'\n')?;
+    let mut line = &rest[..newline];
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    let value: i64 = std::str::from_utf8(line).ok()?.parse().ok()?;
+    Some((value, pos + newline + 1))
+}
+
+/// The first bulk length a command DECLARES that is over `cap`, if any.
+///
+/// Reads only the length headers of a command that may still be arriving,
+/// so an oversized value is refused before its bytes have been buffered --
+/// which is the whole point of the cap (ADR 0014): the memory an ingest
+/// costs is the value, and a limit that only applies once the value is in
+/// memory limits nothing.
+///
+/// `None` means "nothing over the cap so far", including the case where the
+/// buffer stops mid-header. It is called again on every read, so a header
+/// that has not arrived yet is simply seen a moment later.
+pub fn oversized_bulk(buffer: &[u8], cap: usize) -> Option<usize> {
+    // Only a RESP array can carry a bulk argument. An inline command has its
+    // own, much smaller, bound (INLINE_MAX_SIZE).
+    if buffer.first() != Some(&b'*') {
+        return None;
+    }
+
+    let (count, mut pos) = read_len_line(buffer, 1)?;
+    for _ in 0..count.max(0) {
+        if buffer.get(pos) != Some(&b'$') {
+            return None;
+        }
+        let (len, after_header) = read_len_line(buffer, pos + 1)?;
+        if len < 0 {
+            // A null bulk string carries no bytes.
+            pos = after_header;
+            continue;
+        }
+        let len = len as usize;
+        if len > cap {
+            return Some(len);
+        }
+        // Past this argument's bytes and its trailing CRLF. Beyond the end
+        // of what has arrived means the rest is still coming.
+        pos = after_header.checked_add(len)?.checked_add(2)?;
+        if pos > buffer.len() {
+            return None;
+        }
+    }
+
+    None
+}
+
 /// Helper functions for Redis RESP protocol
 pub struct RespHelper;
 
@@ -247,6 +305,61 @@ impl RespHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply of any size encodes: the buffer is sized from the frame, not
+    /// guessed at. The 16 KiB guess used to turn a large GET into a dropped
+    /// connection.
+    #[test]
+    fn a_reply_larger_than_the_old_guess_encodes() {
+        let value = vec![0x5au8; 1 << 20];
+        let encoded = RespHelper::encode_frame(&Frame::BulkString(value.clone()))
+            .expect("a megabyte reply is a reply");
+
+        assert_eq!(encoded.len(), value.len() + b"$1048576\r\n\r\n".len());
+        assert!(encoded.starts_with(b"$1048576\r\n"));
+        assert!(encoded.ends_with(b"\r\n"));
+        assert_eq!(&encoded[10..10 + value.len()], &value[..]);
+    }
+
+    /// The value cap is checked against what a command DECLARES, so an
+    /// oversized value is refused while the buffer still holds only headers
+    /// (ADR 0014).
+    #[test]
+    fn an_oversized_value_is_seen_from_its_header_alone() {
+        // SET key <8 byte value>, of which only the header has arrived.
+        let head = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$8\r\n";
+
+        assert_eq!(oversized_bulk(head, 4), Some(8), "the header is enough");
+        assert_eq!(oversized_bulk(head, 8), None, "at the cap is not over it");
+
+        // Nothing to say yet: the length line is still arriving.
+        assert_eq!(
+            oversized_bulk(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$81", 4),
+            None
+        );
+
+        // A complete, small command says nothing either.
+        let whole = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+        assert_eq!(oversized_bulk(whole, 64), None);
+
+        // An inline command carries no bulk headers; its own bound applies.
+        assert_eq!(oversized_bulk(b"PING\r\n", 1), None);
+    }
+
+    /// Bytes inside a value are not headers. The scan walks the frame's
+    /// structure rather than searching for `$`, so a value that looks like a
+    /// protocol header cannot get a connection killed.
+    #[test]
+    fn a_value_that_looks_like_a_header_is_not_one() {
+        let payload = b"$999999999\r\n";
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n");
+        buffer.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+        buffer.extend_from_slice(payload);
+        buffer.extend_from_slice(b"\r\n");
+
+        assert_eq!(oversized_bulk(&buffer, 1024), None);
+    }
 
     /// The command name and arguments of a parsed frame, for terse assertions.
     fn parse(buffer: &[u8]) -> (Vec<Vec<u8>>, usize) {

@@ -6,7 +6,7 @@ use tracing::info;
 use cas_storage::StoreOptions;
 use cas_storage::config::{
     self, DEFAULT_RESP_DATA_DIR, DEFAULT_RESP_HOST, DEFAULT_RESP_INLINE_METADATA_SIZE,
-    DEFAULT_RESP_PORT, QssStorageConfig,
+    DEFAULT_RESP_MAX_VALUE_SIZE, DEFAULT_RESP_PORT, QssStorageConfig,
 };
 
 mod cmd;
@@ -58,6 +58,10 @@ struct ResolvedConfig {
     host: String,
     port: u16,
     admin: Option<String>,
+    /// Largest value a client may send (ADR 0014). Ingest is
+    /// buffer-then-write, so this is the memory one writing connection
+    /// costs.
+    max_value_size: usize,
     /// How the store is opened. The same `[store]` table s3cas and fsck read,
     /// because since ADR 0014 respcas opens the same kind of store they do.
     store: StoreOptions,
@@ -91,6 +95,7 @@ fn resolve(flags: Opt, config: &QssStorageConfig) -> Result<ResolvedConfig, conf
             .unwrap_or_else(|| DEFAULT_RESP_HOST.to_string()),
         port: flags.port.or(resp.port).unwrap_or(DEFAULT_RESP_PORT),
         admin: flags.admin.or(resp.admin_password),
+        max_value_size: resp.max_value_size.unwrap_or(DEFAULT_RESP_MAX_VALUE_SIZE),
         store: StoreOptions {
             inline_metadata_size: Some(
                 store
@@ -144,7 +149,7 @@ async fn main() -> Result<()> {
         info!("Admin authentication is disabled - all connections have admin privileges");
     }
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    server::run(addr, storage, cfg.admin).await
+    server::run(addr, storage, cfg.admin, cfg.max_value_size).await
 }
 
 #[cfg(test)]

@@ -132,6 +132,14 @@ pub const DEFAULT_RESP_DATA_DIR: &str = "./data";
 /// everything that fits", which is how respcas has always run.
 pub const DEFAULT_RESP_INLINE_METADATA_SIZE: usize = 1;
 
+/// Largest value respcas accepts by default: 64 MiB (ADR 0014).
+///
+/// zdb caps its payload at 8 MiB; respcas serves broader workloads, and the
+/// cost of the larger cap is memory per concurrent writer, not per stored
+/// object. A client with objects bigger than this belongs on the S3 face,
+/// which has multipart.
+pub const DEFAULT_RESP_MAX_VALUE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Days an unfinished multipart upload survives before the stale-upload GC
 /// aborts it (ADR 0003). Seven days is the conventional S3 lifecycle value and
 /// is long enough that no legitimate transfer, however slow or often retried,
@@ -374,6 +382,14 @@ pub struct RespConfig {
     /// Password required for admin commands. Absent means every connection is
     /// granted admin privileges.
     pub admin_password: Option<String>,
+    /// Largest value a client may send, in bytes (ADR 0014).
+    ///
+    /// RESP has no chunked framing, so ingest is buffer-then-write: a value
+    /// is whole in memory before the write path sees it. This bounds that
+    /// honestly rather than pretending the daemon streams -- the high-water
+    /// mark is this times the connections writing at once. A command
+    /// declaring a longer value is refused before its bytes are read.
+    pub max_value_size: Option<usize>,
 }
 
 /// Loads the configuration, returning it together with the file it came from.
@@ -697,6 +713,24 @@ admin_password = "hunter2"
         assert_eq!(resp.host.as_deref(), Some(DEFAULT_RESP_HOST));
         assert_eq!(resp.port, Some(DEFAULT_RESP_PORT));
         assert_eq!(resp.data_dir, Some(PathBuf::from(DEFAULT_RESP_DATA_DIR)));
+
+        // Commented out in the example, so the number in the comment is what
+        // is checked -- the same way the other opt-in keys are documented.
+        assert!(
+            text.contains(&format!("#max_value_size = {DEFAULT_RESP_MAX_VALUE_SIZE}")),
+            "the example must document the value cap default"
+        );
+    }
+
+    /// The value cap is an opt-in key: absent means the built-in default,
+    /// and a file that sets it is read.
+    #[test]
+    fn the_value_cap_reads_from_the_resp_table() {
+        let absent = parse_str("[resp]\nport = 6380\n").unwrap();
+        assert_eq!(absent.resp.unwrap().max_value_size, None);
+
+        let set = parse_str("[resp]\nmax_value_size = 1048576\n").unwrap();
+        assert_eq!(set.resp.unwrap().max_value_size, Some(1024 * 1024));
     }
 
     #[test]

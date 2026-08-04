@@ -483,6 +483,40 @@ fn concurrent_sets_of_one_key_converge() {
     assert_eq!(checked, 1);
 }
 
+/// The value cap: a command declaring more than the configured maximum is
+/// refused, and it is refused from its header -- the daemon never buffers
+/// the bytes it has already decided not to accept (ADR 0014).
+#[test]
+fn a_value_over_the_cap_is_refused() {
+    let server = TestServer::new_with_max_value_size(4096);
+    let mut conn = server.connect();
+    select_cas(&mut conn, "blobs");
+
+    // Under the cap: ordinary.
+    let small = vec![0x11u8; 4096];
+    let key: Vec<u8> = redis::cmd("CSET")
+        .arg(&small)
+        .query(&mut conn)
+        .expect("a value at the cap is accepted");
+    assert_eq!(key, address(&small));
+
+    // Over it: refused. The connection goes with it, because the bytes that
+    // were refused are still arriving and nothing after them can be parsed.
+    let big = vec![0x22u8; 4097];
+    let err = redis::cmd("CSET")
+        .arg(&big)
+        .query::<Vec<u8>>(&mut conn)
+        .expect_err("a value over the cap must be refused");
+    assert!(format!("{err}").contains("4097"), "{err}");
+    assert!(format!("{err}").contains("max_value_size"), "{err}");
+
+    // The store is unharmed, and the daemon is still serving.
+    let mut next = server.connect();
+    let _: String = redis::cmd("SELECT").arg("blobs").query(&mut next).unwrap();
+    assert!(exists(&mut next, &key));
+    assert!(!exists(&mut next, &address(&big)));
+}
+
 /// CSET is only a verb where a key is an address.
 #[test]
 fn cset_is_refused_outside_a_cas_namespace() {

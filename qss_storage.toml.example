@@ -261,3 +261,11 @@ data_dir = "./data"
 # not passed, every connection is granted admin privileges.
 # Default: unset
 #admin_password = "CHANGE_ME"
+
+# Largest value a client may send, in bytes (ADR 0014). RESP has no chunked
+# framing, so a value is whole in memory before the write path sees it: this
+# times the connections writing at once is the ingest high-water mark. A
+# command declaring a longer value is refused before its bytes are read.
+# Clients with larger objects belong on the S3 face, which has multipart.
+# Default: 67108864 (64 MiB)
+#max_value_size = 67108864
