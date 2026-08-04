@@ -1795,7 +1795,7 @@ mod tests {
             // And the strangers' objects are really there, not merely acked.
             for i in 0..STRANGERS {
                 let obj = fs
-                    .get_object_meta(BUCKET, &format!("innocent-{i}"))
+                    .get_object_meta(BUCKET, format!("innocent-{i}"))
                     .unwrap()
                     .expect("an acked object must have its record");
                 for id in obj.blocks() {
@@ -2038,7 +2038,7 @@ mod tests {
             // Every object readable, every block exactly as recorded.
             for i in 0..WRITERS {
                 let obj = fs
-                    .get_object_meta(BUCKET, &format!("small-{i}"))
+                    .get_object_meta(BUCKET, format!("small-{i}"))
                     .unwrap()
                     .expect("every acked PUT must have its record");
                 for id in obj.blocks() {
