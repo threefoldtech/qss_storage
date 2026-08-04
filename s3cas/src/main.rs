@@ -14,10 +14,10 @@ use cas_storage::config::{
     self, DEFAULT_METRICS_HOST, DEFAULT_METRICS_PORT, DEFAULT_MULTIPART_STALE_TTL_DAYS,
     DEFAULT_S3_HOST, DEFAULT_S3_PORT, QssStorageConfig,
 };
+use s3cas::cas::metastore::Durability;
 use s3cas::cas::{CasFS, StorageEngine};
 use s3cas::check::{CheckConfig, check_integrity};
 use s3cas::inspect::{disk_space, headers, num_keys};
-use s3cas::metastore::Durability;
 use s3cas::retrieve::{RetrieveConfig, retrieve};
 
 /// Help text for every `--config` flag in this binary.

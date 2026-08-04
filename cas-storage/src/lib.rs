@@ -125,11 +125,17 @@ pub use cas::{
     AsyncByteStream,
     // Streaming and utilities
     BLOCKS_DB_DIR_NAME,
+    BlockCorruption,
+    BlockStream,
     CasFS,
     // Cross-request group commit (ADR 0011): how a store runs its commit
     // station, and what that station has done
     GroupCommit,
     GroupCommitStats,
+    // Multipart support
+    MultiPart,
+    MultiPartTree,
+    RangeRequest,
     // The blocks root's pairing marker (ADR 0012)
     STORE_ID_MARKER_NAME,
     SharedBlockStore,
@@ -139,10 +145,6 @@ pub use cas::{
     SweepStats,
     // The outcome of complete's atomic upload-plus-parts claim
     UploadClaim,
-    block_stream::{BlockCorruption, BlockStream},
-    // Multipart support
-    multipart::{MultiPart, MultiPartTree},
-    range_request::RangeRequest,
     sweep_stale_uploads,
 };
 

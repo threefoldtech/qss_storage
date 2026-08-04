@@ -50,7 +50,7 @@ use crate::storage::Storage;
 /// address space entirely -- see `cas_storage::metastore::block`). This is
 /// the whole-value digest a client can compute with stock `b3sum`, which is
 /// the reason it is fixed at 32 rather than following the store's header.
-pub const CAS_KEY_LEN: usize = 32;
+pub(crate) const CAS_KEY_LEN: usize = 32;
 
 /// The address of a value: BLAKE3-256 over the whole thing.
 pub fn value_key(value: &[u8]) -> [u8; CAS_KEY_LEN] {
@@ -59,7 +59,7 @@ pub fn value_key(value: &[u8]) -> [u8; CAS_KEY_LEN] {
 
 /// How the client named the record it is writing.
 #[derive(Debug, Clone, Copy)]
-pub enum Ingest<'a> {
+pub(crate) enum Ingest<'a> {
     /// `SET "" <value>` or `CSET <value>`: the server derives the key.
     /// Hashing IS the verification -- a derived key cannot mismatch.
     ServerHashed,
@@ -79,7 +79,7 @@ pub enum Ingest<'a> {
 /// A claimed key that is not [`CAS_KEY_LEN`] bytes, a claimed key that the
 /// value does not hash to (only ever checked when the address is nowhere in
 /// the store), or a storage failure.
-pub async fn ingest(
+pub(crate) async fn ingest(
     storage: &Storage,
     namespace: &Namespace,
     mode: Ingest<'_>,
@@ -183,7 +183,7 @@ async fn clone_from_another_namespace(
 }
 
 /// A content address as tooling and logs print it.
-pub fn hex(key: &[u8]) -> String {
+pub(crate) fn hex(key: &[u8]) -> String {
     use std::fmt::Write;
 
     let mut out = String::with_capacity(key.len() * 2);

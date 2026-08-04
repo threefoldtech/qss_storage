@@ -11,6 +11,9 @@ use crate::namespace::NamespaceCache;
 use crate::resp::{self, RespHelper};
 use crate::storage::Storage;
 
+/// Stays `pub` although no test calls it: the lib's copy of this module has no
+/// caller for it (main.rs compiles its own), so `pub(crate)` would make it dead
+/// code.
 pub async fn run(
     addr: String,
     storage: Storage,

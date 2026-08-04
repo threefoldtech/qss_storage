@@ -7,8 +7,6 @@ pub mod inspect;
 pub mod metrics;
 pub mod retrieve;
 
-// Re-export cas-storage so downstream code can use `s3cas::cas_storage::*`
-// or `s3cas::cas::*` / `s3cas::metastore::*` as before.
-pub use cas_storage;
+// The one canonical path to the storage library: `s3cas::cas::*`, and
+// `s3cas::cas::metastore::*` below it. One name, not three.
 pub use cas_storage as cas;
-pub use cas_storage::metastore;

@@ -196,7 +196,7 @@ impl Storage {
     /// 32-byte key in a UserKey namespace is a coincidence and is never
     /// consulted, which is exactly why this list is derived from the key
     /// mode and not from the key length.
-    pub fn cas_namespaces(&self) -> Result<Vec<String>, StorageError> {
+    pub(crate) fn cas_namespaces(&self) -> Result<Vec<String>, StorageError> {
         let mut names = Vec::new();
         for meta in self.iter_namespace()? {
             let meta = meta?;
@@ -222,7 +222,7 @@ impl Storage {
     }
 
     /// Get a namespace instance for a specific namespace name
-    pub fn get_namespace(
+    pub(crate) fn get_namespace(
         &self,
         name: &str,
     ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, StorageError> {
@@ -254,7 +254,7 @@ impl Storage {
     }
 
     /// Update the metadata for a namespace
-    pub fn update_namespace_meta(
+    pub(crate) fn update_namespace_meta(
         &self,
         name: &str,
         meta: NamespaceMeta,
@@ -291,7 +291,7 @@ impl Storage {
         self.get_namespace(name)
     }
 
-    pub fn delete_namespace(&self, name: &str) -> Result<(), StorageError> {
+    pub(crate) fn delete_namespace(&self, name: &str) -> Result<(), StorageError> {
         if !self.store.bucket_exists(name)? {
             return Err(StorageError::NamespaceNotFound);
         }
@@ -303,7 +303,7 @@ impl Storage {
     /// Iterate over all namespaces in the storage
     ///
     /// Returns an iterator that yields NamespaceMeta structs for each namespace
-    pub fn iter_namespace(
+    pub(crate) fn iter_namespace(
         &self,
     ) -> Result<impl Iterator<Item = Result<NamespaceMeta, StorageError>>, StorageError> {
         // Get the all buckets tree which contains namespace metadata
@@ -329,13 +329,13 @@ impl Storage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NamespaceMeta {
-    pub name: String,
-    pub password: Option<String>,
-    pub max_size: Option<u64>,
-    pub public: bool,
-    pub worm: bool,
-    pub locked: bool,
-    pub key_mode: KeyMode,
+    pub(crate) name: String,
+    pub(crate) password: Option<String>,
+    pub(crate) max_size: Option<u64>,
+    pub(crate) public: bool,
+    pub(crate) worm: bool,
+    pub(crate) locked: bool,
+    pub(crate) key_mode: KeyMode,
 }
 
 /// How a namespace decides what a record's key is.
@@ -363,7 +363,7 @@ pub enum KeyMode {
 
 impl NamespaceMeta {
     /// Create a new NamespaceMeta with default values
-    pub fn new(name: String) -> Self {
+    pub(crate) fn new(name: String) -> Self {
         Self {
             name,
             password: None,
@@ -376,13 +376,13 @@ impl NamespaceMeta {
     }
 
     /// Encode the NamespaceMeta to MessagePack format
-    pub fn to_msgpack(&self) -> Result<Vec<u8>> {
+    pub(crate) fn to_msgpack(&self) -> Result<Vec<u8>> {
         rmp_serde::to_vec(self)
             .map_err(|e| anyhow::anyhow!("Failed to encode NamespaceMeta to MessagePack: {}", e))
     }
 
     /// Decode a NamespaceMeta from MessagePack format
-    pub fn from_msgpack(data: &[u8]) -> Result<Self> {
+    pub(crate) fn from_msgpack(data: &[u8]) -> Result<Self> {
         rmp_serde::from_slice(data)
             .map_err(|e| anyhow::anyhow!("Failed to decode NamespaceMeta from MessagePack: {}", e))
     }

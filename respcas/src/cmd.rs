@@ -429,7 +429,7 @@ impl Command {
 }
 
 /// Handler for Redis commands
-pub struct CommandHandler {
+pub(crate) struct CommandHandler {
     storage: Arc<Storage>,
 
     // Namespace for this connection
@@ -448,7 +448,7 @@ pub struct CommandHandler {
 
 impl CommandHandler {
     /// Create a new command handler
-    pub fn new(
+    pub(crate) fn new(
         storage: Arc<Storage>,
         namespace: Arc<Namespace>,
         namespace_cache: Arc<NamespaceCache>,
@@ -472,7 +472,7 @@ impl CommandHandler {
     }
 
     /// Set the authentication status for the current namespace
-    pub fn set_namespace_authenticated(&mut self, authenticated: bool) {
+    pub(crate) fn set_namespace_authenticated(&mut self, authenticated: bool) {
         self.namespace_authenticated = authenticated;
         debug!("Set namespace authentication status to {}", authenticated);
     }
@@ -482,7 +482,7 @@ impl CommandHandler {
     /// block engine's, and those are async all the way down (they take
     /// stripes and run their disk work on blocking threads). Nothing here
     /// spawns or waits on anything else.
-    pub async fn execute(&self, cmd: Command) -> Frame {
+    pub(crate) async fn execute(&self, cmd: Command) -> Frame {
         match cmd {
             Command::Get { key } => self.handle_get(&key).await,
             Command::MGet { keys } => self.handle_mget(keys).await,

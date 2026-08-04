@@ -1,11 +1,14 @@
 //! Redis-compatible server (respcas) using metastore as backend
 
-// Re-export modules for use in integration tests
+// The binary declares its own module tree in main.rs and never goes through
+// this crate, so what stays public below is test access, not an API: it is the
+// set of items the integration tests in tests/ drive directly, and nothing
+// else.
 pub mod cmd;
-pub mod conn;
+mod conn;
 pub mod content;
 pub mod namespace;
-pub mod property;
-pub mod resp;
+mod property;
+mod resp;
 pub mod server;
 pub mod storage;

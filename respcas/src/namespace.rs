@@ -16,20 +16,20 @@ use cas_storage::{
 
 /// Properties for a namespace
 #[derive(Debug, Clone)]
-pub struct NamespaceProperties {
+pub(crate) struct NamespaceProperties {
     /// Name of the namespace this properties belongs to
-    pub namespace_name: String,
+    pub(crate) namespace_name: String,
     /// Write Once Read Many mode - if true, keys can only be written once and never modified or deleted
-    pub worm: bool,
+    pub(crate) worm: bool,
     /// Locked mode - if true, no set or delete operations are allowed
-    pub locked: bool,
+    pub(crate) locked: bool,
     /// Public mode - if false and password is set, authentication is required for read operations
-    pub public: bool,
+    pub(crate) public: bool,
     /// What a key means here (ADR 0014): a name the client chose, or the
     /// BLAKE3-256 of the value. The in-memory copy of the persisted
     /// `key_mode`, kept here because it decides what SET does and every
     /// command reads it.
-    pub key_mode: KeyMode,
+    pub(crate) key_mode: KeyMode,
 }
 
 impl Default for NamespaceProperties {
@@ -45,11 +45,11 @@ impl Default for NamespaceProperties {
 }
 
 /// Represents a namespace with its associated tree
-pub struct Namespace {
+pub(crate) struct Namespace {
     /// The tree for this namespace
-    pub tree: RwLock<Arc<dyn MetaTreeExt + Send + Sync>>,
+    pub(crate) tree: RwLock<Arc<dyn MetaTreeExt + Send + Sync>>,
     /// Properties for this namespace
-    pub properties: RwLock<NamespaceProperties>,
+    pub(crate) properties: RwLock<NamespaceProperties>,
     /// The block engine, for the paths that are not a single record: the
     /// ADR 0006 write path, the block-backed read, and the rc release a
     /// DELETE owes (ADR 0014). A namespace is a bucket to it.
@@ -72,7 +72,7 @@ impl NamespaceCache {
     }
 
     /// Get a namespace from the cache or existing storage
-    pub fn get_or_create(&self, name: String) -> Result<Arc<Namespace>, StorageError> {
+    pub(crate) fn get_or_create(&self, name: String) -> Result<Arc<Namespace>, StorageError> {
         // First, try to get from cache
         {
             let namespaces = self.namespaces.read().unwrap();
@@ -116,7 +116,7 @@ impl NamespaceCache {
 
     /// Update all instances of a namespace in the cache
     /// This ensures that all clients using this namespace will see the updated properties
-    pub fn update_all_instances<F>(&self, name: &str, update_fn: F)
+    pub(crate) fn update_all_instances<F>(&self, name: &str, update_fn: F)
     where
         F: Fn(&Arc<Namespace>),
     {
@@ -132,7 +132,10 @@ impl NamespaceCache {
     }
 
     /// Create a namespace if it doesn't exist and return it
-    pub fn create_if_not_exists(&self, name: String) -> Result<Arc<Namespace>, StorageError> {
+    pub(crate) fn create_if_not_exists(
+        &self,
+        name: String,
+    ) -> Result<Arc<Namespace>, StorageError> {
         match self.get_or_create(name.clone()) {
             Ok(namespace) => Ok(namespace),
             Err(_) => {
@@ -167,7 +170,7 @@ impl NamespaceCache {
 
     /// Flush a namespace by dropping and recreating its bucket
     /// This operation will clear all keys in the namespace
-    pub fn flush_namespace(&self, name: &str) -> Result<(), StorageError> {
+    pub(crate) fn flush_namespace(&self, name: &str) -> Result<(), StorageError> {
         // Write lock the cache to prevent concurrent access during flush
         let namespaces_lock = self.namespaces.read().unwrap();
 
@@ -212,7 +215,7 @@ impl Namespace {
     /// Sync properties with the persistent metadata
     /// This is called when the namespace is loaded to ensure in-memory properties
     /// reflect the persistent metadata
-    pub fn sync_properties_from_meta(&self, meta: &crate::storage::NamespaceMeta) {
+    pub(crate) fn sync_properties_from_meta(&self, meta: &crate::storage::NamespaceMeta) {
         let mut props = self.properties.write().unwrap();
         props.worm = meta.worm;
         props.locked = meta.locked;
@@ -220,7 +223,7 @@ impl Namespace {
         props.key_mode = meta.key_mode;
     }
 
-    pub fn flush(&self, namespace_cache: &NamespaceCache) -> Result<()> {
+    pub(crate) fn flush(&self, namespace_cache: &NamespaceCache) -> Result<()> {
         // Get the namespace name
         let namespace_name = self.properties.read().unwrap().namespace_name.clone();
 
@@ -234,12 +237,12 @@ impl Namespace {
     }
 
     /// This namespace's name, which is also its bucket name in the store.
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         self.properties.read().unwrap().namespace_name.clone()
     }
 
     /// What a key means here (ADR 0014).
-    pub fn key_mode(&self) -> KeyMode {
+    pub(crate) fn key_mode(&self) -> KeyMode {
         self.properties.read().unwrap().key_mode
     }
 
@@ -276,7 +279,7 @@ impl Namespace {
         Ok(())
     }
 
-    pub fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
+    pub(crate) fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
         self.refuse_unless_writable(Some(key))?;
 
         // Note: Authentication check is now handled by the CommandHandler
@@ -305,7 +308,7 @@ impl Namespace {
     ///
     /// Only [`crate::content::ingest`] may call this: it is the code that
     /// has established that the key is the value's address.
-    pub async fn store_verified(&self, key: &[u8], value: Bytes) -> Result<()> {
+    pub(crate) async fn store_verified(&self, key: &[u8], value: Bytes) -> Result<()> {
         self.refuse_unless_writable(None)?;
 
         let bucket = self.name();
@@ -345,7 +348,7 @@ impl Namespace {
     /// (which only a content-addressed namespace has, ADR 0014) is read from
     /// the block files and concatenated, because a RESP bulk reply is a
     /// length-prefixed whole and there is nothing to stream it into.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, MetaError> {
+    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, MetaError> {
         let Some(obj) = self.get_object(key)? else {
             return Ok(None);
         };
@@ -394,7 +397,7 @@ impl Namespace {
     /// A block-backed record's references are dropped as part of the delete
     /// (ADR 0008's release path), so the blocks of a value nothing else
     /// holds are freed here and not by a sweep.
-    pub async fn del(&self, key: &[u8]) -> Result<bool> {
+    pub(crate) async fn del(&self, key: &[u8]) -> Result<bool> {
         {
             // Read namespace properties
             let props = self.properties.read().unwrap();
@@ -423,13 +426,13 @@ impl Namespace {
         Ok(self.cas.delete_object(&bucket, key).await?)
     }
 
-    pub fn exists(&self, key: &[u8]) -> Result<bool, MetaError> {
+    pub(crate) fn exists(&self, key: &[u8]) -> Result<bool, MetaError> {
         self.tree.read().unwrap().contains_key(key)
     }
 
     /// Get the length (size) of a key's value
     /// Returns None if the key doesn't exist
-    pub fn length(&self, key: &[u8]) -> Result<Option<u64>, MetaError> {
+    pub(crate) fn length(&self, key: &[u8]) -> Result<Option<u64>, MetaError> {
         match self.get_object(key)? {
             Some(obj) => Ok(Some(obj.size())),
             None => Ok(None),
@@ -438,7 +441,7 @@ impl Namespace {
 
     /// Get the last-modified timestamp of a key
     /// Returns None if the key doesn't exist
-    pub fn keytime(&self, key: &[u8]) -> Result<Option<i64>, MetaError> {
+    pub(crate) fn keytime(&self, key: &[u8]) -> Result<Option<i64>, MetaError> {
         match self.get_object(key)? {
             Some(obj) => {
                 // Get the last modified time as Unix timestamp (seconds since epoch)
@@ -465,7 +468,7 @@ impl Namespace {
     ///
     /// `None` means there is no such key. Cost is O(size) either way, the
     /// same class as GET.
-    pub async fn check(&self, key: &[u8]) -> Result<Option<bool>, MetaError> {
+    pub(crate) async fn check(&self, key: &[u8]) -> Result<Option<bool>, MetaError> {
         let Some(obj) = self.get_object(key)? else {
             return Ok(None);
         };
@@ -484,11 +487,11 @@ impl Namespace {
         }
     }
 
-    pub fn num_keys(&self) -> Result<usize, MetaError> {
+    pub(crate) fn num_keys(&self) -> Result<usize, MetaError> {
         self.tree.read().unwrap().len()
     }
 
-    pub fn scan(
+    pub(crate) fn scan(
         &self,
         start_key: Option<Vec<u8>>,
         num_keys: u32,
@@ -512,7 +515,7 @@ impl Namespace {
         Ok(keys)
     }
 
-    pub fn scan_backward(
+    pub(crate) fn scan_backward(
         &self,
         start_key: Option<Vec<u8>>,
         num_keys: u32,

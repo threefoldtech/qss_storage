@@ -3,15 +3,18 @@
 //! Library code, all synchronous, no policy. Three walkers answer the three
 //! questions a reconciliation needs, each from one source of truth:
 //!
-//! - [`holders`]: who references which block, per occurrence (the holder
+//! - `holders`: who references which block, per occurrence (the holder
 //!   records);
-//! - [`records`]: what `_BLOCKS` says (the block records);
-//! - [`disk`]: what is actually on disk (the block files).
+//! - `records`: what `_BLOCKS` says (the block records);
+//! - `disk`: what is actually on disk (the block files).
 //!
-//! [`passes`] compares those three and says what the differences mean;
-//! [`engine::run`] walks once, runs the passes and returns a [`report`].
-//! Everything up to there only ever reads; [`mod@repair`] is the one module
+//! `passes` compares those three and says what the differences mean;
+//! [`run`] walks once, runs the passes and returns a `report`.
+//! Everything up to there only ever reads; `repair` is the one module
 //! that mutates, and it runs after a report has been emitted, never before.
+//!
+//! Those modules are private: the names above are re-exported here, and this
+//! flat front is the whole of what a caller sees.
 //!
 //! One rule is enforced below the passes: the holder walk refuses on any
 //! incompleteness, because a recount over a partial holder set that then
@@ -21,15 +24,15 @@
 //! the daemon's own store can be checked by the same code the tool uses,
 //! and so a future online mode can wrap them.
 
-pub mod disk;
-pub mod engine;
-pub mod findings;
-pub mod holders;
-pub mod pairing;
-pub mod passes;
-pub mod records;
-pub mod repair;
-pub mod report;
+mod disk;
+mod engine;
+mod findings;
+mod holders;
+mod pairing;
+mod passes;
+mod records;
+mod repair;
+mod report;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
