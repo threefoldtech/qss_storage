@@ -1,6 +1,8 @@
 # respcas Content-Addressed Namespaces
 
-**Status**: Proposed
+**Status**: Accepted (2026-08-04, owner sign-off; all four review asks
+ruled and the ruling-4 reading -- per-namespace rc contributions via
+clone-by-reference -- confirmed)
 **Date**: 2026-08-04
 **Updated**: 2026-08-04 (all four review asks ruled by owner; verification
 semantics reworked per ruling 4 -- dedup hits are served by reference,
