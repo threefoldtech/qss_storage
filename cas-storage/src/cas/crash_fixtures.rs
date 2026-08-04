@@ -299,36 +299,28 @@ pub(crate) fn plant_foreign_store_id_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::CasFS;
     use crate::cas::shared_block_store::SharedBlockStore;
-    use crate::cas::{CasFS, StorageEngine};
     use crate::metastore::Durability;
     use crate::metrics::SharedMetrics;
+    use crate::store_options::StoreOptions;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     fn fixture_store(dir: &Path) -> (Arc<SharedBlockStore>, CasFS) {
+        let opts = StoreOptions {
+            inline_metadata_size: Some(1),
+            durability: Durability::Buffer,
+            ..StoreOptions::default()
+        };
         let shared = Arc::new(
-            SharedBlockStore::new(
-                dir.join("meta/blocks"),
-                dir.join("blocks"),
-                StorageEngine::Fjall,
-                Some(1),
-                Some(Durability::Buffer),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap(),
+            SharedBlockStore::new(dir.join("meta/blocks"), dir.join("blocks"), opts).unwrap(),
         );
         let fs = CasFS::new(
             dir.join("meta"),
             shared.clone(),
             SharedMetrics::default(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            false,
+            opts,
         )
         .unwrap();
         (shared, fs)

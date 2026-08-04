@@ -142,18 +142,16 @@ pub async fn check_integrity(args: CheckConfig, store: StoreOptions) -> Result<(
         args.fs_root.clone(),
         args.meta_root.clone(),
         metrics.to_cas(),
-        store.metadata_db,
-        store.inline_metadata_size,
-        Some(store.durability),
-        Some(store.header_spec()),
-        // verify_on_read stays off whatever the config says: this command
-        // checks the blocks itself and reports every one that failed, which a
-        // read-path corruption error would pre-empt at the first bad block.
-        false,
-        store.stripe_count,
-        store.max_blocks_per_commit,
-        // No commit station (ADR 0011): this command only reads.
-        None,
+        StoreOptions {
+            // verify_on_read stays off whatever the config says: this command
+            // checks the blocks itself and reports every one that failed,
+            // which a read-path corruption error would pre-empt at the first
+            // bad block.
+            verify_on_read: false,
+            // No commit station (ADR 0011): this command only reads.
+            group_commit: None,
+            ..store
+        },
     )?;
 
     let Some((obj_meta, paths)) = casfs.get_object_paths(&args.bucket, &args.key)? else {
@@ -251,14 +249,7 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             SharedMetrics::default(),
-            opts.metadata_db,
-            opts.inline_metadata_size,
-            Some(opts.durability),
-            Some(opts.header_spec()),
-            false,
-            opts.stripe_count,
-            opts.max_blocks_per_commit,
-            opts.group_commit,
+            *opts,
         )
         .unwrap()
     }

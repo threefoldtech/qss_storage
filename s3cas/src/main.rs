@@ -364,14 +364,7 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
         args.fs_root.clone(),
         args.meta_root.clone(),
         metrics.to_cas(),
-        args.store.metadata_db,
-        args.store.inline_metadata_size,
-        Some(args.store.durability),
-        Some(args.store.header_spec()),
-        args.store.verify_on_read,
-        args.store.stripe_count,
-        args.store.max_blocks_per_commit,
-        args.store.group_commit,
+        args.store,
     )?;
 
     // store.hash applies at creation only: an existing store is addressed by

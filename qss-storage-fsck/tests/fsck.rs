@@ -15,7 +15,7 @@ use std::process::{Command, Output};
 use cas_storage::metastore::block_disk_path;
 use cas_storage::{
     AsyncByteStream, BlockId, BlockStream, CasFS, Durability, RangeRequest, SharedMetrics,
-    StorageEngine,
+    StoreOptions,
 };
 use tempfile::TempDir;
 
@@ -72,14 +72,11 @@ fn try_open_roots(meta_root: &Path, fs_root: &Path) -> Result<CasFS, cas_storage
         fs_root.to_path_buf(),
         meta_root.to_path_buf(),
         SharedMetrics::default(),
-        StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        None,
-        false,
-        None,
-        None,
-        None,
+        StoreOptions {
+            inline_metadata_size: Some(1),
+            durability: Durability::Buffer,
+            ..StoreOptions::default()
+        },
     )
 }
 

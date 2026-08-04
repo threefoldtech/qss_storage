@@ -249,9 +249,10 @@ impl std::error::Error for PairingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::SharedBlockStore;
     use crate::cas::crash_fixtures::{plant_unreadable_store_id_marker, remove_store_id_marker};
-    use crate::cas::{SharedBlockStore, StorageEngine};
     use crate::metastore::Durability;
+    use crate::store_options::StoreOptions;
     use tempfile::{TempDir, tempdir};
 
     /// A store on two roots, closed again, and the id it minted.
@@ -259,13 +260,11 @@ mod tests {
         SharedBlockStore::new(
             meta_root.join("blocks"),
             fs_root.join("blocks"),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            None,
-            None,
-            None,
+            StoreOptions {
+                inline_metadata_size: Some(1),
+                durability: Durability::Buffer,
+                ..StoreOptions::default()
+            },
         )
         .expect("the store must open")
         .store_id()

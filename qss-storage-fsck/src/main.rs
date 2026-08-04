@@ -239,25 +239,21 @@ async fn run(cli: Cli) -> Result<u8> {
     // Opening is also the store's own recovery: the block writer purges
     // `.tmp` residue and re-checks that the temp dir shares a filesystem with
     // the blocks root. Both happen here for free, before the first walk.
-    //
-    // verify_on_read is off whatever the config says: fsck never reads an
-    // object through the read path, and the corruption scrub re-hashes every
-    // block itself under --scrub.
     let casfs = CasFS::single_namespace(
         fs_root,
         meta_root.clone(),
         SharedMetrics::default(),
-        store.metadata_db,
-        store.inline_metadata_size,
-        Some(store.durability),
-        Some(store.header_spec()),
-        false,
-        store.stripe_count,
-        store.max_blocks_per_commit,
-        // No commit station whatever the config says (ADR 0011): fsck never
-        // goes through the write path, so a station here would be a committer
-        // task waiting on a queue nobody feeds.
-        None,
+        StoreOptions {
+            // verify_on_read is off whatever the config says: fsck never
+            // reads an object through the read path, and the corruption
+            // scrub re-hashes every block itself under --scrub.
+            verify_on_read: false,
+            // No commit station whatever the config says (ADR 0011): fsck
+            // never goes through the write path, so a station here would be a
+            // committer task waiting on a queue nobody feeds.
+            group_commit: None,
+            ..store
+        },
     )?;
 
     let options = if cli.scrub {

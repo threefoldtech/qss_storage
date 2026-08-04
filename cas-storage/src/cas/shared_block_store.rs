@@ -3,9 +3,10 @@ use std::sync::{Arc, OnceLock};
 
 use crate::hasher::Hasher;
 use crate::metastore::{
-    BlockTree, Durability, FjallStore, HeaderSpec, MULTIPART_PARTS_TREE, MetaError, MetaStore,
-    MetaTreeExt, StoreHeader, StoreId, StorePairingMismatch, UPLOADS_TREE, store_header,
+    BlockTree, FjallStore, MULTIPART_PARTS_TREE, MetaError, MetaStore, MetaTreeExt, StoreHeader,
+    StoreId, StorePairingMismatch, UPLOADS_TREE, store_header,
 };
+use crate::store_options::StoreOptions;
 
 use super::block_disk::{
     AtomicBlockWriter, BLOCKS_DB_DIR_NAME, BlockDiskOps, RealDiskOps, StoreIdMarker,
@@ -71,36 +72,23 @@ impl SharedBlockStore {
     /// * `path` - Path to the shared block metadata DB (e.g., /meta_root/blocks/.db)
     /// * `blocks_root` - Root directory for the block data files, shared by
     ///   every namespace of this store
-    /// * `storage_engine` - Storage engine
-    /// * `inlined_metadata_size` - Maximum size for inlined metadata
-    /// * `durability` - Durability level for transactions
-    /// * `spec` - Hash written into the header of a *new* store; ignored when
-    ///   an existing store is opened. `None` takes [`HeaderSpec::default`].
-    /// * `stripe_count` - Number of block lock stripes; `None` takes
-    ///   [`DEFAULT_STRIPE_COUNT`]. Sizing rule in `cas::stripes`.
-    /// * `max_blocks_per_commit` - Most block records one transaction carries
-    ///   (ADR 0010); `None` takes [`DEFAULT_MAX_BLOCKS_PER_COMMIT`]. Like the
-    ///   stripe count, a property of this process and not of the store.
-    /// * `group_commit` - `Some` to merge the closing step of concurrent
-    ///   requests through a commit station (ADR 0011), `None` for the ADR
-    ///   0010 write path unchanged. Default off; the station is bounded by
-    ///   the same `max_blocks_per_commit`.
+    /// * `opts` - How this process opens the store: backend, durability,
+    ///   inline threshold, the hash a *new* store's header gets, the stripe
+    ///   count, the batch cap (ADR 0010) and the commit station (ADR 0011).
+    ///   [`StoreOptions::default`] is "no opinion"; see the field docs there
+    ///   for which knobs describe the store on disk and which describe only
+    ///   this process. `verify_on_read` is read by [`CasFS`](super::CasFS)
+    ///   and ignored here -- the block store serves bytes, it does not read
+    ///   objects.
     ///
     /// # Errors
     ///
     /// [`MetaError::StoreLocked`] if another process holds the blocks DB, and
     /// [`MetaError::Header`] if its header is missing or unacceptable.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut path: PathBuf,
         mut blocks_root: PathBuf,
-        storage_engine: StorageEngine,
-        inlined_metadata_size: Option<usize>,
-        durability: Option<Durability>,
-        spec: Option<HeaderSpec>,
-        stripe_count: Option<usize>,
-        max_blocks_per_commit: Option<usize>,
-        group_commit: Option<GroupCommit>,
+        opts: StoreOptions,
     ) -> Result<Self, MetaError> {
         // A store from before the .db rename has its database at
         // <blocks>/db, a name that doubles as the 0xdb fanout slot.
@@ -135,20 +123,17 @@ impl SharedBlockStore {
         // blocks/.tmp, purge temp residue, refuse a temp dir on another
         // filesystem, fsync per durability (ADR 0006 component 4).
         let disk_ops: Arc<dyn BlockDiskOps> = Arc::new(RealDiskOps);
-        let disk_writer = AtomicBlockWriter::open(
-            &*disk_ops,
-            blocks_root.clone(),
-            durability.unwrap_or(Durability::Fsync),
-        )
-        .map_err(|e| MetaError::OtherDBError(format!("opening the blocks root: {e}")))?;
+        let disk_writer = AtomicBlockWriter::open(&*disk_ops, blocks_root.clone(), opts.durability)
+            .map_err(|e| MetaError::OtherDBError(format!("opening the blocks root: {e}")))?;
 
-        let spec = spec.unwrap_or_default();
-        let (meta_store, header) = match storage_engine {
-            StorageEngine::Fjall => {
-                MetaStore::open_or_create(path.clone(), inlined_metadata_size, spec, |p| {
-                    FjallStore::new(p, inlined_metadata_size, durability)
-                })?
-            }
+        let inlined_metadata_size = opts.inline_metadata_size;
+        let (meta_store, header) = match opts.metadata_db {
+            StorageEngine::Fjall => MetaStore::open_or_create(
+                path.clone(),
+                inlined_metadata_size,
+                opts.header_spec(),
+                |p| FjallStore::new(p, inlined_metadata_size, Some(opts.durability)),
+            )?,
         };
 
         // ADR 0012: the two halves of the store name each other, or this is
@@ -176,15 +161,16 @@ impl SharedBlockStore {
             hasher: header.hasher(),
             placement: BlockPlacement::new(blocks_root.clone()),
             blocks_root,
-            stripes: Stripes::new(stripe_count.unwrap_or(DEFAULT_STRIPE_COUNT)),
+            stripes: Stripes::new(opts.stripe_count.unwrap_or(DEFAULT_STRIPE_COUNT)),
             // Clamped rather than refused: the config and CLI layers already
             // reject zero with a message naming the setting, and a store
             // built in code should not be able to wedge the write path with
             // a batch that can never close.
-            max_blocks_per_commit: max_blocks_per_commit
+            max_blocks_per_commit: opts
+                .max_blocks_per_commit
                 .unwrap_or(DEFAULT_MAX_BLOCKS_PER_COMMIT)
                 .max(1),
-            group_commit,
+            group_commit: opts.group_commit,
             station: OnceLock::new(),
             disk_writer,
             disk_ops,
@@ -407,12 +393,12 @@ fn pair_the_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cas::StorageEngine;
     use crate::cas::block_disk::STORE_ID_MARKER_NAME;
     use crate::cas::crash_fixtures::{
         plant_foreign_store_id_marker, plant_unreadable_store_id_marker, remove_store_id_marker,
         strip_store_id,
     };
+    use crate::metastore::Durability;
     use tempfile::{TempDir, tempdir};
 
     /// Opens (creating the first time) a store whose two roots are wherever
@@ -422,13 +408,11 @@ mod tests {
         SharedBlockStore::new(
             meta_root.join("blocks"),
             fs_root.join("blocks"),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            None,
-            None,
-            None,
+            StoreOptions {
+                inline_metadata_size: Some(1),
+                durability: Durability::Buffer,
+                ..StoreOptions::default()
+            },
         )
     }
 

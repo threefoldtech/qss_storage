@@ -55,15 +55,11 @@ pub async fn retrieve(args: RetrieveConfig, store: StoreOptions) -> Result<()> {
         args.fs_root.clone(),
         args.meta_root.clone(),
         metrics.to_cas(),
-        store.metadata_db,
-        store.inline_metadata_size,
-        Some(store.durability),
-        Some(store.header_spec()),
-        store.verify_on_read,
-        store.stripe_count,
-        store.max_blocks_per_commit,
-        // No commit station (ADR 0011): this command only reads.
-        None,
+        StoreOptions {
+            // No commit station (ADR 0011): this command only reads.
+            group_commit: None,
+            ..store
+        },
     )?;
 
     let (obj_meta, paths) = match casfs.get_object_paths(&args.bucket, &args.key)? {

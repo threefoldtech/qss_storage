@@ -10,44 +10,40 @@ use tempfile::{TempDir, tempdir};
 use crate::cas::crash_fixtures::{plant_degraded_record, plant_orphan_file};
 use crate::cas::{
     AsyncByteStream, BLOCKS_DB_DIR_NAME, CasFS, STORE_ID_MARKER_NAME, SharedBlockStore,
-    StorageEngine,
 };
 use crate::metastore::{
     BlockId, ContentHash, DEFAULT_BLOCK_TREE, Durability, MAX_BLOCKID_SIZE, ObjectData,
     block_disk_path,
 };
 use crate::metrics::SharedMetrics;
+use crate::store_options::StoreOptions;
 
 use super::findings::{FindingClass, HolderRef, Severity};
 use super::holders::{HolderEnumerationError, expected_counts, holders_of};
 use super::records::walk_records;
 use super::{ScrubContext, disk::walk_disk};
 
+/// How every store in the scrub tests is opened: nothing inlined, so the
+/// block records under scrub are always real ones.
+pub(super) fn options() -> StoreOptions {
+    StoreOptions {
+        inline_metadata_size: Some(1),
+        durability: Durability::Buffer,
+        ..StoreOptions::default()
+    }
+}
+
 /// One store: a shared block store and a single namespace over it.
 pub(super) fn store(dir: &TempDir) -> (Arc<SharedBlockStore>, CasFS) {
     let path = dir.path();
     let shared = Arc::new(
-        SharedBlockStore::new(
-            path.join("meta/blocks"),
-            path.join("blocks"),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
+        SharedBlockStore::new(path.join("meta/blocks"), path.join("blocks"), options()).unwrap(),
     );
     let fs = CasFS::new(
         path.join("meta/ns"),
         shared.clone(),
         SharedMetrics::default(),
-        StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        false,
+        options(),
     )
     .unwrap();
     (shared, fs)
@@ -518,14 +514,7 @@ fn the_stores_own_database_inside_the_blocks_root_is_not_foreign() {
         root.clone(),
         root.clone(),
         SharedMetrics::default(),
-        StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        None,
-        false,
-        None,
-        None,
-        None,
+        options(),
     )
     .unwrap();
     let blocks_db = root.join("blocks").join(BLOCKS_DB_DIR_NAME);
@@ -563,14 +552,7 @@ fn the_db_fanout_directory_is_walked_like_any_other() {
         root.clone(),
         root.clone(),
         SharedMetrics::default(),
-        StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        None,
-        false,
-        None,
-        None,
-        None,
+        options(),
     )
     .unwrap();
 
@@ -609,14 +591,7 @@ fn a_legacy_blocks_db_is_refused_not_shadowed() {
         root.clone(),
         root.clone(),
         SharedMetrics::default(),
-        StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        None,
-        false,
-        None,
-        None,
-        None,
+        options(),
     ) else {
         panic!("a legacy store must be refused");
     };

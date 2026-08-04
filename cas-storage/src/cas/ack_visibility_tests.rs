@@ -32,34 +32,25 @@ use super::fs::CasFS;
 use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{ContentHash, Durability, ObjectData};
 use crate::metrics::SharedMetrics;
+use crate::store_options::StoreOptions;
 
 const BUCKET: &str = "acks";
 
 /// One store at `durability`, with the namespace DB at `<dir>/meta/db` and the
 /// blocks DB at `<dir>/blocks/.db`.
 fn store(dir: &Path, durability: Durability) -> (Arc<SharedBlockStore>, CasFS) {
-    let shared = Arc::new(
-        SharedBlockStore::new(
-            dir.join("meta/blocks"),
-            dir.join("blocks"),
-            super::StorageEngine::Fjall,
-            Some(1),
-            Some(durability),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap(),
-    );
+    let opts = StoreOptions {
+        inline_metadata_size: Some(1),
+        durability,
+        ..StoreOptions::default()
+    };
+    let shared =
+        Arc::new(SharedBlockStore::new(dir.join("meta/blocks"), dir.join("blocks"), opts).unwrap());
     let fs = CasFS::new(
         dir.join("meta"),
         shared.clone(),
         SharedMetrics::default(),
-        super::StorageEngine::Fjall,
-        Some(1),
-        Some(durability),
-        false,
+        opts,
     )
     .unwrap();
     fs.create_bucket(BUCKET).unwrap();

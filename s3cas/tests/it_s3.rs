@@ -92,14 +92,13 @@ static CONFIG: LazyLock<SdkConfig> = LazyLock::new(|| {
         FS_ROOT.into(),
         FS_ROOT.into(),
         metrics.to_cas(),
-        storage_engine,
-        inlined_size,
-        None,
-        None,
-        false, // verify_on_read
-        None,  // stripe_count: the built-in default
-        None,  // max_blocks_per_commit: the built-in default
-        None,  // group_commit: off, the ADR 0011 default
+        // Everything else is the built-in default: stripe count, batch cap,
+        // no commit station, no read verification.
+        cas_storage::StoreOptions {
+            metadata_db: storage_engine,
+            inline_metadata_size: inlined_size,
+            ..cas_storage::StoreOptions::default()
+        },
     )
     .expect("can construct CasFS");
     let s3 = s3cas::api::S3Cas::new(casfs, metrics.clone());

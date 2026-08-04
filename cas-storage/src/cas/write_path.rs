@@ -808,10 +808,10 @@ pub(super) async fn store_inlined_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cas::StorageEngine;
     use crate::cas::block_disk::{BlockDiskOps, RealDiskOps};
     use crate::cas::fs::BLOCK_SIZE;
     use crate::metastore::{BlockTree, Durability, block_disk_path};
+    use crate::store_options::StoreOptions;
     use bytes::Bytes;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex as StdMutex;
@@ -836,18 +836,15 @@ mod tests {
         ops: Option<Arc<dyn BlockDiskOps>>,
         group_commit: Option<crate::cas::GroupCommit>,
     ) -> (Arc<SharedBlockStore>, CasFS) {
-        let mut shared = SharedBlockStore::new(
-            dir.join("meta/blocks"),
-            dir.join("blocks"),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            None,
-            cap,
+        let opts = StoreOptions {
+            inline_metadata_size: Some(1),
+            durability: Durability::Buffer,
+            max_blocks_per_commit: cap,
             group_commit,
-        )
-        .unwrap();
+            ..StoreOptions::default()
+        };
+        let mut shared =
+            SharedBlockStore::new(dir.join("meta/blocks"), dir.join("blocks"), opts).unwrap();
         if let Some(ops) = ops {
             shared.set_disk_ops(ops);
         }
@@ -856,10 +853,7 @@ mod tests {
             dir.join("meta/ns"),
             shared.clone(),
             SharedMetrics::default(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            false,
+            opts,
         )
         .unwrap();
         fs.create_bucket(BUCKET).unwrap();
@@ -1461,17 +1455,17 @@ mod tests {
                 .tempdir_in(&scratch)
                 .unwrap();
             // Fsync, not Buffer: the whole point is to pay the real syncs.
+            let opts = StoreOptions {
+                inline_metadata_size: Some(1),
+                durability: Durability::Fsync,
+                max_blocks_per_commit: Some(cap),
+                ..StoreOptions::default()
+            };
             let shared = Arc::new(
                 SharedBlockStore::new(
                     dir.path().join("meta/blocks"),
                     dir.path().join("blocks"),
-                    StorageEngine::Fjall,
-                    Some(1),
-                    Some(Durability::Fsync),
-                    None,
-                    None,
-                    Some(cap),
-                    None,
+                    opts,
                 )
                 .unwrap(),
             );
@@ -1479,10 +1473,7 @@ mod tests {
                 dir.path().join("meta/ns"),
                 shared.clone(),
                 SharedMetrics::default(),
-                StorageEngine::Fjall,
-                Some(1),
-                Some(Durability::Fsync),
-                false,
+                opts,
             )
             .unwrap();
             fs.create_bucket(BUCKET).unwrap();

@@ -268,19 +268,11 @@ mod tests {
     /// here.
     fn store_with_keys(bucket: &str, keys: usize) -> TempDir {
         let dir = TempDir::new().unwrap();
-        let opts = options();
         let casfs = CasFS::single_namespace(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             SharedMetrics::default(),
-            opts.metadata_db,
-            opts.inline_metadata_size,
-            Some(opts.durability),
-            Some(opts.header_spec()),
-            false,
-            opts.stripe_count,
-            opts.max_blocks_per_commit,
-            opts.group_commit,
+            options(),
         )
         .unwrap();
         casfs.create_bucket(bucket).unwrap();
@@ -360,20 +352,15 @@ mod tests {
     #[test]
     fn headers_report_the_stores_own_width() {
         let dir = TempDir::new().unwrap();
-        let mut opts = options();
-        opts.hasher = Hasher::Blake3W16;
+        let opts = StoreOptions {
+            hasher: Hasher::Blake3W16,
+            ..options()
+        };
         let casfs = CasFS::single_namespace(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             SharedMetrics::default(),
-            opts.metadata_db,
-            opts.inline_metadata_size,
-            Some(opts.durability),
-            Some(opts.header_spec()),
-            false,
-            opts.stripe_count,
-            opts.max_blocks_per_commit,
-            opts.group_commit,
+            opts,
         )
         .unwrap();
         drop(casfs);

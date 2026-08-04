@@ -22,6 +22,7 @@ use super::fs::CasFS;
 use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{BlockId, Durability};
 use crate::metrics::SharedMetrics;
+use crate::store_options::StoreOptions;
 
 const STORM_ITERATIONS: usize = 60;
 
@@ -32,18 +33,13 @@ fn store_with_namespaces(
     ops: Option<Arc<dyn BlockDiskOps>>,
     n: usize,
 ) -> (Arc<SharedBlockStore>, Vec<Arc<CasFS>>) {
-    let mut shared = SharedBlockStore::new(
-        dir.join("meta/blocks"),
-        dir.join("blocks"),
-        super::StorageEngine::Fjall,
-        Some(1),
-        Some(Durability::Buffer),
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let opts = StoreOptions {
+        inline_metadata_size: Some(1),
+        durability: Durability::Buffer,
+        ..StoreOptions::default()
+    };
+    let mut shared =
+        SharedBlockStore::new(dir.join("meta/blocks"), dir.join("blocks"), opts).unwrap();
     if let Some(ops) = ops {
         shared.set_disk_ops(ops);
     }
@@ -55,10 +51,7 @@ fn store_with_namespaces(
                     dir.join(format!("meta/ns-{i}")),
                     shared.clone(),
                     SharedMetrics::default(),
-                    super::StorageEngine::Fjall,
-                    Some(1),
-                    Some(Durability::Buffer),
-                    false,
+                    opts,
                 )
                 .unwrap(),
             )

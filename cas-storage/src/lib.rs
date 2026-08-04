@@ -16,7 +16,7 @@
 //! ## Example: Single-namespace convenience
 //!
 //! ```no_run
-//! use cas_storage::{CasFS, StorageEngine, Durability};
+//! use cas_storage::{CasFS, Durability, StoreOptions};
 //! use std::path::PathBuf;
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,14 +24,10 @@
 //!     PathBuf::from("./data"),
 //!     PathBuf::from("./data/meta"),
 //!     Default::default(),  // metrics
-//!     StorageEngine::Fjall,
-//!     None,                // inlined_metadata_size
-//!     Some(Durability::Fsync),
-//!     None,                // header spec (defaults to blake3/32)
-//!     false,               // verify_on_read
-//!     None,                // stripe count (defaults to 1024)
-//!     None,                // blocks per commit (defaults to 64)
-//!     None,                // group commit (ADR 0011; defaults to off)
+//!     StoreOptions {
+//!         durability: Durability::Fsync,
+//!         ..StoreOptions::default()
+//!     },
 //! )?;
 //! casfs.create_bucket("my-bucket")?;
 //! # Ok(())
@@ -41,24 +37,26 @@
 //! ## Example: Multi-namespace (shared block store, many namespaces)
 //!
 //! ```no_run
-//! use cas_storage::{SharedBlockStore, CasFS, StorageEngine, Durability};
+//! use cas_storage::{SharedBlockStore, CasFS, Durability, StoreOptions};
 //! use std::path::PathBuf;
 //! use std::sync::Arc;
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // One options value for the whole store: both constructors take it, so
+//! // the two databases of one deployment cannot be opened on different
+//! // terms.
+//! let opts = StoreOptions {
+//!     durability: Durability::Fsync,
+//!     ..StoreOptions::default()
+//! };
+//!
 //! // Create shared block store (once, shared across all namespaces). It
 //! // owns the blocks DB AND the block data root: every namespace derives
 //! // block file paths from that one root.
 //! let shared = Arc::new(SharedBlockStore::new(
 //!     PathBuf::from("./data/meta/blocks"),
 //!     PathBuf::from("./data/blocks"),
-//!     StorageEngine::Fjall,
-//!     None,
-//!     Some(Durability::Fsync),
-//!     None,                // header spec (defaults to blake3/32)
-//!     None,                // stripe count (defaults to 1024)
-//!     None,                // blocks per commit (defaults to 64)
-//!     None,                // group commit (ADR 0011; defaults to off)
+//!     opts,
 //! )?);
 //!
 //! // One CasFS per namespace (e.g. per user)
@@ -66,10 +64,7 @@
 //!     PathBuf::from("./data/meta/user_alice"),
 //!     shared.clone(),
 //!     Default::default(),
-//!     StorageEngine::Fjall,
-//!     None,
-//!     Some(Durability::Fsync),
-//!     false,               // verify_on_read
+//!     opts,
 //! )?;
 //! # Ok(())
 //! # }

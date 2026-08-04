@@ -6,7 +6,7 @@
 //! other on the block write path.
 
 use bytes::Bytes;
-use cas_storage::{AsyncByteStream, CasFS, Durability, Hasher, SharedMetrics, StorageEngine};
+use cas_storage::{AsyncByteStream, CasFS, Durability, Hasher, SharedMetrics, StoreOptions};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::stream;
 use rand::RngExt;
@@ -27,22 +27,20 @@ fn setup_casfs_with(hasher: Hasher) -> (CasFS, TempDir) {
     let meta_path = root_path.clone();
 
     let metrics = get_shared_metrics();
-    let storage_engine = StorageEngine::Fjall;
-    let inlined_metadata_size = Some(1024); // Use a reasonable inline metadata size for benchmarking
-    let durability = Some(Durability::Buffer); // Use buffer durability for benchmarking
 
     let fs = CasFS::single_namespace(
         root_path,
         meta_path,
         metrics,
-        storage_engine,
-        inlined_metadata_size,
-        durability,
-        Some(hasher.into()),
-        false, // verify_on_read: benchmarks measure the normal read path
-        None,  // stripe_count: the default 1024, which the sizing note assumes
-        None,  // max_blocks_per_commit: the default 64 (ADR 0010)
-        None,  // group_commit: off, the ADR 0011 default
+        StoreOptions {
+            // A reasonable inline threshold for benchmarking, and buffer
+            // durability: the rest is the built-in default (stripe count
+            // 1024, batch cap 64, no commit station, no read verification).
+            inline_metadata_size: Some(1024),
+            durability: Durability::Buffer,
+            hasher,
+            ..StoreOptions::default()
+        },
     )
     .unwrap();
 

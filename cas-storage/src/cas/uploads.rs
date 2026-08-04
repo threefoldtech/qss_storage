@@ -416,9 +416,10 @@ pub(super) async fn abort_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cas::{AsyncByteStream, CasFS, StorageEngine};
+    use crate::cas::{AsyncByteStream, CasFS};
     use crate::metastore::{BlockId, Durability};
     use crate::metrics::SharedMetrics;
+    use crate::store_options::StoreOptions;
     use tempfile::{TempDir, tempdir};
 
     const BUCKET: &str = "test-bucket";
@@ -430,14 +431,11 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("meta"),
             SharedMetrics::default(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            false,
-            None,
-            None,
-            None,
+            StoreOptions {
+                inline_metadata_size: Some(1),
+                durability: Durability::Buffer,
+                ..StoreOptions::default()
+            },
         )
         .unwrap();
         (fs, dir)

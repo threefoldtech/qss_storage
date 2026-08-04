@@ -271,9 +271,10 @@ async fn sweep_orphan_parts(fs: &CasFS, stats: &mut SweepStats) {
 mod tests {
     use super::*;
     use crate::cas::uploads::upload_key;
-    use crate::cas::{AsyncByteStream, StorageEngine, UploadClaim};
+    use crate::cas::{AsyncByteStream, UploadClaim};
     use crate::metastore::{BlockId, ContentHash, Durability, ObjectData, UploadRecord};
     use crate::metrics::SharedMetrics;
+    use crate::store_options::StoreOptions;
     use tempfile::{TempDir, tempdir};
 
     const BUCKET: &str = "test-bucket";
@@ -286,14 +287,11 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("meta"),
             SharedMetrics::default(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            false,
-            None,
-            None,
-            None,
+            StoreOptions {
+                inline_metadata_size: Some(1),
+                durability: Durability::Buffer,
+                ..StoreOptions::default()
+            },
         )
         .unwrap();
         fs.create_bucket(BUCKET).unwrap();

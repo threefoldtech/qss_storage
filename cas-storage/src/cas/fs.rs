@@ -8,9 +8,10 @@ use super::uploads::UploadClaim;
 use crate::metrics::SharedMetrics;
 
 use crate::metastore::{
-    BlockId, BlockTree, BucketMeta, ContentHash, Durability, FjallStore, HeaderSpec, MetaError,
-    MetaStore, MetaTreeExt, Object, ObjectData, UploadRecord,
+    BlockId, BlockTree, BucketMeta, ContentHash, FjallStore, HeaderSpec, MetaError, MetaStore,
+    MetaTreeExt, Object, ObjectData, UploadRecord,
 };
+use crate::store_options::StoreOptions;
 
 use super::byte_stream::AsyncByteStream;
 
@@ -107,17 +108,16 @@ impl CasFS {
     /// namespace DB. Routine rather than exceptional -- it is what an offline
     /// tool meets when the daemon is running -- so it is a value, not a panic.
     ///
-    /// `verify_on_read` turns on block verification on read; see
-    /// [`CasFS::verify_on_read`] for what it does and does not cover. It is a
-    /// constructor parameter until the config file gives it a home.
+    /// `opts` says how this process opens the store; the only field that
+    /// applies to a namespace DB and not to the block store is
+    /// [`StoreOptions::verify_on_read`], and `opts.hasher` is ignored here
+    /// because the namespace header takes the hash the block store already
+    /// carries.
     pub fn new(
         mut namespace_meta_path: PathBuf,
         shared: Arc<SharedBlockStore>,
         metrics: SharedMetrics,
-        storage_engine: StorageEngine,
-        inlined_metadata_size: Option<usize>,
-        durability: Option<Durability>,
-        verify_on_read: bool,
+        opts: StoreOptions,
     ) -> Result<Self, MetaError> {
         namespace_meta_path.push("db");
 
@@ -128,10 +128,11 @@ impl CasFS {
             .unwrap_or(namespace_meta_path);
 
         let spec = HeaderSpec::from(shared.hasher());
-        let (namespace, _header) = match storage_engine {
+        let inlined_metadata_size = opts.inline_metadata_size;
+        let (namespace, _header) = match opts.metadata_db {
             StorageEngine::Fjall => {
                 MetaStore::open_or_create(namespace_meta_path, inlined_metadata_size, spec, |p| {
-                    FjallStore::new(p, inlined_metadata_size, durability)
+                    FjallStore::new(p, inlined_metadata_size, Some(opts.durability))
                 })?
             }
         };
@@ -140,7 +141,7 @@ impl CasFS {
             namespace,
             shared,
             metrics,
-            verify_on_read,
+            verify_on_read: opts.verify_on_read,
         })
     }
 
@@ -153,16 +154,11 @@ impl CasFS {
     /// `meta_path/db/`.
     ///
     /// Two headered DBs are involved: the blocks DB, whose header names the
-    /// block hash, and the namespace DB, which inherits it. `spec` applies
-    /// only to DBs that are created now; `None` takes
-    /// [`HeaderSpec::default`].
+    /// block hash, and the namespace DB, which inherits it. `opts.hasher`
+    /// applies only to DBs that are created now.
     ///
-    /// `verify_on_read` is passed straight to [`CasFS::new`], and
-    /// `stripe_count`, `max_blocks_per_commit` and `group_commit` straight to
-    /// [`SharedBlockStore::new`] (`None` takes the built-in defaults;
-    /// `config::DEFAULT_STRIPE_COUNT`,
-    /// `config::DEFAULT_MAX_BLOCKS_PER_COMMIT` and
-    /// `config::DEFAULT_GROUP_COMMIT` name them).
+    /// `opts` is passed whole to both constructors; see [`StoreOptions`] for
+    /// what each knob does and which ADR put it there.
     ///
     /// # One process, one store
     ///
@@ -173,40 +169,18 @@ impl CasFS {
     /// on (ADR 0006) would silently not hold between them. Open one `CasFS`
     /// per store, or build one `SharedBlockStore` and hand it to
     /// [`CasFS::new`] per namespace.
-    #[allow(clippy::too_many_arguments)]
     pub fn single_namespace(
         root: PathBuf,
         meta_path: PathBuf,
         metrics: SharedMetrics,
-        storage_engine: StorageEngine,
-        inlined_metadata_size: Option<usize>,
-        durability: Option<Durability>,
-        spec: Option<HeaderSpec>,
-        verify_on_read: bool,
-        stripe_count: Option<usize>,
-        max_blocks_per_commit: Option<usize>,
-        group_commit: Option<crate::cas::GroupCommit>,
+        opts: StoreOptions,
     ) -> Result<Self, MetaError> {
         let shared = Arc::new(SharedBlockStore::new(
             meta_path.join("blocks"),
             root.join("blocks"),
-            storage_engine,
-            inlined_metadata_size,
-            durability,
-            spec,
-            stripe_count,
-            max_blocks_per_commit,
-            group_commit,
+            opts,
         )?);
-        Self::new(
-            meta_path,
-            shared,
-            metrics,
-            storage_engine,
-            inlined_metadata_size,
-            durability,
-            verify_on_read,
-        )
+        Self::new(meta_path, shared, metrics, opts)
     }
 
     /// The hash function this filesystem addresses blocks with, taken from the
@@ -572,6 +546,8 @@ mod tests {
     use crate::cas::block_stream::BlockStream;
     use crate::cas::range_request::RangeRequest;
     use crate::hasher::Hasher;
+    use crate::metastore::Durability;
+    use crate::store_options::StoreOptions;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use std::sync::LazyLock;
@@ -594,6 +570,17 @@ mod tests {
 
     static METRICS: LazyLock<SharedMetrics> = LazyLock::new(SharedMetrics::default);
 
+    /// How every store in this module is opened: inline nothing (so the block
+    /// path is always the path under test) and leave the flush to the page
+    /// cache (tests are not crash tests).
+    fn test_options() -> StoreOptions {
+        StoreOptions {
+            inline_metadata_size: Some(1),
+            durability: Durability::Buffer,
+            ..StoreOptions::default()
+        }
+    }
+
     fn setup_test_fs(storage_engine: StorageEngine, hasher: Hasher) -> (CasFS, tempfile::TempDir) {
         setup_test_fs_verifying(storage_engine, hasher, false)
     }
@@ -611,14 +598,12 @@ mod tests {
             dir.path().to_path_buf(),
             meta_path,
             metrics,
-            storage_engine,
-            Some(1),
-            Some(Durability::Buffer),
-            Some(HeaderSpec::from(hasher)),
-            verify_on_read,
-            None,
-            None,
-            None,
+            StoreOptions {
+                metadata_db: storage_engine,
+                hasher,
+                verify_on_read,
+                ..test_options()
+            },
         )
         .unwrap();
         assert_eq!(fs.hasher(), hasher, "store must open with the asked hasher");
@@ -667,16 +652,14 @@ mod tests {
     /// the injection point -- it must survive every protocol change).
     fn setup_failing_write_fs(hasher: Hasher) -> (CasFS, tempfile::TempDir) {
         let dir = tempdir().unwrap();
+        let opts = StoreOptions {
+            hasher,
+            ..test_options()
+        };
         let mut shared = crate::cas::SharedBlockStore::new(
             dir.path().join("meta/blocks"),
             dir.path().join("blocks"),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            Some(HeaderSpec::from(hasher)),
-            None,
-            None,
-            None,
+            opts,
         )
         .unwrap();
         shared.set_disk_ops(Arc::new(FailingWriteOps));
@@ -684,10 +667,7 @@ mod tests {
             dir.path().join("meta"),
             Arc::new(shared),
             METRICS.clone(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            false,
+            opts,
         )
         .unwrap();
         (fs, dir)
@@ -813,14 +793,10 @@ mod tests {
             one.path().to_path_buf(),
             one.path().to_path_buf(),
             METRICS.clone(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            false,
-            Some(1),
-            None,
-            None,
+            StoreOptions {
+                stripe_count: Some(1),
+                ..test_options()
+            },
         )
         .unwrap();
 
@@ -846,14 +822,7 @@ mod tests {
             many.path().to_path_buf(),
             many.path().to_path_buf(),
             METRICS.clone(),
-            StorageEngine::Fjall,
-            Some(1),
-            Some(Durability::Buffer),
-            None,
-            false,
-            None,
-            None,
-            None,
+            test_options(),
         )
         .unwrap();
         assert!(!Arc::ptr_eq(
@@ -872,13 +841,7 @@ mod tests {
             crate::cas::SharedBlockStore::new(
                 dir.path().join("meta/blocks"),
                 dir.path().join("blocks"),
-                StorageEngine::Fjall,
-                Some(1),
-                Some(Durability::Buffer),
-                None,
-                None,
-                None,
-                None,
+                test_options(),
             )
             .unwrap(),
         );
@@ -887,10 +850,7 @@ mod tests {
                 dir.path().join("meta").join(name),
                 shared.clone(),
                 METRICS.clone(),
-                StorageEngine::Fjall,
-                Some(1),
-                Some(Durability::Buffer),
-                false,
+                test_options(),
             )
             .unwrap()
         };

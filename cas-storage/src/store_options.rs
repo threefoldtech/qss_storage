@@ -7,6 +7,15 @@
 //! the library, and every binary -- s3cas's subcommands and fsck alike --
 //! calls it. The flag definitions themselves stay with each binary's clap
 //! parser; only the merge is shared.
+//!
+//! [`StoreOptions`] is also what the store constructors take: `CasFS::new`,
+//! `CasFS::single_namespace` and `SharedBlockStore::new` each take the paths
+//! that say WHICH store they open positionally, and everything else in this
+//! one struct. It used to be nine and eleven positional arguments, which is
+//! how a caller silently swaps two adjacent `Option<usize>`s. A caller that
+//! wants the defaults writes `StoreOptions::default()`; one that wants a
+//! single knob different writes `StoreOptions { verify_on_read: false,
+//! ..store }`.
 
 use crate::cas::GroupCommit;
 use crate::config::{
@@ -53,6 +62,30 @@ pub struct StoreOptions {
     /// store: two processes may open one store with different stations, or
     /// with none.
     pub group_commit: Option<GroupCommit>,
+}
+
+impl Default for StoreOptions {
+    /// What a store opened with nothing configured gets: the same values
+    /// [`StoreOptions::resolve`] produces from an empty `[store]` table, so
+    /// the two ways of arriving at "no opinion" cannot drift apart.
+    ///
+    /// `hasher` is [`HeaderSpec::default`]'s hash, and it only applies to a
+    /// store being created now -- an existing store is addressed by whatever
+    /// its header says.
+    fn default() -> Self {
+        Self {
+            metadata_db: DEFAULT_METADATA_DB,
+            durability: DEFAULT_DURABILITY,
+            inline_metadata_size: None,
+            verify_on_read: DEFAULT_VERIFY_ON_READ,
+            hasher: Hasher::Blake3W32,
+            stripe_count: None,
+            max_blocks_per_commit: None,
+            group_commit: DEFAULT_GROUP_COMMIT.then_some(GroupCommit {
+                window: DEFAULT_GROUP_COMMIT_WINDOW,
+            }),
+        }
+    }
 }
 
 impl StoreOptions {
