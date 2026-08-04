@@ -6,82 +6,90 @@ so explicitly.
 
 ## Scope and vantage point
 
-Written against branch `refactor/cas-storage` at commit `e349d9d`, which is
-`main` (`c12f930`) plus the `metastore` -> `cas-storage` consolidation.
+Current as of branch `development` at commit `62fdf27` (2026-08-04), which is
+ADR 0014 as built.
 
-This matters: **`main` and this branch have materially different crate
-layouts.** `main` still ships a separate `metastore` crate and an
-`s3cas/src/cas/` tree. ADRs 0001 and 0002 on `main` describe the
-`cas-storage` layout that only exists here. See
+`main` is a different codebase. It is still at `c12f930`: a separate
+`metastore` crate, `respd/` rather than `respcas/`, `s3cas/src/s3fs.rs`
+rather than `api.rs`, and two ADRs rather than fourteen. Nothing in these
+documents describes `main`. See
 [04-code-health.md](./04-code-health.md#p1-adrs-describe-a-layout-main-does-not-have).
 
 ## Documents
 
 | Document | Contents |
 |----------|----------|
-| [01-architecture.md](./01-architecture.md) | Crate topology, process model, request paths, vendored-fork status |
-| [02-storage-model.md](./02-storage-model.md) | On-disk format, block addressing, refcounting, keyspaces, durability |
-| [03-crates.md](./03-crates.md) | Per-crate detail: cas-storage, s3cas, respcas, benches |
-| [04-code-health.md](./04-code-health.md) | Bloat and smell findings, prioritized, with locations |
+| [01-architecture.md](./01-architecture.md) | Crate topology, provenance, process model, request paths, backends, CI |
+| [02-storage-model.md](./02-storage-model.md) | On-disk format, block addressing, refcounting, keyspaces, durability, the block protocol, content-addressed namespaces |
+| [03-crates.md](./03-crates.md) | Per-crate detail: cas-storage, s3cas, respcas, benches, qss-storage-fsck |
+| [04-code-health.md](./04-code-health.md) | The 2026-07-30 review, each finding annotated with its status at HEAD |
 
 ## Executive summary
 
-qss_storage is a three-crate Rust workspace: one shared content-addressed
-storage library (`cas-storage`, 4884 lines) and two independent protocol
-frontends over it -- `s3cas` (S3 API, 2368 lines) and `respcas` (Redis/RESP
-subset, 4058 lines). Objects are chunked into 1 MiB blocks, addressed by BLAKE3
-(ADR 0002; the S3 ETag stays MD5), deduplicated, and reference counted.
-Metadata lives in fjall 3.x, behind a `Store` trait with one
-implementation: the transactional `FjallStore` (the non-transactional
-`FjallStoreNotx` was removed by ADR 0007).
+qss_storage is a five-member Rust workspace: one shared content-addressed
+storage library (`cas-storage`, ~27.8k lines) and four consumers of it --
+`s3cas` (S3 API, ~4.9k), `respcas` (Redis/RESP2 subset, ~6.2k),
+`qss-storage-fsck` (offline scrub and repair, ~1k) and `qss-benches`
+(criterion). Objects are chunked into 1 MiB blocks, addressed by BLAKE3
+(ADR 0002; the S3 ETag stays MD5), deduplicated and reference counted.
+Metadata lives in fjall 3.x behind a `Store` trait with one implementation,
+the transactional `FjallStore` (the non-transactional `FjallStoreNotx` was
+removed by ADR 0007).
 
-Three things a reader should know before touching the code:
+Four things a reader should know before touching the code:
 
-1. **`cas-storage` is a vendored fork**, not original code. It was copied from
-   `github.com/threefoldtech/s3-cas` at commit `b28eac0` (2026-05). Four
-   blocks are marked `tfstor-extension: BEGIN/END`; everything else is meant
-   to stay byte-identical to upstream so the snapshot can be re-based. Edits
-   outside those markers make rebasing harder and should be deliberate.
+1. **`cas-storage`'s fork lineage is history, not a constraint.** It was
+   vendored from `github.com/threefoldtech/s3-cas @ b28eac0` (2026-05), and
+   the ownership decision of 2026-07-30 made qss_storage its primary home:
+   nothing is upstreamed, there is no rebase to protect, and the directory
+   may be refactored freely. The nine `tfstor-extension` marker regions that
+   survive are a change record. `cas-storage/EXTENSIONS.md` is the
+   provenance document.
 
-2. **The on-disk format is v1 and has no backward compatibility.** All length
-   and count fields are fixed `u64` (the old `PTR_SIZE = size_of::<usize>()`
-   is gone), records with block-id lists carry a self-describing width byte,
-   and every record is length-exact. A store written before format v1 reads as
-   a decode error. Details in
-   [02-storage-model.md](./02-storage-model.md#on-disk-record-formats-v1).
+2. **The on-disk format is versioned and refuses rather than migrates.**
+   Every metadata database carries a 32-byte QSST header. A store is created
+   at version 3 and this build opens `{3, 4}`; version 4 is raised on a live
+   store when a respcas content-addressed namespace is first created (ADR
+   0014). Older versions are refused at open with an operator-readable
+   message naming the store. Details in
+   [02-storage-model.md](./02-storage-model.md#store-header-qsst).
 
-3. **The health review found 6 correctness or soundness issues**, one of them
-   a confirmed reachable panic on default flags, and one a cross-tenant data
-   substitution risk arising from MD5 plus shared block storage. See
-   [04-code-health.md](./04-code-health.md).
+3. **Both frontends address blocks.** Since ADR 0014 respcas is not a
+   metadata-only key-value store: a `KeyMode::Cas` namespace keys records by
+   the BLAKE3-256 of the value, routes anything above the inline threshold
+   through the same ADR 0006 write path s3cas uses, and clones existing
+   content by reference rather than storing it twice. A respcas store is the
+   same meta+blocks pair every other store here is, which is what lets fsck
+   walk it.
 
-The codebase is in reasonable shape structurally -- the refactor genuinely
-improved it, the trait boundaries are clean, and test coverage of the refcount
-contract is real. The problems are concentrated in the unsafe code and the
-serialization layer, both inherited from upstream.
+4. **The durability boundary is the acknowledgement, not the block.** ADR
+   0010 made one request one durability unit; ADR 0011 optionally merges the
+   closing step of concurrent requests; ADR 0013 gave each tree an ack class,
+   so a write a client was told succeeded is persisted before the reply
+   unless the protocol has a loud, retryable answer for losing it.
 
 ## Health summary
 
-| Series | Count | Theme |
-|--------|-------|-------|
-| H1-H6, correctness / soundness | 6 | Reachable panic, unaudited `unsafe`, format portability, MD5 collision exposure |
-| H7-H12, design / consistency | 6 | Unverified Content-MD5, truncating casts, edition and naming drift |
-| B1-B4, bloat / duplication | 4 | Duplicated store backends, oversized functions, lint backlog |
-| P1-P6, hygiene / process | 6 | Red CI on main, stale docs, missing fmt gate |
+[04-code-health.md](./04-code-health.md) is a dated review (2026-07-30,
+branch `refactor/cas-storage` at `e349d9d`), kept as a record and annotated
+finding by finding with its status at `62fdf27`.
 
-The single most actionable item is **H1**: a confirmed panic on a default code
-path whose own error message is wrong about why it cannot be implemented, with a
-few-line fix available in the same file. Suggested order of work is at the end
-of [04-code-health.md](./04-code-health.md#suggested-order-of-work).
+| Series | Count | Status at `62fdf27` |
+|--------|-------|---------------------|
+| H1-H6, correctness / soundness | 6 | all RESOLVED |
+| H7-H12, design / consistency | 6 | 4 RESOLVED, H9 CLOSED (correct as written), H10 PARTIAL (sites fixed, class recurred), H12 OBSOLETE |
+| B1-B4, bloat / duplication | 4 | B1 OBSOLETE, B3 RESOLVED, B2 and B4 PARTIAL |
+| P1-P6, hygiene / process | 6 | 3 RESOLVED, P5 OBSOLETE, P1 and P2 OPEN on `main` |
 
-**Update 2026-07-30:** a remediation pass on the `development` branch fixed
-H1, H2, H5, H6, H8, B2, B3, P3, P4, and P6, recorded H3/H4 in ADR 0002, and
-additionally revived the dead benchmark suite and fixed a port race in the
-respcas test harness. Live status table at the top of
-[04-code-health.md](./04-code-health.md#resolution-status-2026-07-30-branch-development).
+Nothing in the correctness series is open. What remains is P1/P2 -- `main`
+carries a codebase the ADRs no longer describe -- and two classes that came
+back rather than staying fixed: truncating casts (nothing gates the lint) and
+function length (two long functions that were never the shape the finding was
+about).
 
-Verification state at time of writing, on this branch:
+Verification at `62fdf27`:
 
+- `cargo fmt --all --check`: clean
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean
-- `cargo test --workspace`: 44 passed, 0 failed
-- `cargo clippy -- -W clippy::pedantic`: 458 warnings (not gating)
+- `cargo test --workspace`: 455 passed, 0 failed, 1 ignored
+- `cargo clippy -- -W clippy::pedantic`: 758 warnings (not gating)
