@@ -32,6 +32,16 @@
 //! migration: the blocks of a store are addressed by the hash named in its
 //! header, so guessing wrong does not degrade the service, it corrupts it.
 //!
+//! # A version this build writes, and versions it opens
+//!
+//! [`STORE_HEADER_VERSION`] is what a store is CREATED at;
+//! [`SUPPORTED_STORE_HEADER_VERSIONS`] is what it will open. The two differ
+//! since ADR 0014, which raises a live store's version when a feature is
+//! first used ([`raise_version`]) rather than at creation -- so a store that
+//! never uses the feature stays openable by the builds that predate it, and
+//! one that does is refused by them at the open instead of failing to decode
+//! its own metadata later.
+//!
 //! # Forward compatibility
 //!
 //! The record has no spare bytes left: ADR 0012 spent the reserved block on
@@ -64,7 +74,7 @@ pub const STORE_HEADER_SIZE: usize = 32;
 /// Leading four bytes of every header record.
 pub const STORE_HEADER_MAGIC: [u8; 4] = *b"QSST";
 
-/// Format version this build writes and is willing to open.
+/// Format version a store is CREATED at.
 ///
 /// v1: ADR 0002 -- BLAKE3 addressing, u64 on-disk fields, this header.
 /// v2: ADR 0006 -- block records store a fanout depth instead of allocated
@@ -75,7 +85,35 @@ pub const STORE_HEADER_MAGIC: [u8; 4] = *b"QSST";
 ///     degraded bit. A v2 record is one byte short of a v3 record and fails
 ///     the exact-length check, so a v2 store is refused at open rather than
 ///     misread. Same stance as v2: no deployed store carries data.
+/// v4: ADR 0014 -- a respcas store that holds a content-addressed namespace.
+///     See [`STORE_HEADER_VERSION_CAS_NAMESPACE`]: this is the one version
+///     that is RAISED on a live store rather than written at creation, so a
+///     store keeps saying v3 until the feature is actually used.
 pub const STORE_HEADER_VERSION: u16 = 3;
+
+/// The version a store carries once it holds a respcas Cas namespace (ADR
+/// 0014).
+///
+/// The namespace metadata of such a store contains a `key_mode` variant an
+/// older build's msgpack decoder does not know, and a decode failure in the
+/// middle of serving is not a refusal an operator can act on. So the store
+/// says so in the one place every build reads first: the first `NSSET
+/// key_mode cas` raises the header from [`STORE_HEADER_VERSION`] to this,
+/// and an older build then refuses the open with
+/// [`StoreHeaderError::UnsupportedVersion`] -- which is what the header is
+/// for (ADR 0002).
+///
+/// Raised, never written at creation: a store that never uses the feature
+/// stays readable by the builds that predate it.
+pub const STORE_HEADER_VERSION_CAS_NAMESPACE: u16 = 4;
+
+/// Every format version this build will open.
+///
+/// The version field is a gate, not a range to interpolate over: a store is
+/// opened only if its exact version is listed here, and each entry has code
+/// behind it that can read that store's records.
+pub const SUPPORTED_STORE_HEADER_VERSIONS: &[u16] =
+    &[STORE_HEADER_VERSION, STORE_HEADER_VERSION_CAS_NAMESPACE];
 
 /// File name of the sidecar copy written next to the db directory at
 /// creation. Recovery from it is a manual operation.
@@ -305,7 +343,7 @@ impl StoreHeader {
             return Err(StoreHeaderError::BadMagic(magic));
         }
         let version = reader.u16("version").map_err(StoreHeaderError::Malformed)?;
-        if version != STORE_HEADER_VERSION {
+        if !SUPPORTED_STORE_HEADER_VERSIONS.contains(&version) {
             return Err(StoreHeaderError::UnsupportedVersion(version));
         }
         let hash_algo = reader
@@ -367,7 +405,12 @@ impl Display for StoreHeaderError {
             ),
             StoreHeaderError::UnsupportedVersion(version) => write!(
                 f,
-                "unsupported QSST store format version {version}; this build supports version {STORE_HEADER_VERSION}"
+                "unsupported QSST store format version {version}; this build supports {}",
+                SUPPORTED_STORE_HEADER_VERSIONS
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             StoreHeaderError::Malformed(e) => {
                 write!(f, "malformed QSST store header: {e}")
@@ -510,6 +553,51 @@ pub(crate) fn adopt_store_id(
     write_header(store, &adopted)?;
     write_sidecar(db_path, &adopted);
     Ok(adopted)
+}
+
+/// Raises an existing store's format version to `version`, and returns the
+/// header as it now reads.
+///
+/// The one write that changes a store's version after creation, and it goes
+/// in one direction only: a store already at or above `version` is left
+/// alone, so calling this on every use of the feature that needs it costs a
+/// point read and nothing else.
+///
+/// Its caller is respcas creating the first Cas namespace in a store (ADR
+/// 0014). What the raise BUYS is the refusal an older build gives afterwards
+/// -- it must therefore land before the metadata that older build cannot
+/// decode, never after.
+///
+/// # Errors
+///
+/// [`MetaError::Header`] if `version` is not one this build supports (a build
+/// may only raise a store to a version it can itself open), or if the store
+/// has no header to raise.
+pub fn raise_version(
+    store: &dyn Store,
+    db_path: &Path,
+    version: u16,
+) -> Result<StoreHeader, MetaError> {
+    if !SUPPORTED_STORE_HEADER_VERSIONS.contains(&version) {
+        return Err(MetaError::header(
+            db_path,
+            StoreHeaderError::UnsupportedVersion(version),
+        ));
+    }
+    let header = read_header(store, db_path)?
+        .ok_or_else(|| MetaError::header(db_path, StoreHeaderError::Missing))?;
+    if header.version >= version {
+        return Ok(header);
+    }
+    let raised = StoreHeader { version, ..header };
+    write_header(store, &raised)?;
+    write_sidecar(db_path, &raised);
+    tracing::info!(
+        "raised the QSST store format version of {} from {} to {version}",
+        db_path.display(),
+        header.version,
+    );
+    Ok(raised)
 }
 
 #[cfg(test)]
@@ -658,14 +746,77 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         let mut raw = GOLDEN;
-        raw[4..6].copy_from_slice(&4u16.to_le_bytes());
+        raw[4..6].copy_from_slice(&5u16.to_le_bytes());
         let err = StoreHeader::from_bytes(&raw).unwrap_err();
-        assert_eq!(err, StoreHeaderError::UnsupportedVersion(4));
+        assert_eq!(err, StoreHeaderError::UnsupportedVersion(5));
         assert!(
             err.to_string()
-                .contains("unsupported QSST store format version 4"),
+                .contains("unsupported QSST store format version 5"),
             "{err}"
         );
+    }
+
+    /// A store that has grown a Cas namespace (ADR 0014) says v4 and is
+    /// opened by this build; nothing else about the record moves.
+    #[test]
+    fn the_cas_namespace_version_is_opened_and_changes_nothing_else() {
+        let mut raw = GOLDEN;
+        raw[4..6].copy_from_slice(&STORE_HEADER_VERSION_CAS_NAMESPACE.to_le_bytes());
+
+        let header = StoreHeader::from_bytes(&raw).expect("v4 is a version this build opens");
+        assert_eq!(header.version(), STORE_HEADER_VERSION_CAS_NAMESPACE);
+        assert_eq!(header.hasher(), Hasher::Blake3W32);
+        assert_eq!(header.created_at(), GOLDEN_CREATED_AT);
+        assert_eq!(header.to_bytes(), raw, "the raise costs no other byte");
+    }
+
+    /// The raise is one-way, idempotent, and refuses a version this build
+    /// could not itself open.
+    #[test]
+    fn raising_the_version_is_one_way_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("db");
+        let (store, created) =
+            MetaStore::open_or_create(db_path.clone(), Some(1), HeaderSpec::default(), fjall)
+                .expect("fresh directory must be created");
+        assert_eq!(created.version(), STORE_HEADER_VERSION);
+
+        let raised = raise_version(
+            &*store.get_underlying_store(),
+            &db_path,
+            STORE_HEADER_VERSION_CAS_NAMESPACE,
+        )
+        .unwrap();
+        assert_eq!(raised.version(), STORE_HEADER_VERSION_CAS_NAMESPACE);
+        assert_eq!(raised.store_id(), created.store_id(), "identity is kept");
+
+        // On disk, and in the sidecar next to it.
+        let on_disk = read_header(&*store.get_underlying_store(), &db_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk, raised);
+        let sidecar = std::fs::read(db_path.parent().unwrap().join(STORE_HEADER_SIDECAR)).unwrap();
+        assert_eq!(StoreHeader::from_bytes(&sidecar).unwrap(), raised);
+
+        // Idempotent, and never a downgrade.
+        let again = raise_version(
+            &*store.get_underlying_store(),
+            &db_path,
+            STORE_HEADER_VERSION_CAS_NAMESPACE,
+        )
+        .unwrap();
+        assert_eq!(again, raised);
+        let down = raise_version(
+            &*store.get_underlying_store(),
+            &db_path,
+            STORE_HEADER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(down, raised, "a lower version leaves the header alone");
+
+        // A version this build cannot open is not one it may write.
+        let err = raise_version(&*store.get_underlying_store(), &db_path, 99).unwrap_err();
+        assert!(err.to_string().contains("99"), "{err}");
     }
 
     /// The migration gate for ADR 0005's block record change: a v2 store
@@ -888,12 +1039,32 @@ mod tests {
     #[test]
     fn refuses_a_doctored_version() {
         let mut raw = GOLDEN;
-        raw[4..6].copy_from_slice(&4u16.to_le_bytes());
+        raw[4..6].copy_from_slice(&9u16.to_le_bytes());
         let msg = refusal_for(raw.to_vec());
         assert!(
-            msg.contains("unsupported QSST store format version 4"),
+            msg.contains("unsupported QSST store format version 9"),
             "{msg}"
         );
+    }
+
+    /// The other side of the ADR 0014 gate, at store level: a store whose
+    /// header was raised to the Cas-namespace version still opens here, and
+    /// its version is not quietly written back down.
+    #[test]
+    fn a_cas_namespace_store_reopens_at_its_raised_version() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db");
+        {
+            let _ = MetaStore::open_or_create(db.clone(), Some(1), HeaderSpec::default(), fjall)
+                .unwrap();
+        }
+        let mut raw = GOLDEN;
+        raw[4..6].copy_from_slice(&STORE_HEADER_VERSION_CAS_NAMESPACE.to_le_bytes());
+        doctor_header(&db, raw.to_vec());
+
+        let (_store, header) = MetaStore::open_or_create(db, Some(1), HeaderSpec::default(), fjall)
+            .expect("a raised store must open");
+        assert_eq!(header.version(), STORE_HEADER_VERSION_CAS_NAMESPACE);
     }
 
     #[test]

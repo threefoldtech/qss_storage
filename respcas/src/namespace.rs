@@ -7,7 +7,7 @@ use bytes::Bytes;
 use md5::{Digest, Md5};
 use tracing::debug;
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{KeyMode, Storage, StorageError};
 use cas_storage::{ContentHash, MetaError, MetaTreeExt, Object, ObjectData};
 
 /// Properties for a namespace
@@ -21,6 +21,11 @@ pub struct NamespaceProperties {
     pub locked: bool,
     /// Public mode - if false and password is set, authentication is required for read operations
     pub public: bool,
+    /// What a key means here (ADR 0014): a name the client chose, or the
+    /// BLAKE3-256 of the value. The in-memory copy of the persisted
+    /// `key_mode`, kept here because it decides what SET does and every
+    /// command reads it.
+    pub key_mode: KeyMode,
 }
 
 impl Default for NamespaceProperties {
@@ -30,6 +35,7 @@ impl Default for NamespaceProperties {
             worm: false,
             locked: false,
             public: true, // Default to public access
+            key_mode: KeyMode::UserKey,
         }
     }
 }
@@ -201,6 +207,7 @@ impl Namespace {
         props.worm = meta.worm;
         props.locked = meta.locked;
         props.public = meta.public;
+        props.key_mode = meta.key_mode;
     }
 
     pub fn flush(&self, namespace_cache: &NamespaceCache) -> Result<()> {

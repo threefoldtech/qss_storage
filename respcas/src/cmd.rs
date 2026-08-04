@@ -6,7 +6,7 @@ use tracing::{debug, error};
 
 use crate::namespace::{Namespace, NamespaceCache};
 use crate::property::BoolPropertyValue;
-use crate::storage::Storage;
+use crate::storage::{KeyMode, Storage};
 
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -290,6 +290,35 @@ fn parse_select(args: &Args) -> Result<Command, CommandError> {
         namespace,
         password,
     })
+}
+
+/// How a key mode is spelled on the wire: what `NSINFO` prints and what
+/// `NSSET <ns> key_mode <value>` accepts.
+fn key_mode_name(mode: KeyMode) -> &'static str {
+    match mode {
+        KeyMode::UserKey => "userkey",
+        KeyMode::Sequential => "sequential",
+        KeyMode::Cas => "cas",
+    }
+}
+
+/// The key mode `value` names, or an error naming the ones that exist.
+///
+/// `sequential` is refused rather than accepted: it is a zdb-heritage variant
+/// nothing here implements, so setting it would leave a namespace whose
+/// behaviour is undefined. It stays in [`KeyMode`] because it is on disk in
+/// stores that were created with it.
+fn parse_key_mode(value: &str) -> Result<KeyMode, String> {
+    match value.to_lowercase().as_str() {
+        "userkey" => Ok(KeyMode::UserKey),
+        "cas" => Ok(KeyMode::Cas),
+        "sequential" => Err(
+            "the sequential key mode is not implemented; namespaces are userkey or cas".to_string(),
+        ),
+        other => Err(format!(
+            "unknown key mode: {other} (expected userkey or cas)"
+        )),
+    }
 }
 
 /// `NSSET namespace property value`
@@ -627,10 +656,7 @@ impl CommandHandler {
                     if meta.public { "yes" } else { "no" },
                     if meta.password.is_some() { "yes" } else { "no" },
                     meta.max_size.unwrap_or(0),
-                    match meta.key_mode {
-                        crate::storage::KeyMode::UserKey => "userkey",
-                        crate::storage::KeyMode::Sequential => "sequential",
-                    },
+                    key_mode_name(meta.key_mode),
                     if meta.worm { "yes" } else { "no" },
                     if meta.locked { "yes" } else { "no" }
                 );
@@ -681,6 +707,14 @@ impl CommandHandler {
         // Check if user has admin privileges
         if !self.is_admin {
             return Frame::Error("ERR NSSET command requires admin privileges".into());
+        }
+
+        // The key mode is not a field to overwrite like the others: it is
+        // only coherent on an empty namespace, and switching to `cas` raises
+        // the store's header first (ADR 0014). Both live in the storage
+        // layer, so this property takes its own path.
+        if property.eq_ignore_ascii_case("key_mode") {
+            return self.handle_nsset_key_mode(&namespace, &value);
         }
 
         // Get the namespace metadata
@@ -753,6 +787,30 @@ impl CommandHandler {
                 }
             }
             Err(e) => Frame::Error(format!("ERR Namespace not found: {}", e)),
+        }
+    }
+
+    /// `NSSET <ns> key_mode <userkey|cas>` (ADR 0014).
+    ///
+    /// Refused on a namespace that holds keys, with the count in the message:
+    /// the existing keys would stop meaning what they say, and there is no
+    /// migration that could make them mean the other thing.
+    fn handle_nsset_key_mode(&self, namespace: &str, value: &str) -> Frame {
+        let key_mode = match parse_key_mode(value) {
+            Ok(key_mode) => key_mode,
+            Err(e) => return Frame::Error(format!("ERR {e}")),
+        };
+
+        match self.storage.set_key_mode(namespace, key_mode) {
+            Ok(()) => {
+                // Every connection already bound to this namespace must see
+                // the new mode: it decides what SET means.
+                self.namespace_cache.update_all_instances(namespace, |ns| {
+                    ns.properties.write().unwrap().key_mode = key_mode;
+                });
+                Frame::SimpleString("OK".into())
+            }
+            Err(e) => Frame::Error(format!("ERR {e}")),
         }
     }
 
