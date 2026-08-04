@@ -7,14 +7,18 @@ use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
+use super::plan::flag_unfinished;
 use super::*;
 use crate::cas::AsyncByteStream;
+use crate::cas::block_disk::QUARANTINE_DIR_NAME;
 use crate::cas::crash_fixtures::{
     plant_bit_flip, plant_dangling_record, plant_deflated_rc, plant_half_deleted_bucket,
     plant_inflated_rc, plant_orphan_file, plant_stale_part, plant_upload_record,
 };
-use crate::metastore::{ContentHash, Object, ObjectData};
-use crate::scrub::report::exit_code;
+use crate::metastore::{Block, ContentHash, Object, ObjectData, block_disk_path};
+use crate::scrub::engine::{self, ScrubOptions};
+use crate::scrub::findings::{Finding, FindingClass, Severity};
+use crate::scrub::report::{Pass, Report, exit_code};
 use crate::scrub::tests::{plant_object, put, store, synthetic_id};
 
 /// The tool's workflow: report first, repair second, check third.
