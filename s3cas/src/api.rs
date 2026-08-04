@@ -193,6 +193,26 @@ fn bad_digest() -> s3s::S3Error {
     )
 }
 
+/// The length a streaming-signed chunked request declared, when no
+/// `Content-Length` survived to the handler.
+///
+/// After decoding an aws-chunked body, s3s rewrites `Content-Length` to the
+/// decoded size only if the header already exists (`get_mut`, never an
+/// insert). A chunked upload that omits it entirely -- minio-go's shape for
+/// a zero-byte PUT -- therefore reaches the handler with `content_length:
+/// None` while the size the client signed sits in
+/// `x-amz-decoded-content-length`. Falling back to that header extends it
+/// exactly the trust the rewritten `Content-Length` already gets on the
+/// non-empty path.
+fn decoded_content_length(headers: &hyper::HeaderMap) -> Option<i64> {
+    headers
+        .get(s3s::header::X_AMZ_DECODED_CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// The answer to every operation that could not find (or could not claim) an
 /// upload record: an unknown id, and the loser of a complete-versus-abort
 /// race alike (ADR 0003 -- the record is the only linearization point, so
@@ -1113,6 +1133,7 @@ impl S3 for S3Cas {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        let decoded_content_length = decoded_content_length(&req.headers);
         let input = req.input;
         info!("PUT object {:?}", input);
         if let Some(ref storage_class) = input.storage_class {
@@ -1141,7 +1162,7 @@ impl S3 for S3Cas {
             return Err(s3_error!(NoSuchBucket, "Bucket does not exist"));
         }
 
-        let content_length = content_length.ok_or_else(|| {
+        let content_length = content_length.or(decoded_content_length).ok_or_else(|| {
             s3_error!(
                 MissingContentLength,
                 "You did not provide the number of bytes in the Content-Length HTTP header."
@@ -1210,6 +1231,7 @@ impl S3 for S3Cas {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        let decoded_content_length = decoded_content_length(&req.headers);
         let UploadPartInput {
             body,
             bucket,
@@ -1240,7 +1262,7 @@ impl S3 for S3Cas {
             return Err(s3_error!(IncompleteBody));
         };
 
-        let content_length = content_length.ok_or_else(|| {
+        let content_length = content_length.or(decoded_content_length).ok_or_else(|| {
             s3_error!(
                 MissingContentLength,
                 "You did not provide the number of bytes in the Content-Length HTTP header."
@@ -1316,5 +1338,32 @@ fn decode_continuation_token(rt: Option<&str>) -> Result<Option<String>, s3s::S3
             .map_err(|_| s3_error!(InvalidToken, "continuation token is invalid"))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decoded_content_length;
+    use hyper::HeaderMap;
+
+    #[test]
+    fn a_zero_byte_streaming_put_finds_its_length_in_the_decoded_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            s3s::header::X_AMZ_DECODED_CONTENT_LENGTH,
+            "0".parse().unwrap(),
+        );
+        assert_eq!(decoded_content_length(&headers), Some(0));
+    }
+
+    #[test]
+    fn a_request_that_never_declared_a_length_still_has_none() {
+        assert_eq!(decoded_content_length(&HeaderMap::new()), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            s3s::header::X_AMZ_DECODED_CONTENT_LENGTH,
+            "not-a-number".parse().unwrap(),
+        );
+        assert_eq!(decoded_content_length(&headers), None);
     }
 }
