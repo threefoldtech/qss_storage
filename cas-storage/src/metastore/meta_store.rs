@@ -264,7 +264,15 @@ impl MetaStore {
         self.store.tree_exists(bucket_name)
     }
 
-    /// Deletes the bucket with the given name.
+    /// Deletes the bucket with the given name: its object tree AND its row in
+    /// `_BUCKETS`.
+    ///
+    /// Both, because the name is what [`insert_bucket_if_absent`](Self::insert_bucket_if_absent)
+    /// claims: a dropped bucket whose row survived would be a name nobody
+    /// could take again, which is what respcas's FLUSH does -- drop the
+    /// namespace and create it back. Callers that remove the row themselves
+    /// first (`bucket_delete`, and fsck resuming a crashed teardown) are
+    /// unaffected: removing an absent key is not an error.
     ///
     /// If the bucket doesn't exist, this operation is a no-op and returns success.
     ///
@@ -274,6 +282,9 @@ impl MetaStore {
     /// # Returns
     /// Success or an error if the deletion fails
     pub fn drop_bucket(&self, name: &str) -> Result<(), MetaError> {
+        self.store
+            .tree_open(DEFAULT_BUCKET_TREE)?
+            .remove(name.as_bytes())?;
         if self.bucket_exists(name)? {
             self.store.tree_delete(name)
         } else {
@@ -314,6 +325,60 @@ impl MetaStore {
         self.store.tree_open(bucket_name)?;
 
         Ok(())
+    }
+
+    /// Inserts a bucket record only if the name is free, answering whether it
+    /// did.
+    ///
+    /// [`insert_bucket`](Self::insert_bucket)'s racing sibling, for a caller
+    /// that has to be able to tell "I created it" from "somebody else did":
+    /// respcas's NSNEW, which is a command with an answer. Checking with
+    /// [`bucket_exists`](Self::bucket_exists) and then inserting is two steps,
+    /// and two callers can both pass the check -- so both are told they
+    /// created the namespace, and the second one's default record overwrites
+    /// whatever the first (or an NSSET in between) had already put there.
+    ///
+    /// The read and the insert are one transaction on `_BUCKETS`, which under
+    /// fjall's single writer makes exactly one caller the winner. The bucket's
+    /// own tree is created after the commit, so a namespace is never
+    /// configurable before its record exists.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::ReservedBucketName`] for a `_`-prefixed name, as
+    /// [`insert_bucket`](Self::insert_bucket), and refused before anything is
+    /// written.
+    pub fn insert_bucket_if_absent(
+        &self,
+        bucket_name: &str,
+        raw_bucket: Vec<u8>,
+    ) -> Result<bool, MetaError> {
+        if bucket_name.starts_with('_') {
+            return Err(MetaError::ReservedBucketName(bucket_name.to_string()));
+        }
+
+        let mut tx = self.begin_transaction();
+        let taken = match tx.get_bucket_record(bucket_name) {
+            Ok(record) => record.is_some(),
+            Err(e) => {
+                tx.rollback();
+                return Err(e);
+            }
+        };
+        if taken {
+            tx.rollback();
+            return Ok(false);
+        }
+        if let Err(e) = tx.put_bucket_record(bucket_name, raw_bucket) {
+            tx.rollback();
+            return Err(e);
+        }
+        tx.commit()?;
+
+        // Create the bucket tree if it doesn't exist
+        self.store.tree_open(bucket_name)?;
+
+        Ok(true)
     }
 
     /// Returns a list of all buckets in the system.
@@ -697,6 +762,32 @@ impl Transaction {
         };
         self.backend.insert(bucket, key, raw_obj)?;
         Ok(displaced)
+    }
+
+    /// Reads the raw bucket record for `bucket_name` inside this transaction.
+    ///
+    /// Raw bytes rather than a decoded [`BucketMeta`]: the record under a
+    /// bucket name is not always one -- respcas keeps its own namespace
+    /// metadata there -- and the caller that asked whether the name is taken
+    /// does not care which.
+    pub fn get_bucket_record(&mut self, bucket_name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        self.backend
+            .get(DEFAULT_BUCKET_TREE, bucket_name.as_bytes())
+    }
+
+    /// Writes the raw bucket record for `bucket_name` inside this
+    /// transaction, over whatever is there.
+    ///
+    /// Paired with [`get_bucket_record`](Self::get_bucket_record) it is the
+    /// insert-if-absent [`MetaStore::insert_bucket_if_absent`] is built from:
+    /// the two steps commit together, so a name cannot be claimed twice.
+    pub fn put_bucket_record(
+        &mut self,
+        bucket_name: &str,
+        raw_bucket: Vec<u8>,
+    ) -> Result<(), MetaError> {
+        self.backend
+            .insert(DEFAULT_BUCKET_TREE, bucket_name.as_bytes(), raw_bucket)
     }
 
     /// The multipart claim (ADR 0003): reads AND removes the upload record
@@ -1128,6 +1219,48 @@ mod tests {
         let raw = BucketMeta::new("photos".to_string()).to_vec();
         meta.insert_bucket("photos", raw).unwrap();
         assert!(meta.bucket_exists("photos").unwrap());
+    }
+
+    /// The name is claimed once: a second insert-if-absent is refused, and
+    /// the record the first one wrote is left exactly as it is.
+    #[test]
+    fn insert_bucket_if_absent_claims_a_name_once() {
+        let (meta, _dir) = test_store();
+
+        assert!(
+            meta.insert_bucket_if_absent("photos", b"the first record".to_vec())
+                .unwrap(),
+            "a free name is claimed"
+        );
+        assert!(meta.bucket_exists("photos").unwrap(), "and its tree exists");
+
+        assert!(
+            !meta
+                .insert_bucket_if_absent("photos", b"a record that must not land".to_vec())
+                .unwrap(),
+            "a taken name is refused"
+        );
+        let stored = meta
+            .get_allbuckets_tree()
+            .unwrap()
+            .get(b"photos")
+            .unwrap()
+            .expect("the record is there");
+        assert_eq!(
+            stored, b"the first record",
+            "the refusal wrote nothing over what the winner stored"
+        );
+
+        // Reserved names are refused before anything is written, exactly as
+        // the plain insert refuses them.
+        match meta
+            .insert_bucket_if_absent("_private", b"x".to_vec())
+            .unwrap_err()
+        {
+            MetaError::ReservedBucketName(name) => assert_eq!(name, "_private"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(!meta.bucket_exists("_private").unwrap());
     }
 
     /// The holder enumeration ADR 0005 recounts from: every bucket tree and

@@ -141,7 +141,17 @@ impl NamespaceCache {
             Err(_) => {
                 // Namespace doesn't exist in storage, create a new one
                 debug!("Creating new namespace in storage: {}", name);
-                let tree = self.storage.create_namespace(&name)?;
+                let tree = match self.storage.create_namespace(&name) {
+                    Ok(tree) => tree,
+                    // Somebody else created it between the lookup and the
+                    // claim -- which is exactly what this call wanted. Only
+                    // one caller can win an atomic create, and losing it is
+                    // not a reason to refuse a connection.
+                    Err(StorageError::NamespaceExists { .. }) => {
+                        return self.get_or_create(name);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let props = NamespaceProperties {
                     namespace_name: name.clone(),
                     ..Default::default()

@@ -286,19 +286,30 @@ impl Storage {
         Ok(())
     }
 
+    /// Creates the namespace `name`, or refuses because it is already there.
+    ///
+    /// Atomic: the name is claimed and the record written in one transaction,
+    /// so of several NSNEW calls racing for one name exactly one is told OK
+    /// and the rest are refused. Checking and then inserting let all of them
+    /// pass the check -- every one of them was told OK, and each one's default
+    /// record overwrote what the previous one (or an NSSET that had already
+    /// configured the namespace) had written.
     pub fn create_namespace(
         &self,
         name: &str,
     ) -> Result<Arc<dyn MetaTreeExt + Send + Sync>, StorageError> {
-        if self.store.bucket_exists(name)? {
-            return Err(StorageError::NamespaceNotFound);
-        }
-
         let namespace_meta_raw = NamespaceMeta::new(name.to_string())
             .to_msgpack()
             .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
 
-        self.store.insert_bucket(name, namespace_meta_raw)?;
+        if !self
+            .store
+            .insert_bucket_if_absent(name, namespace_meta_raw)?
+        {
+            return Err(StorageError::NamespaceExists {
+                namespace: name.to_string(),
+            });
+        }
 
         self.get_namespace(name)
     }
@@ -403,6 +414,13 @@ impl NamespaceMeta {
 #[derive(Debug)]
 pub enum StorageError {
     NamespaceNotFound,
+    /// A namespace was asked to be created under a name that is already
+    /// taken. Its own error rather than [`StorageError::NamespaceNotFound`],
+    /// which is what NSNEW used to answer with -- the exactly wrong sentence
+    /// for a namespace that exists.
+    NamespaceExists {
+        namespace: String,
+    },
     /// A change that is only coherent on an empty namespace was asked for on
     /// one that holds keys (ADR 0014's key-mode gate).
     NamespaceNotEmpty {
@@ -420,6 +438,9 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             StorageError::NamespaceNotFound => write!(f, "Namespace not found"),
+            StorageError::NamespaceExists { ref namespace } => {
+                write!(f, "namespace {namespace} already exists")
+            }
             StorageError::NamespaceNotEmpty {
                 ref namespace,
                 keys,

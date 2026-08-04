@@ -246,13 +246,12 @@ fn a_set_and_delete_storm_never_serves_a_torn_value() {
 
 /// Several connections create the same namespace at the same moment.
 ///
-/// What must hold is that the store ends up with ONE namespace of that name,
-/// that it works, and that nothing already in it was lost. Exactly how many
-/// callers are told "OK" is not asserted: NSNEW checks for the name and then
-/// inserts it in two steps (`storage.rs::create_namespace`), so two callers
-/// can both pass the check, and both are then told OK. That race is recorded
-/// here rather than asserted away -- see the sequential half below for the
-/// answer a second caller gets when there is no race.
+/// Exactly one of them may be told OK. NSNEW used to check for the name and
+/// then insert it in two steps (`storage.rs::create_namespace`), so several
+/// callers passed the check together and every one of them was told it had
+/// created the namespace -- three or four of six, in practice -- while each
+/// one's default record overwrote whatever the last had written. The claim is
+/// one transaction now, and the losers are refused by name.
 #[test]
 fn concurrent_creates_of_one_namespace_leave_one_namespace() {
     const CREATORS: usize = 6;
@@ -282,21 +281,18 @@ fn concurrent_creates_of_one_namespace_leave_one_namespace() {
     });
 
     let created = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
-    assert!(created >= 1, "somebody must have created it: {outcomes:?}");
+    assert_eq!(
+        created, 1,
+        "one caller creates the namespace and the rest are refused: {outcomes:?}"
+    );
     for outcome in &outcomes {
         match outcome {
             Ok(answer) => assert_eq!(answer, "OK"),
             Err(message) => assert!(
-                message.contains("Namespace not found"),
+                message.contains("namespace contested already exists"),
                 "the refusal a loser gets: {message}"
             ),
         }
-    }
-    if created > 1 {
-        eprintln!(
-            "note: {created} of {CREATORS} concurrent NSNEW calls were told OK \
-             (the check-then-insert race in create_namespace)"
-        );
     }
 
     // One namespace, once, and it works.
@@ -320,17 +316,40 @@ fn concurrent_creates_of_one_namespace_leave_one_namespace() {
     assert_eq!(read, "the namespace works");
 
     // Sequentially, with no race to lose: the second caller is refused, and
-    // the namespace it collided with keeps its contents.
-    //
-    // The message is "Namespace not found", which is the wrong sentence for
-    // "a namespace of that name already exists" -- `create_namespace` returns
-    // `StorageError::NamespaceNotFound` for both. Pinned as it is; the text
-    // is what a client sees.
+    // the namespace it collided with keeps its contents. The refusal says
+    // what happened -- it used to say "Namespace not found" about a namespace
+    // that was right there.
     let err = redis::cmd("NSNEW")
         .arg("contested")
         .query::<String>(&mut setup)
         .expect_err("a namespace cannot be created twice");
-    assert!(format!("{err}").contains("Namespace not found"), "{err}");
+    assert!(
+        format!("{err}").contains("namespace contested already exists"),
+        "{err}"
+    );
     let read: String = redis::cmd("GET").arg("proof").query(&mut setup).unwrap();
     assert_eq!(read, "the namespace works", "and nothing was reset");
+
+    // And a namespace an NSSET has configured cannot be reset by a late
+    // NSNEW: the claim is a claim, whenever it arrives.
+    let _: String = redis::cmd("NSSET")
+        .arg("contested")
+        .arg("worm")
+        .arg("1")
+        .query(&mut setup)
+        .expect("the namespace is configurable");
+    assert!(
+        redis::cmd("NSNEW")
+            .arg("contested")
+            .query::<String>(&mut setup)
+            .is_err()
+    );
+    let info: String = redis::cmd("NSINFO")
+        .arg("contested")
+        .query(&mut setup)
+        .unwrap();
+    assert!(
+        info.contains("worm: yes"),
+        "a refused NSNEW writes no default record: {info}"
+    );
 }
