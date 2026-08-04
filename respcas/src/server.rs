@@ -339,6 +339,17 @@ impl Session {
 
     /// AUTH: verify the admin password and, on success, rebind the handler so
     /// it sees the connection's new admin status.
+    ///
+    /// The two authentications are orthogonal and stay that way: AUTH says
+    /// who the connection is to the DAEMON, and `SELECT <ns> <password>` says
+    /// what it may do in a namespace. So the rebuild carries the namespace
+    /// authentication across rather than recomputing it -- `CommandHandler::new`
+    /// derives it from whether the namespace has a password at all, which for
+    /// a namespace that has one is "no", and authenticating as admin would
+    /// silently revoke access a SELECT had granted.
+    ///
+    /// It does not GRANT namespace access either: an admin that never gave
+    /// the namespace password is still not authenticated for it.
     fn authenticate(&mut self, password: String) -> Frame {
         debug!("Handling AUTH command");
 
@@ -361,12 +372,15 @@ impl Session {
             .get_or_create(self.conn.get_namespace())
         {
             Ok(namespace) => {
-                self.handler = CommandHandler::new(
+                let namespace_authenticated = self.handler.namespace_authenticated();
+                let mut new_handler = CommandHandler::new(
                     self.storage.clone(),
                     namespace,
                     self.namespace_cache.clone(),
                     self.conn.is_admin(),
                 );
+                new_handler.set_namespace_authenticated(namespace_authenticated);
+                self.handler = new_handler;
                 Frame::SimpleString("OK".into())
             }
             Err(e) => {

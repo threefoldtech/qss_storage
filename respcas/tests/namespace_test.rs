@@ -369,24 +369,18 @@ fn the_namespace_commands_split_along_the_admin_line() {
     );
 }
 
-/// KNOWN DEVIATION, pinned as it behaves: AUTH rebuilds the connection's
-/// handler from scratch, and the rebuild recomputes namespace authentication
-/// from whether the namespace has a password at all -- so authenticating as
-/// ADMIN silently REVOKES the namespace authentication a `SELECT <ns>
-/// <password>` had granted, and the connection's writes start being refused.
+/// The two authentications are orthogonal: AUTH neither revokes nor grants
+/// what a `SELECT <ns> <password>` decided.
 ///
-/// The cause is `server.rs::authenticate`, which calls
-/// `CommandHandler::new` (whose constructor sets `namespace_authenticated =
-/// meta.password.is_none()`) without carrying the old handler's
-/// authentication across, the way `select_namespace` does with
-/// `set_namespace_authenticated`.
-///
-/// Not fixed here: it is observable behaviour on the wire, and which way it
-/// should go -- admin implies namespace access, or the two stay orthogonal
-/// and AUTH preserves what SELECT granted -- is a decision, not a bug fix.
-/// The intended behaviour is the ignored test below.
+/// AUTH rebuilds the connection's handler, and the rebuild used to recompute
+/// namespace authentication from whether the namespace has a password at all
+/// -- which for a namespace that has one is "not authenticated". So
+/// authenticating as ADMIN silently revoked the access a SELECT had granted
+/// and the connection's writes started being refused. Both directions are
+/// pinned here: what SELECT granted survives, and what it did not grant is
+/// not conjured up by being admin.
 #[test]
-fn authenticating_as_admin_drops_the_namespace_authentication() {
+fn authenticating_as_admin_leaves_the_namespace_authentication_where_it_was() {
     let server = TestServer::new_with_admin(Some("admin123".to_string()));
     let mut conn = server.connect();
 
@@ -405,29 +399,45 @@ fn authenticating_as_admin_drops_the_namespace_authentication() {
     let authed: String = redis::cmd("AUTH").arg("admin123").query(&mut conn).unwrap();
     assert_eq!(authed, "OK");
 
-    let err = redis::cmd("SET")
+    let _: String = redis::cmd("SET")
         .arg("after")
         .arg("written after re-authenticating")
-        .query::<String>(&mut conn)
-        .expect_err("this is the deviation: the namespace authentication is gone");
+        .query(&mut conn)
+        .expect("AUTH must not revoke what SELECT granted");
+    let value: String = redis::cmd("GET").arg("before").query(&mut conn).unwrap();
+    assert_eq!(value, "written while authenticated");
+
+    // The other direction, on a connection that never gave the namespace
+    // password: being admin is not being authenticated for a namespace.
+    let mut other = server.connect();
+    assert_eq!(select(&mut other, "guarded"), "OK (read-only access)");
+    let authed: String = redis::cmd("AUTH")
+        .arg("admin123")
+        .query(&mut other)
+        .unwrap();
+    assert_eq!(authed, "OK");
+    let err = redis::cmd("SET")
+        .arg("by-the-admin")
+        .arg("without the namespace password")
+        .query::<String>(&mut other)
+        .expect_err("admin is not a namespace password");
     assert!(
         format!("{err}").contains("Authentication required for write operations"),
         "{err}"
     );
 
-    // Nothing was lost, and SELECTing again with the password restores it.
-    assert_eq!(select_with(&mut conn, "guarded", "s3cret"), "OK");
-    let value: String = redis::cmd("GET").arg("before").query(&mut conn).unwrap();
-    assert_eq!(value, "written while authenticated");
+    // And it is still one SELECT away.
+    assert_eq!(select_with(&mut other, "guarded", "s3cret"), "OK");
+    let _: String = redis::cmd("SET")
+        .arg("by-the-admin")
+        .arg("with the namespace password")
+        .query(&mut other)
+        .expect("the password is what grants it, whoever is asking");
 }
 
-/// What AUTH should leave behind: the namespace access a SELECT already
-/// granted on this connection.
-///
-/// Ignored because it contradicts the test above, which is what the daemon
-/// does today; making this one pass is a behaviour change on the wire.
+/// What AUTH leaves behind: the namespace access a SELECT already granted on
+/// this connection.
 #[test]
-#[ignore = "AUTH rebuilds the handler and drops namespace authentication; changing that is a behaviour decision"]
 fn authenticating_as_admin_should_keep_the_namespace_authentication() {
     let server = TestServer::new_with_admin(Some("admin123".to_string()));
     let mut conn = server.connect();

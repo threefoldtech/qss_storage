@@ -476,6 +476,15 @@ impl CommandHandler {
         self.namespace_authenticated = authenticated;
         debug!("Set namespace authentication status to {}", authenticated);
     }
+
+    /// Whether this connection is authenticated for the namespace it is on.
+    ///
+    /// Read by the session when it rebuilds the handler for a reason that is
+    /// not a namespace change -- AUTH -- so that what a `SELECT <ns> <password>`
+    /// granted survives the rebuild.
+    pub(crate) fn namespace_authenticated(&self) -> bool {
+        self.namespace_authenticated
+    }
     /// Execute a command and return the response frame
     ///
     /// Async since ADR 0014: the storage paths a command can reach are the
