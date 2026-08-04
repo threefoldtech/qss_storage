@@ -50,6 +50,7 @@ use super::buffered_byte_stream::BufferedByteStream;
 use super::byte_stream::AsyncByteStream;
 use super::delete_path::release_blocks;
 use super::fs::CasFS;
+use super::object_key;
 use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{
     BlockId, ContentHash, MetaError, MetaStore, Object, ObjectData, Transaction,
@@ -602,11 +603,11 @@ pub(super) fn record_entry(tx: &mut Transaction, entry: &BatchEntry) -> Result<b
     Ok(inserted)
 }
 
-#[tracing::instrument(skip(fs, data), fields(bucket = %bucket_name, key = %key, size, blocks))]
+#[tracing::instrument(skip(fs, key, data), fields(bucket = %bucket_name, key = %object_key(key), size, blocks))]
 pub(super) async fn store_object(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
     data: AsyncByteStream,
 ) -> io::Result<(Vec<BlockId>, ContentHash, u64)> {
     let mut content_hash = Md5::new();
@@ -661,14 +662,14 @@ pub(super) async fn store_object(
 pub(super) async fn store_single_object_and_meta(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
     data: AsyncByteStream,
     len: usize,
 ) -> io::Result<Object> {
     let (blocks, content_hash, size) = if len > 0 {
         store_object(fs, bucket_name, key, data).await?
     } else {
-        tracing::warn!(%key, "Skipping store for empty blob");
+        tracing::warn!(key = %object_key(key), "Skipping store for empty blob");
         // An empty object still has a content hash: the MD5 of no bytes,
         // which is the ETag d41d8cd98f00b204e9800998ecf8427e that clients
         // expect for a zero-length object.
@@ -698,7 +699,7 @@ pub(super) async fn store_single_object_and_meta(
 fn replace_object_record(
     namespace: &MetaStore,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
     raw_obj: Vec<u8>,
 ) -> Result<Option<Object>, MetaError> {
     let mut tx = namespace.begin_transaction();
@@ -752,7 +753,7 @@ fn replace_object_record(
 pub(super) async fn create_object_meta(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
     size: u64,
     hash: ContentHash,
     object_data: ObjectData,
@@ -766,7 +767,7 @@ pub(super) async fn create_object_meta(
         if !blocks.is_empty() {
             tracing::debug!(
                 bucket = %bucket_name,
-                key = %key,
+                key = %object_key(key),
                 blocks = blocks.len(),
                 "Overwrite: releasing the replaced object's blocks"
             );
@@ -789,7 +790,7 @@ pub(super) async fn create_object_meta(
 pub(super) async fn store_inlined_object(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
     data: Vec<u8>,
 ) -> Result<Object, MetaError> {
     let content_hash = ContentHash(Md5::digest(&data).into());
@@ -1401,7 +1402,7 @@ mod tests {
             Err(io::Error::other("the client went away")),
         ]));
 
-        let err = store_object(&fs, BUCKET, "never", stream)
+        let err = store_object(&fs, BUCKET, b"never", stream)
             .await
             .expect_err("a stream error must fail the request");
         assert!(err.to_string().contains("the client went away"), "{err}");
@@ -1523,7 +1524,7 @@ mod tests {
             let data = distinct_blocks(&format!("part-{part}"), 2);
             let stream =
                 AsyncByteStream::new(futures::stream::once(async move { Ok(Bytes::from(data)) }));
-            store_object(&fs, BUCKET, "multi", stream).await.unwrap();
+            store_object(&fs, BUCKET, b"multi", stream).await.unwrap();
         }
 
         assert_eq!(

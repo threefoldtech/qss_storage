@@ -4,7 +4,7 @@ use crate::metastore::{MetaError, Object};
 pub(super) fn get_object_meta(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
 ) -> Result<Option<Object>, MetaError> {
     fs.namespace.get_meta(bucket_name, key)
 }
@@ -12,7 +12,7 @@ pub(super) fn get_object_meta(
 pub(super) fn get_object_paths(
     fs: &CasFS,
     bucket_name: &str,
-    key: &str,
+    key: &[u8],
 ) -> Result<Option<ObjectPaths>, MetaError> {
     let Some(obj_meta) = get_object_meta(fs, bucket_name, key)? else {
         return Ok(None);

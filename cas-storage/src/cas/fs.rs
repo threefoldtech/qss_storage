@@ -183,6 +183,34 @@ impl CasFS {
         Self::new(meta_path, shared, metrics, opts)
     }
 
+    /// Build a `CasFS` over a namespace metadata store that is already open.
+    ///
+    /// The seam respcas needs (ADR 0014). Its store is one `MetaStore` whose
+    /// buckets are namespaces, opened by respcas itself because its data
+    /// directory has a layout of its own (and a legacy shape to keep
+    /// opening), so it cannot go through [`CasFS::new`] -- which would open a
+    /// second database beside the one it already holds. What it needs is the
+    /// block engine bolted onto the store it has.
+    ///
+    /// `namespace` must be the store's OWN metadata database -- the one
+    /// holding `_BUCKETS` and the per-bucket object trees -- and `shared` the
+    /// block store paired with it. Nothing here can check that pairing, which
+    /// is why every other caller goes through the constructors that establish
+    /// it.
+    pub fn over_namespace(
+        namespace: MetaStore,
+        shared: Arc<SharedBlockStore>,
+        metrics: SharedMetrics,
+        verify_on_read: bool,
+    ) -> Self {
+        Self {
+            namespace,
+            shared,
+            metrics,
+            verify_on_read,
+        }
+    }
+
     /// The hash function this filesystem addresses blocks with, taken from the
     /// block store's header at open.
     pub fn hasher(&self) -> crate::hasher::Hasher {
@@ -257,29 +285,37 @@ impl CasFS {
     pub async fn create_object_meta(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
         size: u64,
         hash: ContentHash,
         object_data: ObjectData,
     ) -> Result<Object, MetaError> {
-        super::write_path::create_object_meta(self, bucket_name, key, size, hash, object_data).await
+        super::write_path::create_object_meta(
+            self,
+            bucket_name,
+            key.as_ref(),
+            size,
+            hash,
+            object_data,
+        )
+        .await
     }
 
     // get meta object from the DB
     pub fn get_object_meta(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
     ) -> Result<Option<Object>, MetaError> {
-        super::read_path::get_object_meta(self, bucket_name, key)
+        super::read_path::get_object_meta(self, bucket_name, key.as_ref())
     }
 
     pub fn get_object_paths(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
     ) -> Result<Option<ObjectPaths>, MetaError> {
-        super::read_path::get_object_paths(self, bucket_name, key)
+        super::read_path::get_object_paths(self, bucket_name, key.as_ref())
     }
 
     // create and insert a new  bucket
@@ -481,8 +517,8 @@ impl CasFS {
         mp_map.remove(&storage_key)
     }
 
-    pub fn key_exists(&self, bucket: &str, key: &str) -> Result<bool, MetaError> {
-        super::buckets::key_exists(self, bucket, key)
+    pub fn key_exists(&self, bucket: &str, key: impl AsRef<[u8]>) -> Result<bool, MetaError> {
+        super::buckets::key_exists(self, bucket, key.as_ref())
     }
 
     /// Get a list of all buckets in the system.
@@ -492,19 +528,24 @@ impl CasFS {
 
     /// Delete an object from a bucket.
     /// it also delete keys under it's tree
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), MetaError> {
-        super::delete_path::delete_object(self, bucket, key).await
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        key: impl AsRef<[u8]>,
+    ) -> Result<(), MetaError> {
+        super::delete_path::delete_object(self, bucket, key.as_ref()).await
     }
 
     // convenient function to store an object to disk and then store it's metada
     pub async fn store_single_object_and_meta(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
         data: AsyncByteStream,
         len: usize,
     ) -> io::Result<Object> {
-        super::write_path::store_single_object_and_meta(self, bucket_name, key, data, len).await
+        super::write_path::store_single_object_and_meta(self, bucket_name, key.as_ref(), data, len)
+            .await
     }
 
     /// Save the stream of bytes to disk.
@@ -517,10 +558,10 @@ impl CasFS {
     pub async fn store_object(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
         data: AsyncByteStream,
     ) -> io::Result<(Vec<BlockId>, ContentHash, u64)> {
-        super::write_path::store_object(self, bucket_name, key, data).await
+        super::write_path::store_object(self, bucket_name, key.as_ref(), data).await
     }
 
     /// Store an object inlined in its own metadata record.
@@ -532,10 +573,10 @@ impl CasFS {
     pub async fn store_inlined_object(
         &self,
         bucket_name: &str,
-        key: &str,
+        key: impl AsRef<[u8]>,
         data: Vec<u8>,
     ) -> Result<Object, MetaError> {
-        super::write_path::store_inlined_object(self, bucket_name, key, data).await
+        super::write_path::store_inlined_object(self, bucket_name, key.as_ref(), data).await
     }
 }
 

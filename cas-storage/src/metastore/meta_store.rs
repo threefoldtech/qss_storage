@@ -352,13 +352,15 @@ impl MetaStore {
     ///
     /// # Arguments
     /// * `bucket_name` - The name of the bucket
-    /// * `key` - The key to look up
+    /// * `key` - The key to look up, as bytes: an S3 key is text, but a
+    ///   respcas Cas namespace keys its records by the raw BLAKE3 of the
+    ///   value (ADR 0014), which is not.
     ///
     /// # Returns
     /// The Object if found, None if the key doesn't exist, or an error
-    pub fn get_meta(&self, bucket_name: &str, key: &str) -> Result<Option<Object>, MetaError> {
+    pub fn get_meta(&self, bucket_name: &str, key: &[u8]) -> Result<Option<Object>, MetaError> {
         let bucket = self.get_bucket_ext(bucket_name)?;
-        match bucket.get(key.as_bytes())? {
+        match bucket.get(key)? {
             Some(data) => {
                 let obj = Object::try_from(&*data)?;
                 Ok(Some(obj))
@@ -605,12 +607,12 @@ impl Transaction {
     ///
     /// Returns the removed object, or `None` (and no change) if the key was
     /// absent -- DELETE is idempotent.
-    pub fn take_object(&mut self, bucket: &str, key: &str) -> Result<Option<Object>, MetaError> {
-        let Some(raw) = self.backend.get(bucket, key.as_bytes())? else {
+    pub fn take_object(&mut self, bucket: &str, key: &[u8]) -> Result<Option<Object>, MetaError> {
+        let Some(raw) = self.backend.get(bucket, key)? else {
             return Ok(None);
         };
         let obj = Object::try_from(&*raw)?;
-        self.backend.remove(bucket, key.as_bytes())?;
+        self.backend.remove(bucket, key)?;
         Ok(Some(obj))
     }
 
@@ -648,14 +650,14 @@ impl Transaction {
     pub fn replace_object(
         &mut self,
         bucket: &str,
-        key: &str,
+        key: &[u8],
         raw_obj: Vec<u8>,
     ) -> Result<Option<Object>, MetaError> {
-        let displaced = match self.backend.get(bucket, key.as_bytes())? {
+        let displaced = match self.backend.get(bucket, key)? {
             Some(raw) => Some(Object::try_from(&*raw)?),
             None => None,
         };
-        self.backend.insert(bucket, key.as_bytes(), raw_obj)?;
+        self.backend.insert(bucket, key, raw_obj)?;
         Ok(displaced)
     }
 
@@ -1152,7 +1154,7 @@ mod tests {
     }
 
     fn stored_object(meta: &MetaStore, bucket: &str, key: &str) -> Option<Object> {
-        meta.get_meta(bucket, key).unwrap()
+        meta.get_meta(bucket, key.as_bytes()).unwrap()
     }
 
     /// A replace onto a free key displaces nothing, and the record it wrote
@@ -1163,7 +1165,7 @@ mod tests {
         let fresh = object(0x01, vec![BlockId::from([0x11u8; BLOCKID_SIZE])]);
 
         let mut tx = meta.begin_transaction();
-        let displaced = tx.replace_object("photos", "a", fresh.to_vec()).unwrap();
+        let displaced = tx.replace_object("photos", b"a", fresh.to_vec()).unwrap();
         tx.commit().unwrap();
 
         assert!(displaced.is_none(), "nothing was there to displace");
@@ -1182,11 +1184,11 @@ mod tests {
         let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
 
         let mut tx = meta.begin_transaction();
-        tx.replace_object("photos", "a", old.to_vec()).unwrap();
+        tx.replace_object("photos", b"a", old.to_vec()).unwrap();
         tx.commit().unwrap();
 
         let mut tx = meta.begin_transaction();
-        let displaced = tx.replace_object("photos", "a", new.to_vec()).unwrap();
+        let displaced = tx.replace_object("photos", b"a", new.to_vec()).unwrap();
         tx.commit().unwrap();
 
         assert_eq!(
@@ -1214,7 +1216,7 @@ mod tests {
         for tag in 1u8..=4 {
             let next = object(tag, vec![BlockId::from([tag; BLOCKID_SIZE])]);
             let mut tx = meta.begin_transaction();
-            let displaced = tx.replace_object("photos", "a", next.to_vec()).unwrap();
+            let displaced = tx.replace_object("photos", b"a", next.to_vec()).unwrap();
             tx.commit().unwrap();
 
             match (&previous, &displaced) {
@@ -1245,11 +1247,11 @@ mod tests {
         let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
 
         let mut tx = meta.begin_transaction();
-        tx.replace_object("photos", "a", old.to_vec()).unwrap();
+        tx.replace_object("photos", b"a", old.to_vec()).unwrap();
         tx.commit().unwrap();
 
         let mut tx = meta.begin_transaction();
-        tx.replace_object("photos", "a", new.to_vec()).unwrap();
+        tx.replace_object("photos", b"a", new.to_vec()).unwrap();
         tx.rollback();
 
         assert_eq!(
@@ -1272,7 +1274,7 @@ mod tests {
 
         let new = object(0x02, vec![BlockId::from([0x22u8; BLOCKID_SIZE])]);
         let mut tx = meta.begin_transaction();
-        assert!(tx.replace_object("photos", "a", new.to_vec()).is_err());
+        assert!(tx.replace_object("photos", b"a", new.to_vec()).is_err());
         tx.rollback();
 
         assert_eq!(

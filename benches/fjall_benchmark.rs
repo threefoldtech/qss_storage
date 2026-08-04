@@ -161,7 +161,7 @@ fn bench_get_meta(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("FjallStore", "get_meta"), |b| {
             b.iter(|| {
                 let key = format!("key-{}", rand::rng().random::<u8>() % 100);
-                black_box(store.get_meta(bucket_name, &key)).unwrap();
+                black_box(store.get_meta(bucket_name, key.as_bytes())).unwrap();
             });
         });
     }
@@ -244,7 +244,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 // Read some objects
                 for i in 0..5 {
                     let key = format!("key-{i}");
-                    black_box(store.get_meta(&bucket_name, &key)).unwrap();
+                    black_box(store.get_meta(&bucket_name, key.as_bytes())).unwrap();
                 }
 
                 // List buckets

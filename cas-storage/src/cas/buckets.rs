@@ -23,7 +23,7 @@ pub(super) fn get_bucket(
     fs.namespace.get_bucket_ext(bucket_name)
 }
 
-pub(super) fn key_exists(fs: &CasFS, bucket: &str, key: &str) -> Result<bool, MetaError> {
+pub(super) fn key_exists(fs: &CasFS, bucket: &str, key: &[u8]) -> Result<bool, MetaError> {
     let bucket = get_bucket(fs, bucket)?;
-    bucket.contains_key(key.as_bytes())
+    bucket.contains_key(key)
 }

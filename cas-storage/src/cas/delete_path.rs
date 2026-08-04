@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use super::fs::CasFS;
+use super::object_key;
 use super::shared_block_store::SharedBlockStore;
 use crate::metastore::{BlockDecrement, BlockId, MetaError};
 use crate::metrics::SharedMetrics;
@@ -132,8 +133,8 @@ pub(crate) async fn release_blocks(
     }
 }
 
-#[tracing::instrument(skip(fs), fields(bucket = %bucket, key = %key, blocks_deleted))]
-pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &str) -> Result<(), MetaError> {
+#[tracing::instrument(skip(fs, key), fields(bucket = %bucket, key = %object_key(key), blocks_deleted))]
+pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Result<(), MetaError> {
     // Step 1: atomically take the object record out of the namespace DB.
     // An absent key deletes nothing and is not an error (idempotent).
     let mut tx = fs.namespace.begin_transaction();
@@ -170,12 +171,7 @@ pub(super) async fn bucket_delete(fs: &CasFS, bucket_name: &str) -> Result<(), M
     let mut object_count = 0;
     for key_val in bucket.iter_all() {
         let (key, _) = key_val?;
-        delete_object(
-            fs,
-            bucket_name,
-            std::str::from_utf8(&key).expect("keys are valid utf-8"),
-        )
-        .await?;
+        delete_object(fs, bucket_name, &key).await?;
         object_count += 1;
     }
 
