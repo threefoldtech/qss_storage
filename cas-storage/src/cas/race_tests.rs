@@ -520,10 +520,20 @@ async fn an_overwrite_races_a_reader_exactly_as_a_delete_does() {
     }
 }
 
-/// Counts exclusive-create file writes; everything else is real.
+/// Counts the two file operations the block protocol distinguishes:
+/// exclusive-create writes (a staged temp file, or the overtake rewrite) and
+/// renames (a file PLACED at its final path). Everything else is real.
+///
+/// The two are counted apart because only one of them is deterministic. A
+/// write is spent on a bet -- the unstriped dedup lookup -- that a racing
+/// writer can lose; a rename happens under the block's stripe, after the
+/// in-transaction decision, and so happens exactly once per block that this
+/// store did not already have. See
+/// [`n_concurrent_puts_of_one_new_block`].
 #[derive(Debug)]
 struct CountingOps {
     writes: AtomicUsize,
+    lands: AtomicUsize,
     real: RealDiskOps,
 }
 
@@ -531,6 +541,7 @@ impl CountingOps {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             writes: AtomicUsize::new(0),
+            lands: AtomicUsize::new(0),
             real: RealDiskOps,
         })
     }
@@ -551,6 +562,7 @@ impl BlockDiskOps for CountingOps {
         self.real.fsync_dir(path)
     }
     fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        self.lands.fetch_add(1, Ordering::SeqCst);
         self.real.rename(from, to)
     }
     fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -564,9 +576,43 @@ impl BlockDiskOps for CountingOps {
     }
 }
 
-/// N concurrent PUTs of one brand-new block: exactly one file write hits
-/// the disk (the stripe serializes; every later writer sees the record and
-/// bumps), and at quiesce rc == N.
+/// N concurrent PUTs of one brand-new block: exactly one file is PLACED,
+/// at quiesce rc == N, and the wasted work is bounded by one staged temp
+/// file per writer.
+///
+/// # Why the write count is a bound and the placement count is not
+///
+/// The dedup lookup that decides whether to spend a file write is
+/// deliberately unstriped and outside any transaction (`resolve_chunk`):
+/// it decides only whether to spend a 1 MiB write, and the authoritative
+/// insert-vs-bump decision is remade later, inside the batch's
+/// transaction, under the block's stripe, against whatever state is
+/// current then. So a writer whose lookup runs before the winner's
+/// transaction commits misses, stages a temp file of its own -- and then,
+/// under the stripe, finds the record live, discards that temp file
+/// UNRENAMED, and bumps. ADR 0010 names this interleaving in as many words
+/// ("Two concurrent batches both contain block X, both new"): the loser's
+/// file is surplus, and dropping it is the whole compensation.
+///
+/// The write count is therefore a race outcome -- one write per writer
+/// whose lookup lost -- bounded by one per request, because a request's
+/// entry for a block either stages (and never rewrites) or dedups (and
+/// rewrites only if the record it deduped against is gone by commit time,
+/// which needs a concurrent DELETE this test does not have). Asserting
+/// `== 1` was asserting a scheduler outcome: at idle it never missed, but
+/// with 32 busy loops on 32 cores an instrumented replay of this exact
+/// scenario spent a second write in 31 of 1500 iterations (2%, 29 of them
+/// at two writes and one at three) -- which is why the pre-push hook, whose
+/// clippy build saturates the cores just before the tests run, was the best
+/// reproducer in the tree.
+///
+/// What is NOT a race, and is asserted exactly: rc == N, and one file
+/// placed. Both hold because every rc mutation and every rename happens
+/// under this block's one stripe, so the writers are a queue -- the first
+/// lands the file and inserts at rc 1, and each one after it sees the
+/// committed record and bumps. All 31 double-write iterations landed
+/// exactly one file and finished at rc exactly 16: the surplus is a wasted
+/// temp write, never a wasted or a missing reference.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn n_concurrent_puts_of_one_new_block() {
     const N: usize = 16;
@@ -590,11 +636,8 @@ async fn n_concurrent_puts_of_one_new_block() {
         t.await.unwrap();
     }
 
-    assert_eq!(
-        ops.writes.load(Ordering::SeqCst),
-        1,
-        "exactly one file write for one block, however many writers"
-    );
+    // The exact half first, so a run that breaks the accounting says so
+    // rather than being pre-empted by the bounded half.
     let block = shared
         .block_tree()
         .get_block(id.as_slice())
@@ -605,6 +648,18 @@ async fn n_concurrent_puts_of_one_new_block() {
         block
             .disk_path(&id, namespaces[0].fs_root().clone())
             .is_file()
+    );
+    assert_eq!(
+        ops.lands.load(Ordering::SeqCst),
+        1,
+        "exactly one file placed for one block, however many writers"
+    );
+
+    // The bounded half: surplus staged files are allowed, and bounded.
+    let writes = ops.writes.load(Ordering::SeqCst);
+    assert!(
+        (1..=N).contains(&writes),
+        "one write per writer that lost the dedup lookup, at most: got {writes}"
     );
 }
 
