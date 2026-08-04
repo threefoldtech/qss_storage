@@ -556,13 +556,18 @@ impl CasFS {
         .await
     }
 
-    /// Delete an object from a bucket.
-    /// it also delete keys under it's tree
+    /// Delete an object from a bucket, answering whether a record was there
+    /// to delete. It also deletes the keys under its tree.
+    ///
+    /// Idempotent: an absent key is `Ok(false)`, not an error. The answer
+    /// comes out of the same transaction that took the record, so it is the
+    /// count a Redis-style DEL reply needs (respcas, ADR 0014) rather than a
+    /// separate lookup that could race with another deleter.
     pub async fn delete_object(
         &self,
         bucket: &str,
         key: impl AsRef<[u8]>,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         super::delete_path::delete_object(self, bucket, key.as_ref()).await
     }
 

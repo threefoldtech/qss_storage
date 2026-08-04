@@ -134,7 +134,7 @@ pub(crate) async fn release_blocks(
 }
 
 #[tracing::instrument(skip(fs, key), fields(bucket = %bucket, key = %object_key(key), blocks_deleted))]
-pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Result<(), MetaError> {
+pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Result<bool, MetaError> {
     // Step 1: atomically take the object record out of the namespace DB.
     // An absent key deletes nothing and is not an error (idempotent).
     let mut tx = fs.namespace.begin_transaction();
@@ -150,7 +150,7 @@ pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Resul
     };
     let Some(obj) = obj else {
         tracing::Span::current().record("blocks_deleted", 0);
-        return Ok(());
+        return Ok(false);
     };
 
     tracing::Span::current().record("blocks_deleted", obj.blocks().len());
@@ -159,7 +159,7 @@ pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Resul
     // record first, release second (see release_blocks).
     release_blocks(&fs.shared, &fs.metrics, obj.blocks()).await;
 
-    Ok(())
+    Ok(true)
 }
 
 #[tracing::instrument(skip(fs), fields(bucket = %bucket_name, objects_deleted))]

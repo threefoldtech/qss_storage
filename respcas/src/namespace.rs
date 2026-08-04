@@ -3,12 +3,16 @@ use std::sync::RwLock;
 use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{StreamExt, stream};
 use md5::{Digest, Md5};
 use tracing::debug;
 
 use crate::storage::{KeyMode, Storage, StorageError};
-use cas_storage::{ContentHash, MetaError, MetaTreeExt, Object, ObjectData};
+use cas_storage::{
+    AsyncByteStream, BlockStream, CasFS, ContentHash, MetaError, MetaTreeExt, Object, ObjectData,
+    RangeRequest, SharedMetrics,
+};
 
 /// Properties for a namespace
 #[derive(Debug, Clone)]
@@ -46,6 +50,10 @@ pub struct Namespace {
     pub tree: RwLock<Arc<dyn MetaTreeExt + Send + Sync>>,
     /// Properties for this namespace
     pub properties: RwLock<NamespaceProperties>,
+    /// The block engine, for the paths that are not a single record: the
+    /// ADR 0006 write path, the block-backed read, and the rc release a
+    /// DELETE owes (ADR 0014). A namespace is a bucket to it.
+    cas: CasFS,
 }
 
 /// A cache for namespace instances to allow sharing between clients
@@ -89,6 +97,7 @@ impl NamespaceCache {
         let namespace = Arc::new(Namespace {
             tree: RwLock::new(tree),
             properties: RwLock::new(props),
+            cas: self.storage.cas().clone(),
         });
 
         // Sync properties with metadata
@@ -137,6 +146,7 @@ impl NamespaceCache {
                 let namespace = Arc::new(Namespace {
                     tree: RwLock::new(tree),
                     properties: RwLock::new(props),
+                    cas: self.storage.cas().clone(),
                 });
 
                 // Sync properties with metadata
@@ -223,33 +233,93 @@ impl Namespace {
         Ok(())
     }
 
-    pub fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
-        // Read namespace properties
+    /// This namespace's name, which is also its bucket name in the store.
+    pub fn name(&self) -> String {
+        self.properties.read().unwrap().namespace_name.clone()
+    }
+
+    /// What a key means here (ADR 0014).
+    pub fn key_mode(&self) -> KeyMode {
+        self.properties.read().unwrap().key_mode
+    }
+
+    /// Refuses the write if the namespace is not accepting one.
+    ///
+    /// `worm_guards_key` is the key a WORM namespace must not already hold.
+    /// `None` skips that check, which is what a content-addressed write
+    /// passes: its "overwrite" cannot change a byte -- the key IS the
+    /// content -- so an already-present address is an acknowledgement rather
+    /// than a modification, and refusing it would break the probe-then-store
+    /// workflow WORM exists to make safe.
+    fn refuse_unless_writable(&self, worm_guards_key: Option<&[u8]>) -> Result<()> {
         let props = self.properties.read().unwrap();
 
-        // Check if namespace is locked
         if props.locked {
             return Err(anyhow::anyhow!(
                 "ERR: Namespace is temporarily locked (read-only)"
             ));
         }
 
-        // Check if namespace is in WORM mode and key already exists
-        if props.worm {
-            // In WORM mode, check if key already exists
-            if self.exists(key)? {
-                return Err(anyhow::anyhow!("ERR: Namespace is protected by worm mode"));
-            }
+        let occupied = match worm_guards_key {
+            Some(key) => self.exists(key)?,
+            None => false,
+        };
+        if props.worm && occupied {
+            return Err(anyhow::anyhow!("ERR: Namespace is protected by worm mode"));
         }
+
+        Ok(())
+    }
+
+    pub fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
+        self.refuse_unless_writable(Some(key))?;
 
         // Note: Authentication check is now handled by the CommandHandler
 
-        // Proceed with setting the key
+        // Proceed with setting the key. A user-keyed namespace inlines every
+        // value whatever its size, exactly as respcas always has: the block
+        // path is the content-addressed namespaces' (ADR 0014), and giving
+        // it to this one would change the durability and latency of writes
+        // no client asked to change.
         let data = value.to_vec();
         let hash = ContentHash(Md5::digest(&data).into());
         let size = data.len() as u64;
         let obj_meta = Object::new(size, hash, ObjectData::Inline { data });
         self.tree.read().unwrap().insert(key, obj_meta.to_vec())?;
+        Ok(())
+    }
+
+    /// Writes `value` under `key` in a content-addressed namespace, where
+    /// `key` is known to be the BLAKE3-256 of `value` (ADR 0014).
+    ///
+    /// Values at or below the inline threshold stay in their own record,
+    /// exactly as a user-keyed write does; above it the value goes through
+    /// the ADR 0006 block write path and the record names blocks. The
+    /// threshold is the store's (`store.inline_metadata_size`), so one knob
+    /// governs both faces of the workspace.
+    ///
+    /// Only [`crate::content::ingest`] may call this: it is the code that
+    /// has established that the key is the value's address.
+    pub async fn store_verified(&self, key: &[u8], value: Bytes) -> Result<()> {
+        self.refuse_unless_writable(None)?;
+
+        let bucket = self.name();
+        if value.len() <= self.cas.max_inlined_data_length() {
+            self.cas
+                .store_inlined_object(&bucket, key, value.to_vec())
+                .await?;
+            return Ok(());
+        }
+
+        let stream = AsyncByteStream::new(stream::once(async move { Ok(value) }));
+        let (blocks, hash, size) = self.cas.store_object(&bucket, key, stream).await?;
+        // The ETag field of the shared record envelope. In a
+        // content-addressed namespace it carries no authority -- the key is
+        // the stronger digest -- but the envelope has the field and every
+        // other writer fills it in.
+        self.cas
+            .create_object_meta(&bucket, key, size, hash, ObjectData::SinglePart { blocks })
+            .await?;
         Ok(())
     }
 
@@ -264,45 +334,88 @@ impl Namespace {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, MetaError> {
-        let obj_meta = self.get_object(key)?;
-        match obj_meta {
-            Some(obj) => {
-                if let Some(data) = obj.inlined() {
-                    let bytes = bytes::Bytes::from(data.clone());
-                    Ok(Some(bytes))
-                } else {
-                    Err(MetaError::OtherDBError("Object is not inline".to_string()))
-                }
-            }
-            None => Ok(None),
+    /// The whole value of `key`, or `None` if there is no record.
+    ///
+    /// An inline record answers from its own bytes; a block-backed one
+    /// (which only a content-addressed namespace has, ADR 0014) is read from
+    /// the block files and concatenated, because a RESP bulk reply is a
+    /// length-prefixed whole and there is nothing to stream it into.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, MetaError> {
+        let Some(obj) = self.get_object(key)? else {
+            return Ok(None);
+        };
+        if let Some(data) = obj.inlined() {
+            return Ok(Some(Bytes::from(data.clone())));
         }
+        Ok(Some(self.read_blocks(key, &obj).await?))
+    }
+
+    /// Reads a block-backed record's value whole.
+    ///
+    /// Verification of the blocks against their own addresses is the read
+    /// path's (`store.verify_on_read`); what this adds is nothing, on
+    /// purpose -- CHECK is where a caller asks for the value to be re-hashed
+    /// against its key.
+    async fn read_blocks(&self, key: &[u8], obj: &Object) -> Result<Bytes, MetaError> {
+        let bucket = self.name();
+        let Some((_, paths)) = self.cas.get_object_paths(&bucket, key)? else {
+            return Err(MetaError::OtherDBError(format!(
+                "the record for {} went away while it was being read",
+                crate::content::hex(key)
+            )));
+        };
+
+        let size = obj.size() as usize;
+        let mut stream = BlockStream::new(paths, size, RangeRequest::All, SharedMetrics::default());
+        if self.cas.verify_on_read() {
+            stream = stream.verified(self.cas.hasher(), obj.blocks().to_vec());
+        }
+
+        let mut out = BytesMut::with_capacity(size);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                MetaError::OtherDBError(format!(
+                    "reading the blocks of {}: {e}",
+                    crate::content::hex(key)
+                ))
+            })?;
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out.freeze())
     }
 
     /// Deletes a key, answering whether it existed -- the unit DEL counts.
-    pub fn del(&self, key: &[u8]) -> Result<bool> {
-        // Read namespace properties
-        let props = self.properties.read().unwrap();
+    ///
+    /// A block-backed record's references are dropped as part of the delete
+    /// (ADR 0008's release path), so the blocks of a value nothing else
+    /// holds are freed here and not by a sweep.
+    pub async fn del(&self, key: &[u8]) -> Result<bool> {
+        {
+            // Read namespace properties
+            let props = self.properties.read().unwrap();
 
-        // Check if namespace is locked
-        if props.locked {
-            return Err(anyhow::anyhow!(
-                "ERR: Namespace is temporarily locked (read-only)"
-            ));
-        }
+            // Check if namespace is locked
+            if props.locked {
+                return Err(anyhow::anyhow!(
+                    "ERR: Namespace is temporarily locked (read-only)"
+                ));
+            }
 
-        // Check if namespace is in WORM mode
-        if props.worm {
-            return Err(anyhow::anyhow!(
-                "ERR: Cannot delete a key when namespace is in worm mode"
-            ));
+            // Check if namespace is in WORM mode
+            if props.worm {
+                return Err(anyhow::anyhow!(
+                    "ERR: Cannot delete a key when namespace is in worm mode"
+                ));
+            }
         }
 
         // Note: Authentication check is now handled by the CommandHandler
 
-        // Proceed with deleting the key
-        let existed = self.tree.read().unwrap().remove(key)?;
-        Ok(existed)
+        // Proceed with deleting the key. The record is taken and its blocks
+        // released in the one operation, so the reply counts what this call
+        // removed rather than what a separate lookup saw a moment earlier.
+        let bucket = self.name();
+        Ok(self.cas.delete_object(&bucket, key).await?)
     }
 
     pub fn exists(&self, key: &[u8]) -> Result<bool, MetaError> {
@@ -335,23 +448,34 @@ impl Namespace {
         }
     }
 
-    pub fn check(&self, key: &[u8]) -> Result<Option<bool>, MetaError> {
-        let obj = self.get_object(key)?;
-        match obj {
-            Some(obj) => {
-                if let Some(data) = obj.inlined() {
-                    // check the hash
-                    let hash = ContentHash(Md5::digest(data).into());
-                    if hash != *obj.hash() {
-                        Ok(Some(false))
-                    } else {
-                        Ok(Some(true))
-                    }
-                } else {
-                    Err(MetaError::OtherDBError("Object is not inline".to_string()))
-                }
-            }
-            None => Ok(None),
+    /// Re-hashes a record's value and says whether it still matches.
+    ///
+    /// What it is checked against depends on what the key means (ADR 0014):
+    ///
+    /// - user-keyed: the MD5 the record carries, which is what CHECK has
+    ///   always compared;
+    /// - content-addressed: the KEY, which is the BLAKE3-256 of the value --
+    ///   a strictly stronger check, and the only one that can be made
+    ///   against a block-backed record whose bytes are not in the record.
+    ///
+    /// `None` means there is no such key. Cost is O(size) either way, the
+    /// same class as GET.
+    pub async fn check(&self, key: &[u8]) -> Result<Option<bool>, MetaError> {
+        let Some(obj) = self.get_object(key)? else {
+            return Ok(None);
+        };
+
+        if self.key_mode() == KeyMode::Cas {
+            let value = match obj.inlined() {
+                Some(data) => Bytes::from(data.clone()),
+                None => self.read_blocks(key, &obj).await?,
+            };
+            return Ok(Some(crate::content::value_key(&value) == key));
+        }
+
+        match obj.inlined() {
+            Some(data) => Ok(Some(ContentHash(Md5::digest(data).into()) == *obj.hash())),
+            None => Err(MetaError::OtherDBError("Object is not inline".to_string())),
         }
     }
 

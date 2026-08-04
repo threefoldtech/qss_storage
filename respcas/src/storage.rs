@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -8,10 +8,25 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use cas_storage::metastore::store_header::{self, STORE_HEADER_VERSION_CAS_NAMESPACE};
-use cas_storage::{Durability, FjallStore, HeaderSpec, MetaError, MetaStore, MetaTreeExt};
+use cas_storage::{
+    CasFS, FjallStore, HeaderSpec, MetaError, MetaStore, MetaTreeExt, SharedBlockStore,
+    SharedMetrics, StoreOptions,
+};
 
 // Default tree name for key-value storage
 // No longer using a default tree name as we'll use the namespace as the tree name
+
+/// fjall's own marker file in the root of a database directory. Never a name
+/// respcas writes, so it is what tells a data directory that IS a database
+/// (the layout before ADR 0014) from one that CONTAINS one.
+const FJALL_VERSION_MARKER: &str = "version";
+
+/// Subdirectory of the data directory holding the metadata database.
+const DB_DIR_NAME: &str = "db";
+
+/// Subdirectory of the data directory holding the block store: the block
+/// data files, and the blocks database beneath them.
+const BLOCKS_DIR_NAME: &str = "blocks";
 
 /// Storage implementation using metastore with inlined data
 pub struct Storage {
@@ -19,20 +34,33 @@ pub struct Storage {
     /// The metadata database's own directory: what the QSST header belongs
     /// to, and what a header error names.
     db_path: PathBuf,
+    /// The block engine over that same metadata store (ADR 0014).
+    cas: CasFS,
 }
 
 impl Storage {
     /// Create a new MetaStorage instance, or open the one already at
     /// `data_dir`.
     ///
-    /// respcas never addresses a block, but its DB carries the same QSST header
-    /// as every other store in this workspace: that is what gives it format
-    /// versioning, and what makes a store from before the format refuse to
-    /// open instead of being read as garbage.
+    /// # Layout
     ///
-    /// `durability` and `header` come from the config file merge in `main`;
-    /// `header` applies only if the store is created now, since an existing
-    /// one is opened on the header it already carries.
+    /// Since ADR 0014 a respcas data directory is a standard store: the same
+    /// meta-plus-blocks pair every other store in this workspace is, which is
+    /// what lets fsck and the inspect tooling walk it.
+    ///
+    /// ```text
+    /// <data_dir>/store_header.bin   the sidecar copy of the QSST header
+    /// <data_dir>/db/                the namespace metadata database
+    /// <data_dir>/blocks/            block data files, and blocks/.db
+    /// ```
+    ///
+    /// A store from before that ADR has its metadata database directly in
+    /// `<data_dir>`, and is opened there unchanged -- fjall's own `version`
+    /// marker is what says so. Such a store gains its `blocks/` directory
+    /// additively, inside the database directory (fjall enumerates only its
+    /// own `keyspaces/`, so a directory it did not create is none of its
+    /// business). Nothing is moved and nothing is migrated: a store keeps the
+    /// shape it was created with.
     ///
     /// # Errors
     ///
@@ -43,22 +71,66 @@ impl Storage {
     /// directory open -- a second respcas on the same `--data-dir`. Both errors
     /// reach `main`, which reports them and exits nonzero rather than
     /// panicking.
-    pub fn new(
-        data_dir: PathBuf,
-        inlined_metadata_size: Option<usize>,
-        durability: Durability,
-        header: HeaderSpec,
-    ) -> Result<Self, MetaError> {
+    ///
+    /// [`MetaError::StorePairing`] if the blocks root belongs to another
+    /// store (ADR 0012).
+    pub fn new(data_dir: PathBuf, opts: StoreOptions) -> Result<Self, MetaError> {
+        let db_path = Self::db_path(&data_dir);
+        let inlined_metadata_size = opts.inline_metadata_size;
+
         // Create the metastore with FjallStore backend
-        let (store, _header) =
-            MetaStore::open_or_create(data_dir.clone(), inlined_metadata_size, header, |path| {
-                FjallStore::new(path, inlined_metadata_size, Some(durability))
-            })?;
+        let (store, _header) = MetaStore::open_or_create(
+            db_path.clone(),
+            inlined_metadata_size,
+            HeaderSpec::from(opts.hasher),
+            |path| FjallStore::new(path, inlined_metadata_size, Some(opts.durability)),
+        )?;
+
+        // The block store: one per respcas store, both halves under the data
+        // directory. respcas has no meta-root/data-root split of its own
+        // (ADR 0012's is s3cas's), so the two paths are the same directory --
+        // which is the layout the tools default to, and the one they walk.
+        let blocks = data_dir.join(BLOCKS_DIR_NAME);
+        let shared = Arc::new(SharedBlockStore::new(blocks.clone(), blocks, opts)?);
+
+        // The block engine over the store that is already open: respcas owns
+        // the metadata database (its layout rules are above), so the CasFS is
+        // built on it rather than opening a second one.
+        let cas = CasFS::over_namespace(
+            store.clone(),
+            shared,
+            SharedMetrics::default(),
+            opts.verify_on_read,
+        );
 
         Ok(Self {
             store,
-            db_path: data_dir,
+            db_path,
+            cas,
         })
+    }
+
+    /// Where the metadata database of the store at `data_dir` lives.
+    ///
+    /// `<data_dir>/db` for a store of this format, and `<data_dir>` itself
+    /// for one created before ADR 0014, which put fjall's files straight in
+    /// the data directory. The `version` file is fjall's own and respcas
+    /// never writes a `db` file, so the two shapes are told apart without
+    /// guessing.
+    fn db_path(data_dir: &Path) -> PathBuf {
+        let legacy =
+            data_dir.join(FJALL_VERSION_MARKER).is_file() && !data_dir.join(DB_DIR_NAME).is_dir();
+        if legacy {
+            data_dir.to_path_buf()
+        } else {
+            data_dir.join(DB_DIR_NAME)
+        }
+    }
+
+    /// The block engine: the ADR 0006 write path, the rc lifecycle, and the
+    /// block-backed read path, over this store's namespaces.
+    pub fn cas(&self) -> &CasFS {
+        &self.cas
     }
 
     /// Records in the store's header that it now holds a content-addressed
@@ -113,6 +185,26 @@ impl Storage {
 
         meta.key_mode = key_mode;
         self.update_namespace_meta(name, meta)
+    }
+
+    /// Every namespace whose records are addressed by content (ADR 0014),
+    /// by name.
+    ///
+    /// This is what `presence(H)` enumerates: a hash that is present in one
+    /// Cas namespace names bytes that were verified when they were first
+    /// written, so another Cas namespace may take a reference to them. A
+    /// 32-byte key in a UserKey namespace is a coincidence and is never
+    /// consulted, which is exactly why this list is derived from the key
+    /// mode and not from the key length.
+    pub fn cas_namespaces(&self) -> Result<Vec<String>, StorageError> {
+        let mut names = Vec::new();
+        for meta in self.iter_namespace()? {
+            let meta = meta?;
+            if meta.key_mode == KeyMode::Cas {
+                names.push(meta.name);
+            }
+        }
+        Ok(names)
     }
 
     /// Initialize the default namespace if it doesn't exist

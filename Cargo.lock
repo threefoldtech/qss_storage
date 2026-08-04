@@ -2876,6 +2876,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atoi 3.1.0",
+ "blake3",
  "bytes",
  "cas-storage",
  "clap",

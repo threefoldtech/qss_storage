@@ -4,9 +4,24 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error};
 
+use crate::content::{self, Ingest};
 use crate::namespace::{Namespace, NamespaceCache};
 use crate::property::BoolPropertyValue;
 use crate::storage::{KeyMode, Storage};
+
+/// Keys one SCAN or RSCAN answers with. The cursor of a full page is its
+/// last key; a shorter page ends the scan.
+const SCAN_PAGE: usize = 10;
+
+/// A key as a log line should show it: itself when it is text, hex when it
+/// is a hash (ADR 0014). Never a lossy decode, which would print the same
+/// replacement characters for two different keys.
+fn shown(key: &[u8]) -> String {
+    match std::str::from_utf8(key) {
+        Ok(text) => text.to_string(),
+        Err(_) => content::hex(key),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -24,16 +39,28 @@ pub enum CommandError {
 }
 
 /// Redis command types supported by our server
+///
+/// Keys are `Bytes`, not `String`: a content-addressed namespace keys its
+/// records by the raw BLAKE3 of the value (ADR 0014), which is binary, and a
+/// lossy UTF-8 decode on the way in would quietly address a different record
+/// than the client named. RESP is binary-safe end to end, so nothing else
+/// had to change for that to work.
 #[derive(Debug)]
 pub enum Command {
     Get {
-        key: String,
+        key: Bytes,
     },
     MGet {
-        keys: Vec<String>,
+        keys: Vec<Bytes>,
     },
     Set {
-        key: String,
+        key: Bytes,
+        value: Bytes,
+    },
+    /// `CSET <value>`: the content-addressed put, valid only in a cas
+    /// namespace. Equivalent to `SET "" <value>`, and the reply is the same
+    /// -- the 32-byte key the server computed (ADR 0014).
+    CSet {
         value: Bytes,
     },
     Ping {
@@ -43,19 +70,19 @@ pub enum Command {
         message: Bytes,
     },
     Del {
-        keys: Vec<String>,
+        keys: Vec<Bytes>,
     },
     Exists {
-        key: String,
+        key: Bytes,
     },
     Check {
-        key: String,
+        key: Bytes,
     },
     Length {
-        key: String,
+        key: Bytes,
     },
     KeyTime {
-        key: String,
+        key: Bytes,
     },
     Select {
         namespace: String,
@@ -73,10 +100,10 @@ pub enum Command {
     },
     DBSize,
     Scan {
-        cursor: Option<String>,
+        cursor: Option<Bytes>,
     },
     RScan {
-        cursor: Option<String>,
+        cursor: Option<Bytes>,
     },
     NSSet {
         namespace: String,
@@ -201,6 +228,15 @@ impl Args {
             Ok(None)
         }
     }
+
+    /// Same as `bytes_at`, but yields `None` when the argument was not sent.
+    fn opt_bytes_at(&self, idx: usize, what: &str) -> Result<Option<Bytes>, CommandError> {
+        if idx < self.len() {
+            Ok(Some(self.bytes_at(idx, what)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// `<CMD>` with no arguments: DBSIZE, FLUSH, NSLIST, TIME.
@@ -209,7 +245,8 @@ fn parse_no_args(args: &Args, cmd: Command) -> Result<Command, CommandError> {
     Ok(cmd)
 }
 
-/// `<CMD> <arg>`: AUTH, CHECK, DEL, EXISTS, GET, KEYTIME, LENGTH, NSINFO, NSNEW.
+/// `<CMD> <arg>`: AUTH, NSINFO, NSNEW -- the commands whose argument is a
+/// name rather than a key.
 fn parse_one_arg<F>(args: &Args, what: &str, make: F) -> Result<Command, CommandError>
 where
     F: FnOnce(String) -> Command,
@@ -218,15 +255,27 @@ where
     Ok(make(args.string_at(1, what)?))
 }
 
-/// `<CMD> [cursor]`: SCAN, RSCAN. Cursor "0" means "start from the beginning".
+/// `<CMD> <key>`: CHECK, EXISTS, GET, KEYTIME, LENGTH. The key stays bytes;
+/// see [`Command`].
+fn parse_one_key<F>(args: &Args, make: F) -> Result<Command, CommandError>
+where
+    F: FnOnce(Bytes) -> Command,
+{
+    args.arity_exact(2)?;
+    Ok(make(args.bytes_at(1, "key")?))
+}
+
+/// `<CMD> [cursor]`: SCAN, RSCAN. Cursor "0" means "start from the
+/// beginning"; any other value is a key to resume after, so it is bytes for
+/// the same reason keys are.
 fn parse_cursor<F>(args: &Args, make: F) -> Result<Command, CommandError>
 where
-    F: FnOnce(Option<String>) -> Command,
+    F: FnOnce(Option<Bytes>) -> Command,
 {
     args.arity_max(2)?;
     let cursor = args
-        .opt_string_at(1, "cursor")?
-        .filter(|cursor| cursor != "0");
+        .opt_bytes_at(1, "cursor")?
+        .filter(|cursor| cursor.as_ref() != b"0");
     Ok(make(cursor))
 }
 
@@ -245,21 +294,33 @@ fn parse_del(args: &Args) -> Result<Command, CommandError> {
 }
 
 /// Every argument after the command name as a key, at least one.
-fn parse_keys(args: &Args) -> Result<Vec<String>, CommandError> {
+fn parse_keys(args: &Args) -> Result<Vec<Bytes>, CommandError> {
     args.arity_min(2)?;
     let mut keys = Vec::with_capacity(args.len() - 1);
     for idx in 1..args.len() {
-        keys.push(args.string_at(idx, "key")?);
+        keys.push(args.bytes_at(idx, "key")?);
     }
     Ok(keys)
 }
 
 /// `SET key value` (trailing arguments are accepted and ignored)
+///
+/// An empty key is a value in a content-addressed namespace -- the zdb-shaped
+/// "you compute the key" form (ADR 0014) -- and an ordinary key everywhere
+/// else, so the parser passes it through and the handler decides.
 fn parse_set(args: &Args) -> Result<Command, CommandError> {
     args.arity_min(3)?;
-    let key = args.string_at(1, "key")?;
+    let key = args.bytes_at(1, "key")?;
     let value = args.bytes_at(2, "value")?;
     Ok(Command::Set { key, value })
+}
+
+/// `CSET value`: SET with the key left to the server, spelled as its own verb.
+fn parse_cset(args: &Args) -> Result<Command, CommandError> {
+    args.arity_exact(2)?;
+    Ok(Command::CSet {
+        value: args.bytes_at(1, "value")?,
+    })
 }
 
 /// `PING [message]`
@@ -341,15 +402,16 @@ impl Command {
 
         match args.name.as_str() {
             "AUTH" => parse_one_arg(&args, "password", |password| Command::Auth { password }),
-            "CHECK" => parse_one_arg(&args, "key", |key| Command::Check { key }),
+            "CHECK" => parse_one_key(&args, |key| Command::Check { key }),
+            "CSET" => parse_cset(&args),
             "DBSIZE" => parse_no_args(&args, Command::DBSize),
             "DEL" => parse_del(&args),
             "ECHO" => parse_echo(&args),
-            "EXISTS" => parse_one_arg(&args, "key", |key| Command::Exists { key }),
+            "EXISTS" => parse_one_key(&args, |key| Command::Exists { key }),
             "FLUSH" => parse_no_args(&args, Command::Flush),
-            "GET" => parse_one_arg(&args, "key", |key| Command::Get { key }),
-            "KEYTIME" => parse_one_arg(&args, "key", |key| Command::KeyTime { key }),
-            "LENGTH" => parse_one_arg(&args, "key", |key| Command::Length { key }),
+            "GET" => parse_one_key(&args, |key| Command::Get { key }),
+            "KEYTIME" => parse_one_key(&args, |key| Command::KeyTime { key }),
+            "LENGTH" => parse_one_key(&args, |key| Command::Length { key }),
             "MGET" => parse_mget(&args),
             "NSINFO" => parse_one_arg(&args, "name", |name| Command::NSInfo { name }),
             "NSLIST" => parse_no_args(&args, Command::NSList),
@@ -415,18 +477,24 @@ impl CommandHandler {
         debug!("Set namespace authentication status to {}", authenticated);
     }
     /// Execute a command and return the response frame
-    pub fn execute(&self, cmd: Command) -> Frame {
+    ///
+    /// Async since ADR 0014: the storage paths a command can reach are the
+    /// block engine's, and those are async all the way down (they take
+    /// stripes and run their disk work on blocking threads). Nothing here
+    /// spawns or waits on anything else.
+    pub async fn execute(&self, cmd: Command) -> Frame {
         match cmd {
-            Command::Get { key } => self.handle_get(key),
-            Command::MGet { keys } => self.handle_mget(keys),
-            Command::Set { key, value } => self.handle_set(key, value),
+            Command::Get { key } => self.handle_get(&key).await,
+            Command::MGet { keys } => self.handle_mget(keys).await,
+            Command::Set { key, value } => self.handle_set(key, value).await,
+            Command::CSet { value } => self.handle_cset(value).await,
             Command::Ping { message } => Self::handle_ping(message),
             Command::Echo { message } => Self::handle_echo(message),
-            Command::Del { keys } => self.handle_del(keys),
-            Command::Exists { key } => self.handle_exists(key),
-            Command::Check { key } => self.handle_check(key),
-            Command::Length { key } => self.handle_length(key),
-            Command::KeyTime { key } => self.handle_keytime(key),
+            Command::Del { keys } => self.handle_del(keys).await,
+            Command::Exists { key } => self.handle_exists(&key),
+            Command::Check { key } => self.handle_check(&key).await,
+            Command::Length { key } => self.handle_length(&key),
+            Command::KeyTime { key } => self.handle_keytime(&key),
             Command::NSNew { name } => self.handle_nsnew(name),
             Command::NSInfo { name } => self.handle_nsinfo(name),
             Command::NSList => self.handle_nslist(),
@@ -451,48 +519,48 @@ impl CommandHandler {
         }
     }
 
-    /// Handle GET command
-    fn handle_get(&self, key: String) -> Frame {
-        debug!("Handling GET command for key: {}", key);
-
-        // Check if namespace requires authentication for read operations
+    /// Whether this connection may read here.
+    fn may_read(&self) -> bool {
         let props = self.namespace.properties.read().unwrap();
+        props.public || self.namespace_authenticated
+    }
+
+    /// Handle GET command
+    async fn handle_get(&self, key: &[u8]) -> Frame {
+        debug!("Handling GET command for key: {}", shown(key));
 
         // If namespace is not public and user is not authenticated, deny access
-        if !props.public && !self.namespace_authenticated {
+        if !self.may_read() {
             return Frame::Error("ERR Authentication required for read operations".into());
         }
 
-        match self.namespace.get(key.as_bytes()) {
+        match self.namespace.get(key).await {
             Ok(Some(value)) => Frame::BulkString(value.to_vec()),
             Ok(None) => Frame::Null,
             Err(e) => {
-                error!("Error getting key {}: {}", key, e);
+                error!("Error getting key {}: {}", shown(key), e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
     }
 
     /// Handle MGET command - get multiple keys at once
-    fn handle_mget(&self, keys: Vec<String>) -> Frame {
+    async fn handle_mget(&self, keys: Vec<Bytes>) -> Frame {
         debug!("Handling MGET command for {} keys", keys.len());
 
-        // Check if namespace requires authentication for read operations
-        let props = self.namespace.properties.read().unwrap();
-
         // If namespace is not public and user is not authenticated, deny access
-        if !props.public && !self.namespace_authenticated {
+        if !self.may_read() {
             return Frame::Error("ERR Authentication required for read operations".into());
         }
 
         let mut values = Vec::with_capacity(keys.len());
 
         for key in keys {
-            match self.namespace.get(key.as_bytes()) {
+            match self.namespace.get(&key).await {
                 Ok(Some(value)) => values.push(Frame::BulkString(value.to_vec())),
                 Ok(None) => values.push(Frame::Null),
                 Err(e) => {
-                    error!("Error getting key {}: {}", key, e);
+                    error!("Error getting key {}: {}", shown(&key), e);
                     // For MGET, we don't return an error for the whole command
                     // Instead, we return a null for this specific key
                     values.push(Frame::Null);
@@ -504,18 +572,74 @@ impl CommandHandler {
     }
 
     /// Handle SET command
-    fn handle_set(&self, key: String, value: Bytes) -> Frame {
-        debug!("Handling SET command for key: {}", key);
+    ///
+    /// What a key means decides what this does (ADR 0014). In a user-keyed
+    /// namespace it is the store-what-I-say write it has always been. In a
+    /// content-addressed one the key is the value's address: empty means
+    /// "compute it and tell me", 32 bytes means "I claim this address", and
+    /// anything else is an error.
+    async fn handle_set(&self, key: Bytes, value: Bytes) -> Frame {
+        debug!("Handling SET command for key: {}", shown(&key));
 
         // Check if the connection is authenticated for this namespace
         if !self.namespace_authenticated {
             return Frame::Error("ERR: Authentication required for write operations".into());
         }
 
-        match self.namespace.set(key.as_bytes(), value) {
+        if self.namespace.key_mode() == KeyMode::Cas {
+            let mode = if key.is_empty() {
+                Ingest::ServerHashed
+            } else {
+                Ingest::ClientHashed(&key)
+            };
+            return self.ingest(mode, value).await;
+        }
+
+        match self.namespace.set(&key, value) {
             Ok(()) => Frame::SimpleString("OK".into()),
             Err(e) => {
-                error!("Error setting key {}: {}", key, e);
+                error!("Error setting key {}: {}", shown(&key), e);
+                Frame::Error(format!("ERR {}", e))
+            }
+        }
+    }
+
+    /// Handle CSET command - the server-hashed put (ADR 0014)
+    ///
+    /// The same operation as `SET "" <value>`, spelled as a verb of its own
+    /// for clients that would rather say what they mean than send an empty
+    /// key. It exists only where a key is an address.
+    async fn handle_cset(&self, value: Bytes) -> Frame {
+        debug!("Handling CSET command for {} bytes", value.len());
+
+        if !self.namespace_authenticated {
+            return Frame::Error("ERR: Authentication required for write operations".into());
+        }
+
+        if self.namespace.key_mode() != KeyMode::Cas {
+            return Frame::Error(
+                "ERR CSET is only valid in a content-addressed namespace \
+                 (NSSET <namespace> key_mode cas)"
+                    .into(),
+            );
+        }
+
+        self.ingest(Ingest::ServerHashed, value).await
+    }
+
+    /// The write half both content-addressed forms share.
+    ///
+    /// The reply is the difference between them: a client that had the
+    /// server compute the key gets it back as a bulk string, and one that
+    /// named the address it was writing to already has it, so it gets `+OK`.
+    async fn ingest(&self, mode: Ingest<'_>, value: Bytes) -> Frame {
+        let derived = matches!(mode, Ingest::ServerHashed);
+
+        match content::ingest(&self.storage, &self.namespace, mode, value).await {
+            Ok(key) if derived => Frame::BulkString(key.to_vec()),
+            Ok(_) => Frame::SimpleString("OK".into()),
+            Err(e) => {
+                error!("Error storing a content-addressed value: {}", e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
@@ -539,8 +663,8 @@ impl CommandHandler {
     }
 
     /// Handle DEL command
-    fn handle_del(&self, keys: Vec<String>) -> Frame {
-        debug!("Handling DEL command for keys: {:?}", keys);
+    async fn handle_del(&self, keys: Vec<Bytes>) -> Frame {
+        debug!("Handling DEL command for {} keys", keys.len());
 
         // Check if the connection is authenticated for this namespace
         if !self.namespace_authenticated {
@@ -551,11 +675,11 @@ impl CommandHandler {
         // removed, not the keys that were named.
         let mut removed: i64 = 0;
         for key in &keys {
-            match self.namespace.del(key.as_bytes()) {
+            match self.namespace.del(key).await {
                 Ok(true) => removed += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    error!("Error deleting key {}: {}", key, e);
+                    error!("Error deleting key {}: {}", shown(key), e);
                     return Frame::Error(format!("ERR {}", e));
                 }
             }
@@ -564,61 +688,63 @@ impl CommandHandler {
     }
 
     /// Handle EXISTS command
-    fn handle_exists(&self, key: String) -> Frame {
-        debug!("Handling EXISTS command for key: {}", key);
-
-        // Check if namespace requires authentication for read operations
-        let props = self.namespace.properties.read().unwrap();
+    ///
+    /// The probe a dedup-upload client pipelines before it transfers
+    /// anything (ADR 0014). Namespace-scoped, and advisory outside a worm
+    /// namespace: nothing stops another client deleting the key between the
+    /// answer and the upload the client then skips.
+    fn handle_exists(&self, key: &[u8]) -> Frame {
+        debug!("Handling EXISTS command for key: {}", shown(key));
 
         // If namespace is not public and user is not authenticated, deny access
-        if !props.public && !self.namespace_authenticated {
+        if !self.may_read() {
             return Frame::Error("ERR Authentication required for read operations".into());
         }
 
-        match self.namespace.exists(key.as_bytes()) {
+        match self.namespace.exists(key) {
             Ok(true) => Frame::Integer(1),  // Key exists
             Ok(false) => Frame::Integer(0), // Key does not exist
             Err(e) => {
-                error!("Error checking if key {} exists: {}", key, e);
+                error!("Error checking if key {} exists: {}", shown(key), e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
     }
 
     /// Handle CHECK command - verify data integrity for a key
-    fn handle_check(&self, key: String) -> Frame {
-        debug!("Handling CHECK command for key: {}", key);
-        match self.namespace.check(key.as_bytes()) {
+    async fn handle_check(&self, key: &[u8]) -> Frame {
+        debug!("Handling CHECK command for key: {}", shown(key));
+        match self.namespace.check(key).await {
             Ok(Some(true)) => Frame::Integer(1), // Data integrity check passed
             Ok(Some(false)) | Ok(None) => Frame::Integer(0), // Check failed or key doesn't exist
             Err(e) => {
-                error!("Error checking integrity for key {}: {}", key, e);
+                error!("Error checking integrity for key {}: {}", shown(key), e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
     }
 
     /// Handle LENGTH command - get the size of a key's value
-    fn handle_length(&self, key: String) -> Frame {
-        debug!("Handling LENGTH command for key: {}", key);
-        match self.namespace.length(key.as_bytes()) {
+    fn handle_length(&self, key: &[u8]) -> Frame {
+        debug!("Handling LENGTH command for key: {}", shown(key));
+        match self.namespace.length(key) {
             Ok(Some(size)) => Frame::Integer(size as i64), // Return the size as an integer
             Ok(None) => Frame::Null,                       // Key not found, return nil
             Err(e) => {
-                error!("Error getting length for key {}: {}", key, e);
+                error!("Error getting length for key {}: {}", shown(key), e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
     }
 
     /// Handle KEYTIME command - get the last-modified timestamp of a key
-    fn handle_keytime(&self, key: String) -> Frame {
-        debug!("Handling KEYTIME command for key: {}", key);
-        match self.namespace.keytime(key.as_bytes()) {
+    fn handle_keytime(&self, key: &[u8]) -> Frame {
+        debug!("Handling KEYTIME command for key: {}", shown(key));
+        match self.namespace.keytime(key) {
             Ok(Some(timestamp)) => Frame::Integer(timestamp), // Return the timestamp as an integer
             Ok(None) => Frame::Null,                          // Key not found, return nil
             Err(e) => {
-                error!("Error getting timestamp for key {}: {}", key, e);
+                error!("Error getting timestamp for key {}: {}", shown(key), e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
@@ -824,41 +950,15 @@ impl CommandHandler {
     }
 
     /// Handle SCAN command - scan keys in the current namespace
-    fn handle_scan(&self, cursor: Option<String>) -> Frame {
-        debug!("Handling SCAN command with cursor: {:?}", cursor);
-
-        // Convert the cursor from String to Vec<u8> if it exists
-        let start_after = cursor.map(|c| c.into_bytes());
+    fn handle_scan(&self, cursor: Option<Bytes>) -> Frame {
+        debug!("Handling SCAN command");
 
         // Use the scan method to get keys starting after the cursor
-        match self.namespace.scan(start_after, 10) {
-            Ok(keys) => {
-                if keys.is_empty() {
-                    // If no keys were found, return 0 as cursor and empty array
-                    let response = vec![Frame::BulkString("0".into()), Frame::Array(vec![])];
-                    Frame::Array(response)
-                } else {
-                    // Determine the next cursor
-                    // If we got fewer than 10 keys, we've reached the end
-                    let next_cursor = if keys.len() < 10 {
-                        "0".to_string()
-                    } else {
-                        // Otherwise, use the last key as the next cursor
-                        let last_key = keys.last().unwrap();
-                        String::from_utf8_lossy(last_key).to_string()
-                    };
-
-                    // Convert keys to frames
-                    let key_frames: Vec<Frame> = keys.into_iter().map(Frame::BulkString).collect();
-
-                    // Return [cursor, [keys...]]
-                    let response = vec![
-                        Frame::BulkString(next_cursor.into_bytes()),
-                        Frame::Array(key_frames),
-                    ];
-                    Frame::Array(response)
-                }
-            }
+        match self
+            .namespace
+            .scan(cursor.map(|c| c.to_vec()), SCAN_PAGE as u32)
+        {
+            Ok(keys) => Self::scan_reply(keys),
             Err(e) => {
                 error!("Error scanning keys: {}", e);
                 Frame::Error(format!("ERR {}", e))
@@ -867,46 +967,40 @@ impl CommandHandler {
     }
 
     /// Handle RSCAN command - scan keys in the current namespace in backward direction
-    fn handle_rscan(&self, cursor: Option<String>) -> Frame {
-        debug!("Handling RSCAN command with cursor: {:?}", cursor);
-
-        // Convert the cursor from String to Vec<u8> if it exists
-        let start_after = cursor.map(|c| c.into_bytes());
+    fn handle_rscan(&self, cursor: Option<Bytes>) -> Frame {
+        debug!("Handling RSCAN command");
 
         // Use the scan_backward method to get keys starting before the cursor
-        match self.namespace.scan_backward(start_after, 10) {
-            Ok(keys) => {
-                if keys.is_empty() {
-                    // If no keys were found, return 0 as cursor and empty array
-                    let response = vec![Frame::BulkString("0".into()), Frame::Array(vec![])];
-                    Frame::Array(response)
-                } else {
-                    // Determine the next cursor
-                    // If we got fewer than 10 keys, we've reached the end
-                    let next_cursor = if keys.len() < 10 {
-                        "0".to_string()
-                    } else {
-                        // Otherwise, use the last key as the next cursor
-                        let last_key = keys.last().unwrap();
-                        String::from_utf8_lossy(last_key).to_string()
-                    };
-
-                    // Convert keys to frames
-                    let key_frames: Vec<Frame> = keys.into_iter().map(Frame::BulkString).collect();
-
-                    // Return [cursor, [keys...]]
-                    let response = vec![
-                        Frame::BulkString(next_cursor.into_bytes()),
-                        Frame::Array(key_frames),
-                    ];
-                    Frame::Array(response)
-                }
-            }
+        match self
+            .namespace
+            .scan_backward(cursor.map(|c| c.to_vec()), SCAN_PAGE as u32)
+        {
+            Ok(keys) => Self::scan_reply(keys),
             Err(e) => {
                 error!("Error scanning keys: {}", e);
                 Frame::Error(format!("ERR {}", e))
             }
         }
+    }
+
+    /// `[cursor, [key ...]]`, with `0` for a page that reached the end.
+    ///
+    /// The cursor is the last key of a full page, handed back as the bytes
+    /// it is: in a content-addressed namespace a key is a hash, and a cursor
+    /// that had been through a lossy UTF-8 decode would resume the scan
+    /// somewhere else entirely (ADR 0014).
+    fn scan_reply(keys: Vec<Vec<u8>>) -> Frame {
+        let next_cursor = if keys.len() < SCAN_PAGE {
+            b"0".to_vec()
+        } else {
+            keys.last().expect("a full page has a last key").clone()
+        };
+
+        let key_frames: Vec<Frame> = keys.into_iter().map(Frame::BulkString).collect();
+        Frame::Array(vec![
+            Frame::BulkString(next_cursor),
+            Frame::Array(key_frames),
+        ])
     }
 
     /// Handle FLUSH command - delete all keys in the current namespace

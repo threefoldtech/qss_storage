@@ -1,4 +1,4 @@
-use redis_protocol::resp2::types::OwnedFrame as Frame;
+use redis_protocol::resp2::types::{OwnedFrame as Frame, Resp2Frame};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -226,36 +226,21 @@ impl RespHelper {
     }
 
     /// Encode a frame to bytes
+    ///
+    /// The buffer is sized from the frame itself rather than guessed at.
+    /// It used to be 512 bytes, retried at 16 KiB, and a reply that did not
+    /// fit was reported as a write failure -- which drops the connection
+    /// with nothing sent, so the client sees an unexplained EOF. A value of
+    /// any size is a legitimate reply (a GET of a multi-megabyte record is
+    /// exactly what a content-addressed namespace serves, ADR 0014), so the
+    /// only correct size is the one the encoder asks for.
     pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, RespError> {
-        // Estimate the frame size - for COMMAND responses, we need a much larger buffer
-        let estimated_size = match frame {
-            Frame::Array(items) if items.len() > 10 => 4096, // Large arrays like COMMAND response
-            _ => 512,                                        // Default size for most responses
-        };
+        let mut buffer = vec![0; frame.encode_len(false)];
 
-        // Use Vec<u8> for encoding with zeros already in place
-        let mut buffer = vec![0; estimated_size];
-
-        // Try to encode with the current buffer size
-        match redis_protocol::resp2::encode::encode(&mut buffer, frame, false) {
-            Ok(len) => {
-                buffer.truncate(len);
-                Ok(buffer)
-            }
-            Err(e) => {
-                if e.to_string().contains("Buffer too small") {
-                    // If buffer is too small, try with a much larger buffer
-                    let mut larger_buffer = vec![0; 16384]; // 16KB should be enough for most responses
-                    let len =
-                        redis_protocol::resp2::encode::encode(&mut larger_buffer, frame, false)
-                            .map_err(|e| RespError::Protocol(e.to_string()))?;
-                    larger_buffer.truncate(len);
-                    Ok(larger_buffer)
-                } else {
-                    Err(RespError::Protocol(e.to_string()))
-                }
-            }
-        }
+        let len = redis_protocol::resp2::encode::encode(&mut buffer, frame, false)
+            .map_err(|e| RespError::Protocol(e.to_string()))?;
+        buffer.truncate(len);
+        Ok(buffer)
     }
 }
 

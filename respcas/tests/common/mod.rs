@@ -15,6 +15,17 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::oneshot;
 
+/// How a test daemon opens its store: everything inlined that fits, which is
+/// respcas's own default, and the flush left to the page cache -- these
+/// stores are thrown away, and none of these tests is a crash test.
+pub fn store_options() -> cas_storage::StoreOptions {
+    cas_storage::StoreOptions {
+        inline_metadata_size: Some(cas_storage::config::DEFAULT_RESP_INLINE_METADATA_SIZE),
+        durability: cas_storage::Durability::Buffer,
+        ..cas_storage::StoreOptions::default()
+    }
+}
+
 pub struct TestServer {
     port: u16,
     _temp_dir: tempfile::TempDir, // Keep this field to ensure the directory isn't deleted
@@ -65,13 +76,8 @@ impl TestServer {
 
                 // Create a shared storage instance
                 let storage = Arc::new(
-                    respcas::storage::Storage::new(
-                        thread_data_dir,
-                        None,
-                        cas_storage::Durability::Fsync,
-                        cas_storage::HeaderSpec::default(),
-                    )
-                    .expect("can open storage"),
+                    respcas::storage::Storage::new(thread_data_dir, store_options())
+                        .expect("can open storage"),
                 );
 
                 // Create a shared namespace cache

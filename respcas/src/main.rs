@@ -3,14 +3,15 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+use cas_storage::StoreOptions;
 use cas_storage::config::{
-    self, DEFAULT_DURABILITY, DEFAULT_RESP_DATA_DIR, DEFAULT_RESP_HOST,
-    DEFAULT_RESP_INLINE_METADATA_SIZE, DEFAULT_RESP_PORT, QssStorageConfig,
+    self, DEFAULT_RESP_DATA_DIR, DEFAULT_RESP_HOST, DEFAULT_RESP_INLINE_METADATA_SIZE,
+    DEFAULT_RESP_PORT, QssStorageConfig,
 };
-use cas_storage::{Durability, Hasher, HeaderSpec};
 
 mod cmd;
 mod conn;
+mod content;
 mod namespace;
 mod property;
 mod resp;
@@ -57,24 +58,27 @@ struct ResolvedConfig {
     host: String,
     port: u16,
     admin: Option<String>,
-    inline_metadata_size: usize,
-    durability: Durability,
-    hasher: Hasher,
+    /// How the store is opened. The same `[store]` table s3cas and fsck read,
+    /// because since ADR 0014 respcas opens the same kind of store they do.
+    store: StoreOptions,
 }
 
 /// Merges the flags over the config file over the built-in defaults.
 ///
-/// `store.verify_on_read` and `store.metadata_db` are not consulted: respcas
-/// stores no blocks, so there is nothing to verify on read, and it is
-/// fjall-only.
+/// The `[store]` table resolves exactly as it does for every other binary
+/// here, with one respcas-specific default on top: the inline threshold. A
+/// value at or below it stays in its own record, which is how respcas has
+/// always stored everything, and the built-in 1 byte keeps that true for a
+/// deployment that configures nothing.
 ///
 /// # Errors
 ///
-/// [`config::ConfigError`] if `store.hash` does not name a hash this build
-/// has. respcas never addresses a block, but its database carries the same
-/// header as every other store here, so the section still has to resolve.
+/// [`config::ConfigError`] if the `[store]` table does not resolve -- a hash
+/// this build does not have, an unusable stripe count or batch cap, or a
+/// group-commit window that will not parse.
 fn resolve(flags: Opt, config: &QssStorageConfig) -> Result<ResolvedConfig, config::ConfigError> {
     let resp = config.resp.clone().unwrap_or_default();
+    let store = StoreOptions::resolve(None, None, None, None, &config.store)?;
 
     Ok(ResolvedConfig {
         data_dir: flags
@@ -87,12 +91,14 @@ fn resolve(flags: Opt, config: &QssStorageConfig) -> Result<ResolvedConfig, conf
             .unwrap_or_else(|| DEFAULT_RESP_HOST.to_string()),
         port: flags.port.or(resp.port).unwrap_or(DEFAULT_RESP_PORT),
         admin: flags.admin.or(resp.admin_password),
-        inline_metadata_size: config
-            .store
-            .inline_metadata_size
-            .unwrap_or(DEFAULT_RESP_INLINE_METADATA_SIZE),
-        durability: config.store.durability.unwrap_or(DEFAULT_DURABILITY),
-        hasher: config.store.hash.hasher()?,
+        store: StoreOptions {
+            inline_metadata_size: Some(
+                store
+                    .inline_metadata_size
+                    .unwrap_or(DEFAULT_RESP_INLINE_METADATA_SIZE),
+            ),
+            ..store
+        },
     })
 }
 
@@ -128,12 +134,7 @@ async fn main() -> Result<()> {
     // effectively inlines every value; the hash matters only for a store being
     // created now, since an existing one is opened on the header it already
     // has.
-    let storage = storage::Storage::new(
-        cfg.data_dir.clone(),
-        Some(cfg.inline_metadata_size),
-        cfg.durability,
-        HeaderSpec::from(cfg.hasher),
-    )?;
+    let storage = storage::Storage::new(cfg.data_dir.clone(), cfg.store)?;
 
     // Start server
     info!("Starting respcas server on {}:{}", cfg.host, cfg.port);
@@ -149,6 +150,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cas_storage::{Durability, Hasher};
 
     fn config(text: &str) -> QssStorageConfig {
         config::parse(text, Path::new("test.toml")).expect("test config must parse")
@@ -162,9 +164,9 @@ mod tests {
         assert_eq!(cfg.host, DEFAULT_RESP_HOST);
         assert_eq!(cfg.port, DEFAULT_RESP_PORT);
         assert_eq!(cfg.admin, None);
-        assert_eq!(cfg.inline_metadata_size, 1);
-        assert_eq!(cfg.durability, Durability::Fsync);
-        assert_eq!(cfg.hasher, Hasher::Blake3W32);
+        assert_eq!(cfg.store.inline_metadata_size, Some(1));
+        assert_eq!(cfg.store.durability, Durability::Fsync);
+        assert_eq!(cfg.store.hasher, Hasher::Blake3W32);
     }
 
     #[test]
@@ -181,9 +183,9 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 6380);
         assert_eq!(cfg.admin.as_deref(), Some("hunter2"));
-        assert_eq!(cfg.inline_metadata_size, 64);
-        assert_eq!(cfg.durability, Durability::Buffer);
-        assert_eq!(cfg.hasher, Hasher::Blake3W16);
+        assert_eq!(cfg.store.inline_metadata_size, Some(64));
+        assert_eq!(cfg.store.durability, Durability::Buffer);
+        assert_eq!(cfg.store.hasher, Hasher::Blake3W16);
     }
 
     #[test]

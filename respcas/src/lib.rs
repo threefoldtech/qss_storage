@@ -3,6 +3,7 @@
 // Re-export modules for use in integration tests
 pub mod cmd;
 pub mod conn;
+pub mod content;
 pub mod namespace;
 pub mod property;
 pub mod resp;
