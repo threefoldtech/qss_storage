@@ -326,6 +326,31 @@ impl MetaStore {
             .collect()
     }
 
+    /// The name of every bucket in the store, taken from the `_BUCKETS`
+    /// KEYS rather than from the records under them.
+    ///
+    /// The key is the name -- [`insert_bucket`](Self::insert_bucket) files
+    /// each record under it -- so this answers "which buckets exist" without
+    /// depending on what the value happens to be. That matters because the
+    /// value is not always a [`BucketMeta`]: respcas stores its own
+    /// namespace metadata there (msgpack, with the key mode ADR 0014 added),
+    /// and a walker that decoded it would fail on a healthy store.
+    ///
+    /// Every caller that only wants names uses this; `list_buckets` stays
+    /// for the S3 listing, which needs the creation time in the record.
+    pub fn list_bucket_names(&self) -> Result<Vec<String>, MetaError> {
+        let bucket = self.get_allbuckets_tree()?;
+        bucket
+            .iter_all()
+            .map(|result| {
+                let (key, _) = result?;
+                String::from_utf8(key).map_err(|e| {
+                    MetaError::OtherDBError(format!("bucket name is not valid utf-8: {e}"))
+                })
+            })
+            .collect()
+    }
+
     /// Inserts a metadata Object into the specified bucket.
     ///
     /// # Arguments

@@ -1202,11 +1202,7 @@ fn orphan_parts(fs: &CasFS) -> Result<Vec<(Vec<u8>, MultiPart)>, MetaError> {
 /// `passes::bucket_integrity` makes; repeated here typed, because the
 /// finding it produces states the tree name in prose.
 fn stranded_trees(namespace: &MetaStore) -> Result<Vec<String>, MetaError> {
-    let named: HashSet<String> = namespace
-        .list_buckets()?
-        .into_iter()
-        .map(|meta| meta.name().to_string())
-        .collect();
+    let named: HashSet<String> = namespace.list_bucket_names()?.into_iter().collect();
     let mut stranded: Vec<String> = namespace
         .list_trees()?
         .into_iter()

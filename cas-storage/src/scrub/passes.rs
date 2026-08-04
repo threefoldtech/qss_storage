@@ -568,11 +568,10 @@ fn humanize_age(seconds: i64) -> String {
 /// [`MetaError`] if the tree list or the bucket list cannot be read.
 pub fn bucket_integrity(ctx: &ScrubContext) -> Result<Vec<Finding>, MetaError> {
     let namespace = ctx.namespace();
-    let named: HashSet<String> = namespace
-        .list_buckets()?
-        .into_iter()
-        .map(|meta| meta.name().to_string())
-        .collect();
+    // By NAME, from the keys: what a bucket row's value holds is the
+    // service's business (respcas keeps its namespace metadata there), and
+    // this pass only asks which rows exist.
+    let named: HashSet<String> = namespace.list_bucket_names()?.into_iter().collect();
 
     let mut orphaned: Vec<String> = namespace
         .list_trees()?
