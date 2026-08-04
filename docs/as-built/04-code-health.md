@@ -128,8 +128,8 @@ table; the two above are dated records.
 | B2 oversized functions | **PARTIAL** | the two named outliers are fixed -- `from_frame` is a 29-line dispatch table, `process` a 15-line delegate. `store_object` is 54 lines. But `poll_next` is still 149, `s3cas::main::run` grew 131 -> 175, and `clippy::too_many_lines` now fires 7 times (5 in production code) |
 | B3 edition split / toolchain | **RESOLVED** | every crate is edition 2024; `rust-toolchain.toml` pins 1.97 with a comment saying why. `e4a795b`, `0777c36` |
 | B4 pedantic and TODO backlog | **PARTIAL** | the substantive clusters were cleared (`4a90277`) and TODO/FIXME markers went 16 -> 9. Pedantic is 758 warnings at HEAD against 458 then, on a workspace ~3x the size; the mix is unchanged (missing backticks, `must_use`, `# Errors` sections) and still not worth chasing |
-| P1 ADRs describe a layout `main` lacks | **OPEN on `main`** | `origin/main` is still `c12f930`: separate `metastore` crate, `respd`, `s3fs.rs`. Fourteen ADRs now describe code only `development` has |
-| P2 `main` red in CI | **OPEN on `main`** | same cause as P1; not re-run, since the tree it describes is unchanged |
+| P1 ADRs describe a layout `main` lacks | **RESOLVED** | `main` fast-forwarded `c12f930` -> `a5ffb40` on 2026-08-04, minutes after this review's refresh; both branches are identical |
+| P2 `main` red in CI | **RESOLVED** | with P1: `main` IS the green tree now |
 | P3 missing CI gates | **RESOLVED** | `build.yaml` runs fmt, build, clippy `-Dwarnings`, test; `release.yaml` tests before building. `0777c36`, `50ec0ec` |
 | P4 `.gitignore` too narrow | **RESOLVED** | `/target`, `/data`, `.vscode`, `/qss_storage.toml`. `0777c36` |
 | P5 dangling deadlock-fix doc | **OBSOLETE** | `docs/arch/deadlock-fix.md` was reconstructed (`8e554b0`, rewritten `eade068`, corrected `b95180b`), and the file that cited it -- `cas/async_fs.rs` -- was itself deleted by ADR 0006's write-path reorder (`c5e2561`) |
@@ -677,7 +677,9 @@ problem at the scale the README describes.
 
 ### P1. ADRs describe a layout `main` does not have
 
-> **OPEN on `main`**, resolved on `development` (`9a2d8c8`). `origin/main` is
+> **RESOLVED** (2026-08-04): `main` fast-forwarded to `a5ffb40`, identical to
+> `development`. Until then it was resolved on `development` only (`9a2d8c8`),
+> while `origin/main` was
 > still `c12f930`: a separate `metastore` crate, `respd/` rather than
 > `respcas/`, `s3cas/src/s3fs.rs` rather than `api.rs`, and two ADRs rather
 > than fourteen. Everything this document describes lives on `development`.
@@ -694,7 +696,8 @@ documentation describes code that is not in `main`.
 
 ### P2. `main` is red in CI
 
-> **OPEN on `main`**, green on `development`. Not re-verified: `main`'s tree
+> **RESOLVED** (2026-08-04) with P1: `main` is `development`'s tree now. While
+> open, it was not re-verified because `main`'s tree
 > is byte-identical to what the reviewer observed, so the six clippy errors
 > are still in it. `development` is clean under the gate, including benches.
 > Same cause and same fix as P1.
@@ -777,7 +780,8 @@ the missing rationale is worth reconstructing.
 
 > **Historical.** Items 1 and 3 through 8 were all worked; item 2 (merging
 > to `main`) was not, and is the only entry still live. What is left of this
-> review at `62fdf27` is P1/P2 on `main`, the recurrence of H10's class, and
+> review at `62fdf27` is the recurrence of H10's class (P1/P2 closed with the
+> 2026-08-04 fast-forward of `main`) and
 > the two long functions under B2 that were never the point.
 
 1. **H1** -- confirmed panic on a default code path, and the fix is a few lines
