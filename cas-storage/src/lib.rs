@@ -71,12 +71,15 @@
 //! ```
 
 pub mod cas;
+/// Public because the binaries reach past the re-exports for the `DEFAULT_*`
+/// constants they merge their flags against, and qss-storage-fsck names the
+/// module itself.
 pub mod config;
-pub mod hasher;
+mod hasher;
 pub mod metastore;
-pub mod metrics;
+mod metrics;
 pub mod scrub;
-pub mod store_options;
+mod store_options;
 
 // Re-export the block hasher (used by both the cas and metastore layers)
 pub use hasher::{Hasher, HasherError};

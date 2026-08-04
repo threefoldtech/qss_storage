@@ -78,8 +78,11 @@ was the pre-2018 `mod.rs` files, converted by `git mv`.)
 
 ### Public surface
 
-`lib.rs:82-152` re-exports deliberately, so consumers never name the module
-path. Every re-export is a named list -- the two globs that used to stand at
+`lib.rs:85-155` re-exports deliberately, so consumers never name the module
+path -- and since 2026-08-04 most of them cannot: `hasher`, `metrics` and
+`store_options` are private modules, leaving four public
+(`cas`, `config`, `metastore`, `scrub`). Every re-export is a named list --
+the two globs that used to stand at
 the `metastore` front (`meta_store::*` and `traits::*`) were replaced with
 named lists on 2026-08-04, so a new `pub` item joins the public surface only
 when somebody decides it should. Five groups: the hasher (`Hasher`,

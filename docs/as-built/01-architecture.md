@@ -42,7 +42,7 @@ here is not reachable from outside.
 
 ### cas-storage (library)
 
-The front is seven modules and fifty curated re-exports in `lib.rs`.
+The front is four modules and fifty curated re-exports in `lib.rs`.
 
 ```
 cas_storage
@@ -55,8 +55,9 @@ cas_storage
 |                     SweepStats, sweep_stale_uploads, UploadClaim,
 |                     BLOCKS_DB_DIR_NAME, STORE_ID_MARKER_NAME
 |
-+-- config            the qss_storage.toml loader and every default
-+-- hasher            Hasher, HasherError
++-- config            the qss_storage.toml loader and every default; public
+|                     because the binaries reach past the re-exports for the
+|                     DEFAULT_* constants, and fsck names the module itself
 |
 +-- metastore         1 public module, 33 names
 |     store_header    public for classify_db_dir, STORE_HEADER_MAGIC and
@@ -71,15 +72,19 @@ cas_storage
 |                     FjallStore, HeaderSpec, StoreHeader, StoreHeaderError,
 |                     StoreId, StoreInit, UploadRecord
 |
-+-- metrics           MetricsCollector, NoOpMetrics, SharedMetrics
 +-- scrub             no public modules, 35 names
-+-- store_options     StoreOptions
+|
++-- hasher            private; Hasher, HasherError re-exported
++-- metrics           private; MetricsCollector, NoOpMetrics, SharedMetrics
++-- store_options     private; StoreOptions
 ```
 
-Three of those seven -- `hasher`, `metrics` and `store_options` -- hold
-exactly the items `lib.rs` already re-exports, and no consumer in or out of
-the workspace names them by path. They are public as a redundancy, not as a
-door, and could be closed without moving a name.
+Those last three were public modules until 2026-08-04 and hold exactly the
+items `lib.rs` already re-exports, which no consumer in or out of the
+workspace ever named by path. Rule 1 below was applied to them: a redundant
+door is still a door, so they are private and the names are unmoved. `config`
+was tested the same way and kept, because the compiler named a consumer that
+does reach into it.
 
 The storage pipeline is not in that list, and that is the point. Every stage
 of it is a private module reachable only through `CasFS`: `write_path`,
