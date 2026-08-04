@@ -685,11 +685,11 @@ fn a_key_that_is_not_an_address_is_refused_at_every_other_length() {
     // Reads are not length-checked: a key that cannot be an address is simply
     // a key nothing is stored under, which is what the probe workflow needs
     // (a client asking about garbage gets an answer, not a hangup).
-    conn.send_command(&[b"GET", &vec![0xabu8; 31]]);
+    conn.send_command(&[b"GET", &[0xabu8; 31]]);
     assert!(is_null(&conn.reply()));
-    conn.send_command(&[b"EXISTS", &vec![0xabu8; 33]]);
+    conn.send_command(&[b"EXISTS", &[0xabu8; 33]]);
     assert_eq!(integer(&conn.reply()), 0);
-    conn.send_command(&[b"DEL", &vec![0xabu8; 31]]);
+    conn.send_command(&[b"DEL", &[0xabu8; 31]]);
     assert_eq!(integer(&conn.reply()), 0);
 }
 
@@ -850,12 +850,12 @@ fn the_reading_commands_all_answer_over_hash_keys() {
         assert!(keytime > 1_700_000_000, "a real timestamp, not zero");
     }
     let missing: Option<u64> = redis::cmd("LENGTH")
-        .arg(&address(b"nothing stored under this"))
+        .arg(address(b"nothing stored under this"))
         .query(&mut conn)
         .unwrap();
     assert_eq!(missing, None, "LENGTH of a miss is nil");
     let missing: Option<i64> = redis::cmd("KEYTIME")
-        .arg(&address(b"nothing stored under this"))
+        .arg(address(b"nothing stored under this"))
         .query(&mut conn)
         .unwrap();
     assert_eq!(missing, None);
@@ -865,7 +865,7 @@ fn the_reading_commands_all_answer_over_hash_keys() {
     let (first_key, first_value) = &stored[0];
     let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
         .arg(first_key)
-        .arg(&address(b"nothing stored under this"))
+        .arg(address(b"nothing stored under this"))
         .arg(&big_key)
         .query(&mut conn)
         .expect("MGET must answer");
