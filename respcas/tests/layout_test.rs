@@ -3,21 +3,10 @@
 
 mod common;
 
-use std::path::Path;
-
 use cas_storage::{CasFS, SharedMetrics, StoreOptions};
-use common::store_options;
+use common::{rewind_to_pre_0014_layout, store_options};
 use respcas::storage::Storage;
 use tempfile::tempdir;
-
-/// Moves everything in `from` into `to`, then removes `from`.
-fn move_contents(from: &Path, to: &Path) {
-    for entry in std::fs::read_dir(from).expect("the directory must be readable") {
-        let entry = entry.unwrap();
-        std::fs::rename(entry.path(), to.join(entry.file_name())).expect("the move must work");
-    }
-    std::fs::remove_dir(from).expect("the emptied directory must go");
-}
 
 /// A store this build creates is the standard pair every tool walks:
 /// the header sidecar, the metadata database under db/, and the block store
@@ -68,12 +57,7 @@ fn a_store_from_before_the_layout_opens_where_it_is() {
             .create_namespace("legacy-ns")
             .expect("a namespace to find again afterwards");
     }
-    move_contents(&root.join("db"), root);
-    std::fs::remove_dir_all(root.join("blocks")).expect("the block store goes too");
-    assert!(
-        root.join("version").is_file(),
-        "the pre-0014 shape: fjall's own marker in the data directory"
-    );
+    rewind_to_pre_0014_layout(root);
 
     // It opens, and what was in it is still in it.
     let storage = Storage::new(root.to_path_buf(), store_options())

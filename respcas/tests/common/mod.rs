@@ -110,6 +110,20 @@ impl TestServer {
         })
     }
 
+    /// A daemon that acks nothing it has not fsynced (ADR 0013), which is what
+    /// the binary's own default is. The other constructors leave the flush to
+    /// the page cache, which is enough for a store that is thrown away but not
+    /// for a test about what survives a shutdown.
+    pub fn new_durable() -> Self {
+        Self::with(ServerConfig {
+            options: cas_storage::StoreOptions {
+                durability: cas_storage::Durability::Fsync,
+                ..store_options()
+            },
+            ..ServerConfig::default()
+        })
+    }
+
     pub fn with(config: ServerConfig) -> Self {
         let ServerConfig {
             admin_password,
@@ -512,6 +526,30 @@ pub fn block_files(data_dir: &Path) -> usize {
     let mut count = 0;
     walk(&data_dir.join("blocks"), &mut count);
     count
+}
+
+/// Rewinds the store at `root` to the shape respcas gave one before ADR 0014:
+/// fjall's own files straight in the data directory, and no block store
+/// anywhere.
+///
+/// The point is that such stores exist in the field. A test that wants to say
+/// "this still works on a store from before the layout" has to build one, and
+/// the only honest way to build one is to take a real store apart the way the
+/// old code laid it out.
+///
+/// The daemon must be stopped and the store closed first.
+pub fn rewind_to_pre_0014_layout(root: &Path) {
+    for entry in fs::read_dir(root.join("db")).expect("the database directory must be readable") {
+        let entry = entry.expect("the entry must be readable");
+        fs::rename(entry.path(), root.join(entry.file_name())).expect("the move must work");
+    }
+    fs::remove_dir(root.join("db")).expect("the emptied directory must go");
+    fs::remove_dir_all(root.join("blocks")).expect("the block store goes too");
+
+    assert!(
+        root.join("version").is_file(),
+        "the pre-0014 shape: fjall's own marker in the data directory"
+    );
 }
 
 /// The format version the store at `dir` says it is, read from the sidecar
