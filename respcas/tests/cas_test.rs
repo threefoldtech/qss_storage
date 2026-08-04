@@ -875,26 +875,23 @@ fn the_reading_commands_all_answer_over_hash_keys() {
     assert_eq!(values[2].as_deref(), Some(&big[..]));
 }
 
-/// RSCAN over hash keys, as it actually behaves.
+/// RSCAN over hash keys: the mirror of SCAN.
 ///
-/// It walks the tree backward from the cursor it is handed, exclusive of that
-/// cursor -- the mirror of SCAN, which walks forward from its cursor and is
-/// exclusive of it too. Binary keys travel through the cursor unharmed, which
-/// is the ADR 0014 part and the part that could have broken.
+/// `RSCAN 0` starts the walk at the LARGEST key -- `0` means "the beginning
+/// of this walk", and a backward walk begins at the end of the tree, which is
+/// what zdb's command does and what makes a reverse enumeration startable at
+/// all. Handed a key instead, it resumes strictly below it, exclusive of the
+/// cursor exactly as SCAN is exclusive of its own. Binary keys travel through
+/// the cursor unharmed, which is the ADR 0014 part.
 ///
-/// KNOWN DEVIATION, deliberately pinned here rather than fixed: RSCAN has no
-/// start cursor. `SCAN 0` means "from the beginning", but `RSCAN 0` does NOT
-/// mean "from the end" -- `0` is filtered to "no cursor"
-/// (`cmd.rs::parse_cursor`) and a backward walk with no cursor ranges over
-/// everything below the EMPTY key, which is nothing
-/// (`stores/fjall.rs::iter_kv_backward`). So a client cannot start a reverse
-/// enumeration without already knowing the largest key, and even then the
-/// largest key is never returned, because the cursor is exclusive. zdb, whose
-/// command this is, walks from the end on `RSCAN 0`. The aspiration is the
-/// ignored test below; changing it is a wire-visible change and not this
-/// suite's to make.
+/// It used to answer an empty page to `RSCAN 0`: the cursor was filtered to
+/// "no cursor" (`cmd.rs::parse_cursor`) and a backward walk with no cursor
+/// ranged over everything below the EMPTY key, which is nothing
+/// (`stores/fjall.rs::iter_kv_backward`). A client could not start a reverse
+/// enumeration without already knowing the largest key, and even then never
+/// saw that key.
 #[test]
-fn rscan_walks_backward_from_the_cursor_it_is_given() {
+fn rscan_walks_backward_from_the_largest_key_or_from_the_cursor_it_is_given() {
     let server = TestServer::new();
     let mut conn = server.connect();
     select_cas(&mut conn, "blobs");
@@ -906,14 +903,13 @@ fn rscan_walks_backward_from_the_cursor_it_is_given() {
     }
     keys.sort();
 
-    // The start cursor answers an empty page, and says the walk is over.
+    // The start cursor answers the whole namespace, largest key first.
     let (cursor, page): (Vec<u8>, Vec<Vec<u8>>) =
         redis::cmd("RSCAN").arg("0").query(&mut conn).unwrap();
-    assert_eq!(cursor, b"0");
-    assert!(
-        page.is_empty(),
-        "RSCAN has no start cursor: see the note above"
-    );
+    assert_eq!(cursor, b"0", "six keys, one page");
+    let mut descending: Vec<Vec<u8>> = keys.clone();
+    descending.reverse();
+    assert_eq!(page, descending, "every key, largest first");
 
     // Handed the largest key, it walks the rest of the tree backward. The
     // cursor it was given is not in the answer.
@@ -921,20 +917,25 @@ fn rscan_walks_backward_from_the_cursor_it_is_given() {
         .arg(keys.last().unwrap())
         .query(&mut conn)
         .unwrap();
-    assert_eq!(cursor, b"0", "six keys, one page");
-    let mut expected: Vec<Vec<u8>> = keys[..keys.len() - 1].to_vec();
-    expected.reverse();
-    assert_eq!(page, expected, "every other key, largest first");
+    assert_eq!(cursor, b"0");
+    assert_eq!(
+        page,
+        descending[1..].to_vec(),
+        "every other key, largest first"
+    );
+
+    // And the smallest key ends the walk: there is nothing below it.
+    let (cursor, page): (Vec<u8>, Vec<Vec<u8>>) = redis::cmd("RSCAN")
+        .arg(keys.first().unwrap())
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(cursor, b"0");
+    assert!(page.is_empty(), "the cursor is exclusive at the end too");
 }
 
 /// What a zdb-shaped client expects of `RSCAN 0`: the reverse of `SCAN 0`,
 /// every key, largest first.
-///
-/// Ignored because making it pass changes what an existing wire command
-/// answers, which is not a change a test suite may make on its own. See the
-/// note on `rscan_walks_backward_from_the_cursor_it_is_given`.
 #[test]
-#[ignore = "RSCAN has no start cursor; changing that is a wire-visible change"]
 fn rscan_from_the_start_cursor_should_walk_from_the_largest_key() {
     let server = TestServer::new();
     let mut conn = server.connect();
@@ -952,4 +953,56 @@ fn rscan_from_the_start_cursor_should_walk_from_the_largest_key() {
         redis::cmd("RSCAN").arg("0").query(&mut conn).unwrap();
     assert_eq!(cursor, b"0");
     assert_eq!(page, keys, "the reverse of SCAN, from a bare start cursor");
+}
+
+/// Both walks, across page boundaries: every key exactly once, in opposite
+/// orders, from a bare start cursor.
+///
+/// A page holds ten keys and there are twenty-five of them, so each direction
+/// pages three times and hands back a cursor twice. That is where a cursor
+/// that resumed inclusively (a key twice) or skipped one (a key never) shows
+/// up, and it is the only place either can.
+#[test]
+fn scan_and_rscan_paginate_to_the_same_set_from_opposite_ends() {
+    const KEYS: usize = 25;
+
+    let server = TestServer::new();
+    let mut conn = server.connect();
+    select_cas(&mut conn, "blobs");
+
+    let mut stored: Vec<Vec<u8>> = Vec::new();
+    for i in 0..KEYS as u8 {
+        let value = vec![i; 64];
+        stored.push(redis::cmd("CSET").arg(&value).query(&mut conn).unwrap());
+    }
+    stored.sort();
+
+    let walk = |conn: &mut Connection, command: &str| -> Vec<Vec<u8>> {
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor: Vec<u8> = b"0".to_vec();
+        let mut pages = 0;
+        loop {
+            let (next, keys): (Vec<u8>, Vec<Vec<u8>>) = redis::cmd(command)
+                .arg(&cursor)
+                .query(conn)
+                .unwrap_or_else(|e| panic!("{command} must answer: {e}"));
+            pages += 1;
+            assert!(pages <= KEYS, "{command} is not terminating");
+            seen.extend(keys);
+            if next == b"0" {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(pages, 3, "{command}: ten to a page, twenty-five keys");
+        seen
+    };
+
+    let forward = walk(&mut conn, "SCAN");
+    assert_eq!(forward, stored, "SCAN: every key once, smallest first");
+
+    let backward = walk(&mut conn, "RSCAN");
+    let mut descending = stored.clone();
+    descending.reverse();
+    assert_eq!(backward, descending, "RSCAN: the same set, the other way");
 }

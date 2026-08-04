@@ -471,15 +471,25 @@ impl MetaTreeExt for FjallTree {
         }))
     }
 
+    /// The mirror of [`iter_kv`](Self::iter_kv): no cursor starts at the
+    /// LARGEST key, a cursor resumes strictly below itself.
+    ///
+    /// The no-cursor range has to be unbounded on both ends, not `..empty`:
+    /// the empty key is the smallest key there is, so a range below it is
+    /// always empty and `RSCAN 0` -- whose `0` the command layer reads as "no
+    /// cursor", exactly as `SCAN 0` does -- answered nothing whatever the
+    /// tree held.
     fn iter_kv_backward(&self, start_key: Option<Vec<u8>>) -> KeyValuePairs {
+        use std::ops::Bound;
+
         let partition = self.partition.clone();
         let db = self.db.clone();
         let mut last_key = start_key;
 
         Box::new(std::iter::from_fn(move || {
             let range = match &last_key {
-                Some(k) => ..k.clone(),
-                None => ..Vec::new(),
+                Some(k) => (Bound::Unbounded, Bound::Excluded(k.clone())),
+                None => (Bound::Unbounded, Bound::Unbounded),
             };
 
             Self::range(&db, &partition, range)

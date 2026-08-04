@@ -76,6 +76,12 @@ macro_rules! backend_test_battery {
             let (store, _dir) = ($setup)();
             $crate::metastore::stores::test_utils::test_num_keys(&store);
         }
+
+        #[test]
+        fn test_iter_kv_is_a_mirror_of_iter_kv_backward() {
+            let (store, _dir) = ($setup)();
+            $crate::metastore::stores::test_utils::test_iter_kv_both_directions(&store);
+        }
         // ---- tfstor-extension: END ----
     };
 }
@@ -107,6 +113,69 @@ pub fn test_num_keys(store: &impl TestStore) {
 
     // A tree that was never written to still counts, and counts zero.
     assert_eq!(store.num_keys("test-num-keys-empty").unwrap(), 0);
+}
+
+/// The two directions respcas's SCAN and RSCAN are built on, and the
+/// symmetry between them.
+///
+/// No cursor means "from the end I start at": the smallest key going forward,
+/// the LARGEST key going backward. A cursor resumes strictly past itself, in
+/// whichever direction is being walked. The backward half of that is what
+/// `RSCAN 0` needs -- a no-cursor backward walk that ranged below the empty
+/// key answered nothing at all, so a reverse enumeration could not be
+/// started.
+pub fn test_iter_kv_both_directions(store: &impl TestStore) {
+    let bucket_name = "test-iter-kv";
+    let tree = store.tree_open(bucket_name).unwrap();
+
+    let keys = [
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ];
+    for key in &keys {
+        tree.insert(key, b"value".to_vec()).unwrap();
+    }
+
+    let tree = store.get_bucket_ext(bucket_name).unwrap();
+    let walk = |iter: crate::metastore::KeyValuePairs| -> Vec<Vec<u8>> {
+        iter.map(|kv| kv.unwrap().0).collect()
+    };
+
+    // No cursor: everything, from each end.
+    assert_eq!(walk(tree.iter_kv(None)), keys.to_vec());
+    let mut backward = keys.to_vec();
+    backward.reverse();
+    assert_eq!(
+        walk(tree.iter_kv_backward(None)),
+        backward,
+        "a backward walk with no cursor starts at the largest key"
+    );
+
+    // A cursor is exclusive in both directions.
+    assert_eq!(
+        walk(tree.iter_kv(Some(b"c".to_vec()))),
+        vec![b"d".to_vec(), b"e".to_vec()]
+    );
+    assert_eq!(
+        walk(tree.iter_kv_backward(Some(b"c".to_vec()))),
+        vec![b"b".to_vec(), b"a".to_vec()]
+    );
+
+    // The ends: past the last key in either direction is an empty walk, and
+    // the empty key is a cursor like any other going forward.
+    assert!(walk(tree.iter_kv(Some(b"e".to_vec()))).is_empty());
+    assert!(walk(tree.iter_kv_backward(Some(b"a".to_vec()))).is_empty());
+    assert_eq!(walk(tree.iter_kv(Some(Vec::new()))), keys.to_vec());
+
+    // And a tree with nothing in it walks to nothing either way.
+    let empty_name = "test-iter-kv-empty";
+    let _ = store.tree_open(empty_name);
+    let empty = store.get_bucket_ext(empty_name).unwrap();
+    assert_eq!(empty.iter_kv(None).count(), 0);
+    assert_eq!(empty.iter_kv_backward(None).count(), 0);
 }
 // ---- tfstor-extension: END ----
 

@@ -265,9 +265,11 @@ where
     Ok(make(args.bytes_at(1, "key")?))
 }
 
-/// `<CMD> [cursor]`: SCAN, RSCAN. Cursor "0" means "start from the
-/// beginning"; any other value is a key to resume after, so it is bytes for
-/// the same reason keys are.
+/// `<CMD> [cursor]`: SCAN, RSCAN. Cursor "0" means "start at the beginning of
+/// the walk" -- the smallest key for SCAN and the LARGEST for RSCAN, since a
+/// reverse walk begins at the end of the tree (zdb's semantics, and the
+/// mirror of SCAN's). Any other value is a key to resume past, so it is bytes
+/// for the same reason keys are.
 fn parse_cursor<F>(args: &Args, make: F) -> Result<Command, CommandError>
 where
     F: FnOnce(Option<Bytes>) -> Command,
@@ -975,7 +977,12 @@ impl CommandHandler {
         }
     }
 
-    /// Handle RSCAN command - scan keys in the current namespace in backward direction
+    /// Handle RSCAN command - scan keys in the current namespace in backward
+    /// direction, largest key first
+    ///
+    /// `RSCAN 0` starts the walk at the largest key the namespace holds, and
+    /// each page's cursor resumes strictly below itself -- the mirror of
+    /// SCAN, and what a zdb-shaped client expects.
     fn handle_rscan(&self, cursor: Option<Bytes>) -> Frame {
         debug!("Handling RSCAN command");
 
