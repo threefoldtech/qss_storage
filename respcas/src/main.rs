@@ -169,6 +169,7 @@ mod tests {
         assert_eq!(cfg.host, DEFAULT_RESP_HOST);
         assert_eq!(cfg.port, DEFAULT_RESP_PORT);
         assert_eq!(cfg.admin, None);
+        assert_eq!(cfg.max_value_size, DEFAULT_RESP_MAX_VALUE_SIZE);
         assert_eq!(cfg.store.inline_metadata_size, Some(1));
         assert_eq!(cfg.store.durability, Durability::Fsync);
         assert_eq!(cfg.store.hasher, Hasher::Blake3W32);
@@ -180,7 +181,8 @@ mod tests {
             "[store]\ndurability = \"buffer\"\ninline_metadata_size = 64\n\n\
              [store.hash]\nwidth = 16\n\n\
              [resp]\nhost = \"0.0.0.0\"\nport = 6380\n\
-             data_dir = \"/var/lib/respcas\"\nadmin_password = \"hunter2\"\n",
+             data_dir = \"/var/lib/respcas\"\nadmin_password = \"hunter2\"\n\
+             max_value_size = 8388608\n",
         );
         let cfg = resolve(Opt::default(), &file).unwrap();
 
@@ -188,9 +190,34 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 6380);
         assert_eq!(cfg.admin.as_deref(), Some("hunter2"));
+        assert_eq!(cfg.max_value_size, 8 * 1024 * 1024);
         assert_eq!(cfg.store.inline_metadata_size, Some(64));
         assert_eq!(cfg.store.durability, Durability::Buffer);
         assert_eq!(cfg.store.hasher, Hasher::Blake3W16);
+    }
+
+    /// The value cap (ADR 0014) has no flag: the config file is the only
+    /// place it can be set, so a deployment that needs a different one edits
+    /// `[resp] max_value_size` and nothing on the command line can silently
+    /// outrank it.
+    #[test]
+    fn the_value_cap_is_the_config_files_alone() {
+        let file = config("[resp]\nmax_value_size = 1024\n");
+        let flags = Opt {
+            port: Some(7000),
+            data_dir: Some(PathBuf::from("/tmp/respcas")),
+            ..Opt::default()
+        };
+        let cfg = resolve(flags, &file).unwrap();
+
+        assert_eq!(cfg.max_value_size, 1024);
+        assert_eq!(cfg.port, 7000, "the flags that do exist still apply");
+
+        // An empty [resp] table is not a cap of zero: an absent knob falls
+        // through to the default, which is what "unconfigured" has to mean
+        // for a limit that would otherwise refuse every write.
+        let cfg = resolve(Opt::default(), &config("[resp]\nport = 6380\n")).unwrap();
+        assert_eq!(cfg.max_value_size, DEFAULT_RESP_MAX_VALUE_SIZE);
     }
 
     #[test]
