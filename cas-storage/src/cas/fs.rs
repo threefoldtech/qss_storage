@@ -526,6 +526,36 @@ impl CasFS {
         super::buckets::list_buckets(self)
     }
 
+    /// Copy an object record into another bucket by REFERENCE: same blocks,
+    /// one more reference each, no bytes moved (ADR 0014).
+    ///
+    /// `Ok(None)` means the clone did not happen and nothing was written --
+    /// the source is gone, or a block it named was freed while its
+    /// references were being taken. The caller stores the content the
+    /// ordinary way instead.
+    ///
+    /// The source record's content must have been verified against its key
+    /// (that is what a content-addressed namespace guarantees, and what
+    /// makes the copy safe without re-hashing anything). See
+    /// [`clone_path`](super::clone_path) for the ordering rules and the
+    /// clone-versus-DELETE race.
+    pub async fn clone_object_by_reference(
+        &self,
+        source_bucket: &str,
+        source_key: impl AsRef<[u8]>,
+        dest_bucket: &str,
+        dest_key: impl AsRef<[u8]>,
+    ) -> Result<Option<Object>, MetaError> {
+        super::clone_path::clone_object_by_reference(
+            self,
+            source_bucket,
+            source_key.as_ref(),
+            dest_bucket,
+            dest_key.as_ref(),
+        )
+        .await
+    }
+
     /// Delete an object from a bucket.
     /// it also delete keys under it's tree
     pub async fn delete_object(

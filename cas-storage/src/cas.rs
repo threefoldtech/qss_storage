@@ -14,6 +14,7 @@ pub(crate) mod block_disk;
 mod buckets;
 mod buffered_byte_stream;
 pub mod byte_stream;
+mod clone_path;
 mod delete_path;
 pub mod fs;
 pub(crate) mod group_commit;

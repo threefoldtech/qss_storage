@@ -371,6 +371,81 @@ async fn overwrite_racing_delete_releases_each_record_once() {
     assert_block_state(&shared, id, 1, fs.fs_root());
 }
 
+/// Clone-by-reference racing the DELETE of the record it clones (ADR 0014).
+///
+/// The clone takes its references under each block's stripe and writes its
+/// record only after every one of them succeeded, so there are exactly two
+/// outcomes and no third:
+///
+/// - the bump won the stripe: rc never reached zero, and the clone's record
+///   names blocks that are still there;
+/// - the delete's last decrement won: the clone finds nothing to reference,
+///   refuses, gives back whatever it had taken, and writes no record.
+///
+/// The assertion is therefore not "the clone succeeded" -- it is that
+/// success and refusal each imply their own state, checked per iteration.
+/// A clone that could publish a record naming a freed block would show up
+/// here as a resolve failure on a record that exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clone_by_reference_racing_delete_never_names_a_freed_block() {
+    let dir = tempdir().unwrap();
+    let (shared, namespaces) = store_with_namespaces(dir.path(), None, 1);
+    let fs = namespaces[0].clone();
+    fs.create_bucket("source").unwrap();
+    fs.create_bucket("dest").unwrap();
+
+    let data = b"cloned and deleted at the same time".repeat(120).to_vec();
+    let id = shared.hasher().hash(&data);
+
+    for _ in 0..STORM_ITERATIONS {
+        put(&fs, "source", "k", data.clone()).await;
+
+        let cloner = {
+            let fs = fs.clone();
+            tokio::spawn(async move {
+                fs.clone_object_by_reference("source", b"k", "dest", b"k")
+                    .await
+                    .unwrap()
+            })
+        };
+        let deleter = {
+            let fs = fs.clone();
+            tokio::spawn(async move { fs.delete_object("source", b"k").await.unwrap() })
+        };
+        let cloned = cloner.await.unwrap();
+        deleter.await.unwrap();
+
+        match cloned {
+            Some(_) => {
+                // The record exists, so every block it names must still be
+                // there and readable -- that is the loss this test is for.
+                let (_, paths) = fs
+                    .get_object_paths("dest", b"k")
+                    .unwrap()
+                    .expect("a clone that landed has a record");
+                for (path, _) in &paths {
+                    assert!(
+                        path.exists(),
+                        "a landed clone must never name a freed block: {}",
+                        path.display()
+                    );
+                }
+            }
+            None => {
+                assert!(
+                    fs.get_object_meta("dest", b"k").unwrap().is_none(),
+                    "a refused clone must leave no record behind"
+                );
+            }
+        }
+
+        // Quiesce the round: both keys gone, and with them the block.
+        fs.delete_object("source", b"k").await.unwrap();
+        fs.delete_object("dest", b"k").await.unwrap();
+        assert_block_state(&shared, id, 0, fs.fs_root());
+    }
+}
+
 /// The reader race an overwrite inherits IS the delete race, unchanged.
 ///
 /// A reader resolves its block list from the object record and then reads the
