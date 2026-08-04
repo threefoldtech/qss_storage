@@ -61,7 +61,7 @@ EOF
 
 # --- rails, the harness's own conditions -------------------------------
 
-[ "$(findmnt -no FSTYPE $MOUNT)" = xfs ] || fail "$MOUNT is not xfs"
+[ "$(findmnt -no FSTYPE $MOUNT)" = "${QSSMX_FSTYPE:-xfs}" ] || fail "$MOUNT is not ${QSSMX_FSTYPE:-xfs}"
 [ -f "$MOUNT/.qss-realtest" ] || fail "no sentinel at $MOUNT/.qss-realtest"
 [ -x "$BIN/s3cas" ] || fail "no release s3cas"
 [ -x "$BIN/qss-storage-fsck" ] || fail "no release qss-storage-fsck"
@@ -77,16 +77,22 @@ for entry in "$STORE_ROOT"/*; do
 done
 
 # Wipe only after fsck confirms this is a qss store (exit 3 = could not
-# open, anything else means fsck had an opinion about a real store).
-"$BIN/qss-storage-fsck" --config "$TOML" \
-    --meta-root "$S3_STORE" --fs-root "$S3_STORE" >/dev/null 2>&1
-rc=$?
-[ "$rc" -ne 3 ] || fail "fsck could not open $S3_STORE; refusing to wipe"
-log "fsck confirmed a qss store (exit $rc); wiping the tb fill"
-t0=$(date +%s)
-rm -rf "${STORE_ROOT:?}/s3" "${STORE_ROOT:?}/resp" || fail "wipe failed"
-WIPE_S=$(($(date +%s) - t0))
-log "wipe took ${WIPE_S}s"
+# open, anything else means fsck had an opinion about a real store). A
+# store dir that does not exist is the one state with nothing to wipe:
+# the first run on a virgin mount goes straight to mkdir.
+if [ -e "$S3_STORE" ]; then
+    "$BIN/qss-storage-fsck" --config "$TOML" \
+        --meta-root "$S3_STORE" --fs-root "$S3_STORE" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 3 ] || fail "fsck could not open $S3_STORE; refusing to wipe"
+    log "fsck confirmed a qss store (exit $rc); wiping the tb fill"
+    t0=$(date +%s)
+    rm -rf "${STORE_ROOT:?}/s3" "${STORE_ROOT:?}/resp" || fail "wipe failed"
+    WIPE_S=$(($(date +%s) - t0))
+    log "wipe took ${WIPE_S}s"
+else
+    log "no store at $S3_STORE; virgin mount, nothing to wipe"
+fi
 mkdir -p "$S3_STORE"
 
 # --- the daemon, at buffer ---------------------------------------------

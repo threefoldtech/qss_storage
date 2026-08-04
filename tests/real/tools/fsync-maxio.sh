@@ -47,7 +47,7 @@ s3 =
   max_concurrent_requests = 12
 EOF
 
-[ "$(findmnt -no FSTYPE $MOUNT)" = xfs ] || fail "$MOUNT is not xfs"
+[ "$(findmnt -no FSTYPE $MOUNT)" = "${QSSMX_FSTYPE:-xfs}" ] || fail "$MOUNT is not ${QSSMX_FSTYPE:-xfs}"
 [ -f "$MOUNT/.qss-realtest" ] || fail "no sentinel"
 (echo >/dev/tcp/127.0.0.1/18014) 2>/dev/null && fail "port 18014 busy"
 
@@ -58,12 +58,16 @@ for entry in "$STORE_ROOT"/*; do
     *) fail "unrecognised entry $entry" ;;
     esac
 done
-"$BIN/qss-storage-fsck" --config "$TOML" \
-    --meta-root "$S3_STORE" --fs-root "$S3_STORE" >/dev/null 2>&1
-rc=$?
-[ "$rc" -ne 3 ] || fail "fsck could not open $S3_STORE; refusing to wipe"
-log "fsck confirmed a qss store (exit $rc); wiping"
-rm -rf "${STORE_ROOT:?}/s3" "${STORE_ROOT:?}/resp" || fail "wipe"
+if [ -e "$S3_STORE" ]; then
+    "$BIN/qss-storage-fsck" --config "$TOML" \
+        --meta-root "$S3_STORE" --fs-root "$S3_STORE" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 3 ] || fail "fsck could not open $S3_STORE; refusing to wipe"
+    log "fsck confirmed a qss store (exit $rc); wiping"
+    rm -rf "${STORE_ROOT:?}/s3" "${STORE_ROOT:?}/resp" || fail "wipe"
+else
+    log "no store at $S3_STORE; virgin mount, nothing to wipe"
+fi
 mkdir -p "$S3_STORE"
 
 "$BIN/s3cas" server --config "$TOML" \
