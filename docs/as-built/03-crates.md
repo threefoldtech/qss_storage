@@ -78,8 +78,12 @@ was the pre-2018 `mod.rs` files, converted by `git mv`.)
 
 ### Public surface
 
-`lib.rs:81-150` re-exports deliberately, so consumers never name the module
-path. Five groups: the hasher (`Hasher`, `HasherError`), the config types
+`lib.rs:82-152` re-exports deliberately, so consumers never name the module
+path. Every re-export is a named list -- the two globs that used to stand at
+the `metastore` front (`meta_store::*` and `traits::*`) were replaced with
+named lists on 2026-08-04, so a new `pub` item joins the public surface only
+when somebody decides it should. Five groups: the hasher (`Hasher`,
+`HasherError`), the config types
 (`QssStorageConfig` and its per-section structs, `ConfigError`),
 `StoreOptions`, metastore types (`MetaStore`, `Store`, `BaseMetaTree`,
 `MetaTreeExt`, `Block`, `BlockId`, `BlockTree`, `BucketMeta`, `ContentHash`,
@@ -90,6 +94,13 @@ path. Five groups: the hasher (`Hasher`, `HasherError`), the config types
 `MultiPartTree`, `RangeRequest`, `GroupCommit`, `GroupCommitStats`,
 `SweepStats`, `sweep_stale_uploads`, `UploadClaim`, `BLOCKS_DB_DIR_NAME`,
 `STORE_ID_MARKER_NAME`), plus metrics.
+
+Below `lib.rs` only two modules stay public -- `cas::fs` and
+`metastore::store_header`, each for items the re-exports do not carry -- and
+each says so in a comment where it is declared. The storage pipeline and the
+nine scrub walkers are private modules behind their re-exported names; see
+[01-architecture.md](./01-architecture.md#module-fronts) for the full tree and
+the house rules it follows.
 
 Both doctests in `lib.rs` compile (`no_run`), covering the single-namespace
 and multi-namespace construction paths. They are the only executable
@@ -124,7 +135,7 @@ Binary crate, 4916 lines across 9 files, edition 2024.
 | `inspect.rs` | 382 | `num-keys`, `disk-space`, `header` |
 | `retrieve.rs` | 157 | object extraction |
 | `internal_macros.rs` | 16 | the `try_!` macro |
-| `lib.rs` | 14 | module wiring + the `cas_storage` re-export |
+| `lib.rs` | 12 | module wiring + the single `cas` alias for `cas_storage` |
 
 The S3 trait implementation used to be called `S3FS` and to live in
 `s3fs.rs`; it is `S3Cas` in `api.rs` since `a438277` (2026-08-03), on the
@@ -191,7 +202,7 @@ server backed by `cas-storage`. Called `respd` until 2026-08-02.
 | `tests/password_test.rs` | 134 | password protection |
 | `property.rs` | 58 | namespace property parsing |
 | `conn.rs` | 54 | connection framing |
-| `lib.rs` | 11 | module wiring |
+| `lib.rs` | 14 | module wiring; the test-access front, not an API |
 
 ### Command surface
 
@@ -244,6 +255,13 @@ read to discover that its namespace is not WORM.
 `Command::from_frame` (`cmd.rs:400`) is a 30-line dispatch table over
 per-command parser functions; `server.rs::process` is a 15-line delegate to
 `Session`. Both were finding B2 at 388 and 212 lines respectively.
+
+`lib.rs` is a second compilation of the same sources: `main.rs` declares its
+own `mod` tree, so the binary never links against the library crate and the
+library exists only so `tests/` can drive the internals. It is scoped to that
+-- five modules and eighteen items, down from eight and eighty-six -- and the
+list is in
+[01-architecture.md](./01-architecture.md#module-fronts).
 
 ## benches (`qss-benches`)
 

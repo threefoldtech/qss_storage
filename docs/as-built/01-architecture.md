@@ -33,6 +33,127 @@ Dependency direction is strictly one-way: the three binaries depend on
 `cas-storage`, and `cas-storage` depends on none of them. There is no shared
 code between `s3cas` and `respcas` other than through the library.
 
+## Module fronts
+
+Every module exports the minimum its real consumers use. What follows is the
+public surface as it stands, with the compiler and the test suite as referee:
+a name is here because something outside its module names it, and what is not
+here is not reachable from outside.
+
+### cas-storage (library)
+
+The front is seven modules and fifty curated re-exports in `lib.rs`.
+
+```
+cas_storage
+|
++-- cas               1 public module, 16 names
+|     fs              public for BLOCK_SIZE alone (s3cas's check tests)
+|     re-exports:     CasFS, StorageEngine, SharedBlockStore, AsyncByteStream,
+|                     BlockStream, BlockCorruption, RangeRequest, MultiPart,
+|                     MultiPartTree, GroupCommit, GroupCommitStats,
+|                     SweepStats, sweep_stale_uploads, UploadClaim,
+|                     BLOCKS_DB_DIR_NAME, STORE_ID_MARKER_NAME
+|
++-- config            the qss_storage.toml loader and every default
++-- hasher            Hasher, HasherError
+|
++-- metastore         1 public module, 33 names
+|     store_header    public for classify_db_dir, STORE_HEADER_MAGIC and
+|                     STORE_HEADER_VERSION (s3cas's inspect tool)
+|     re-exports:     MetaStore, Transaction, BlockTree, BlockDecrement,
+|                     DEFAULT_BLOCK_TREE, MULTIPART_PARTS_TREE, UPLOADS_TREE,
+|                     Store, BaseMetaTree, MetaTreeExt, Durability,
+|                     KeyValuePairs, Block, BlockId, BLOCKID_SIZE,
+|                     MAX_BLOCKID_SIZE, block_disk_path, BucketMeta,
+|                     ContentHash, CONTENT_HASH_SIZE, Object, ObjectData,
+|                     ObjectType, MetaError, FsError, StorePairingMismatch,
+|                     FjallStore, HeaderSpec, StoreHeader, StoreHeaderError,
+|                     StoreId, StoreInit, UploadRecord
+|
++-- metrics           MetricsCollector, NoOpMetrics, SharedMetrics
++-- scrub             no public modules, 35 names
++-- store_options     StoreOptions
+```
+
+Three of those seven -- `hasher`, `metrics` and `store_options` -- hold
+exactly the items `lib.rs` already re-exports, and no consumer in or out of
+the workspace names them by path. They are public as a redundancy, not as a
+door, and could be closed without moving a name.
+
+The storage pipeline is not in that list, and that is the point. Every stage
+of it is a private module reachable only through `CasFS`: `write_path`,
+`read_path`, `delete_path`, `clone_path`, `uploads`, `buckets`, `placement`,
+`stripes`, `block_disk`, `group_commit`, plus `block_stream`, `byte_stream`,
+`buffered_byte_stream`, `gc`, `multipart`, `range_request` and
+`shared_block_store`. A caller cannot reach a half of the write protocol
+without going through the type that owns the ordering rules.
+
+`scrub` is the same shape one level down: the nine walkers (`disk`, `engine`,
+`findings`, `holders`, `pairing`, `passes`, `records`, `repair`, `report`) are
+private modules behind a flat set of names -- `run`, `repair`, `re_pair`,
+`exit_code`, `ScrubContext`, `ScrubOptions`, `Report` and the finding and
+repair types. `qss-storage-fsck` and respcas's layout test both drive it that
+way and neither names a walker's module.
+
+### s3cas (binary)
+
+Five modules, and one alias for the library it is built on:
+
+```
+s3cas
++-- api           impl S3 for S3Cas -- the whole S3 verb surface
++-- check         integrity checking
++-- inspect       num-keys, disk-space, header
++-- metrics       the Prometheus collector and MetricFs
++-- retrieve      object extraction
++-- cas           = cas_storage (the one canonical path)
+```
+
+`internal_macros` is private, `#[macro_use]`d for `try_!`. The crate published
+`cas_storage` under three names until 2026-08-04 -- `s3cas::cas_storage`,
+`s3cas::cas` and `s3cas::metastore` -- which meant three ways to write the
+same import and no way to tell which was meant. One remains.
+
+### respcas (binary)
+
+The binary declares its own module tree in `main.rs` and never goes through
+the library crate, so `respcas/src/lib.rs` is not an API: it exists so the
+integration tests can drive the pieces they test directly. It is scoped to
+exactly that -- five modules and eighteen items, down from eight and
+eighty-six:
+
+```
+respcas (test access only)
++-- cmd           Command, CommandError, Command::from_frame
++-- content       value_key
++-- namespace     NamespaceCache, NamespaceCache::new
++-- server        process, run
++-- storage       Storage (new, cas, init_namespace, create_namespace,
+|                 get_namespace_meta, set_key_mode), NamespaceMeta, KeyMode,
+|                 StorageError
++-- conn          private
++-- property      private
++-- resp          private
+```
+
+`server::run` is the one item here that no test calls. It stays public because
+the library's copy of that module has no caller at all -- `main.rs` compiles
+its own -- so `pub(crate)` would make it dead code rather than private code.
+
+### House rules
+
+1. **The tiniest front to each module.** Export the minimum real consumers
+   use. A module with nothing externally used is itself not public.
+2. **Named re-exports only, no globs.** A `pub use x::*` is an unlocked door:
+   it enrolls the next `pub` item somebody adds to `x` into the public surface
+   without anyone deciding it should be there.
+3. **One canonical path per name.** No aliases publishing the same crate
+   twice, and no name reachable by two routes.
+4. **The storage pipeline is reachable only through `CasFS`.** The ordering
+   rules of ADR 0006, 0008, 0010 and 0011 live in the type that owns them, and
+   a caller cannot step around it into a single stage.
+
 ## Provenance: where `cas-storage` came from
 
 `cas-storage/` was not originally written here. It was vendored from
