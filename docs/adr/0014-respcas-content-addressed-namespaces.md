@@ -1,8 +1,9 @@
 # respcas Content-Addressed Namespaces
 
-**Status**: Accepted (2026-08-04, owner sign-off; all four review asks
-ruled and the ruling-4 reading -- per-namespace rc contributions via
-clone-by-reference -- confirmed)
+**Status**: Accepted and IMPLEMENTED (2026-08-04, series 0094cf5..515a1ab
+on development; all gates green, 455 tests. See "As built" below for the
+four places this document was wrong about the code and what was done
+instead.)
 **Date**: 2026-08-04
 **Updated**: 2026-08-04 (all four review asks ruled by owner; verification
 semantics reworked per ruling 4 -- dedup hits are served by reference,
@@ -428,6 +429,57 @@ store with both namespace kinds populated.
    per block per namespace, drop the value write); return-key mode's
    hashing is inherent verification, and the write is omitted on any hit.
    Folded into Decision 3.
+
+---
+
+## As Built (2026-08-04)
+
+Four claims above were wrong about the code, and the implementation
+delivers the specified OUTCOMES by different means:
+
+1. **"Record insert + rc+1 in one transaction" is impossible.** The
+   record lives in the namespace database and `_BLOCKS` in the blocks
+   database; no fjall transaction spans two databases (ADR 0003's
+   precedent works only because `_UPLOADS` and `_MULTIPART_PARTS` share
+   one). Built instead: references are acquired FIRST, one per block under
+   that block's stripe, then the record is written; on any refusal or
+   failure every reference already taken is released. A crash in the
+   middle leaves an over-count (fsck INFO, recount collects it), never a
+   record naming a dead block. The clone-vs-DEL race resolves to exactly
+   the ADR's two outcomes: bump-first means the block survives the DEL;
+   DEL-first means the clone refuses (`Ok(None)`) and the caller falls
+   through to the ordinary verified write with the bytes it still holds.
+   Full reasoning at the head of `cas-storage/src/cas/clone_path.rs`.
+2. **There is no header "minor version".** The QSST header carries one
+   exact-match `u16`. Built instead: stores are still CREATED at v3; this
+   build OPENS {3, 4}; the first `NSSET key_mode cas` raises the store to
+   v4 -- before the metadata an older build cannot decode is written, so
+   the raise is what buys the older build's clean refusal. A store that
+   never uses Cas mode stays openable by pre-0014 builds.
+3. **fsck did NOT already walk this layout.** `bucket_integrity` decoded
+   `_BUCKETS` values as `BucketMeta`; respcas stores msgpack
+   `NamespaceMeta` there, so the walk errored on a healthy respcas store.
+   Fixed via `MetaStore::list_bucket_names` (the key is the name; the
+   value is not fsck's business).
+4. **respcas's data dir was the fjall directory itself**, not the
+   `{store_header.bin, db/, blocks/}` layout this document assumed. New
+   stores get the ADR layout; pre-0014 stores open where they are and
+   gain `blocks/` additively (`respcas/src/storage.rs::db_path`).
+
+Notable reversible deviations, taken and kept: the constructor options
+struct is the existing `StoreOptions` rather than a new type (the 11-arg
+`CasFS::single_namespace` and 9-arg `SharedBlockStore::new` now take it;
+owner asked for this mid-build); `CasFS::over_namespace` for the
+namespace-parameterized paths; object keys are bytes end to end
+(`impl AsRef<[u8]>`), with only S3 layering UTF-8 on top;
+`CommandHandler::execute` went async; `max_value_size` is enforced against
+the DECLARED bulk length before buffering, not after. Two strays fixed en
+route: the RESP encoder's 16 KiB reply guess dropped connections on any
+larger GET (pre-existing, userkey-reachable); an ordinary write no longer
+pays the worm occupancy read unless the namespace is worm. `NSSET
+key_mode sequential` is refused as unimplemented rather than accepted and
+ignored. Still owed: `docs/as-built/*` predates this ADR and still says
+respcas addresses no blocks.
 
 ---
 
