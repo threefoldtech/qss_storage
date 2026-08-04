@@ -194,7 +194,7 @@ impl BlockDiskOps for RealDiskOps {
 /// attempt knows, at a depth already chosen, so landing it is a rename and a
 /// directory sync -- no decision left to make.
 #[derive(Debug)]
-pub(super) struct StagedBlock {
+pub(crate) struct StagedBlock {
     /// Fanout depth `final_path` was derived at, which the block's record
     /// must name -- the record follows the file, never the other way round.
     pub(super) depth: u8,
