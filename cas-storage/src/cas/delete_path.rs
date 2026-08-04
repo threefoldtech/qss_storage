@@ -135,10 +135,18 @@ pub(crate) async fn release_blocks(
 
 #[tracing::instrument(skip(fs, key), fields(bucket = %bucket, key = %object_key(key), blocks_deleted))]
 pub(super) async fn delete_object(fs: &CasFS, bucket: &str, key: &[u8]) -> Result<bool, MetaError> {
-    // Step 1: atomically take the object record out of the namespace DB.
-    // An absent key deletes nothing and is not an error (idempotent).
+    // Step 1: atomically take the object record out of the namespace DB, and
+    // give its logical bytes back to the bucket's usage counter in the same
+    // transaction. An absent key deletes nothing and is not an error
+    // (idempotent), and moves no counter.
     let mut tx = fs.namespace.begin_transaction();
-    let obj = match tx.take_object(bucket, key) {
+    let taken = tx.take_object(bucket, key).and_then(|obj| {
+        if let Some(obj) = &obj {
+            tx.add_bucket_usage(bucket, -(obj.size() as i64))?;
+        }
+        Ok(obj)
+    });
+    let obj = match taken {
         Ok(obj) => {
             tx.commit()?;
             obj

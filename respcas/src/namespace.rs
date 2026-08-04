@@ -289,21 +289,26 @@ impl Namespace {
         Ok(())
     }
 
-    pub(crate) fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
+    /// The user-keyed write: the value goes in its own record, under the name
+    /// the client chose.
+    ///
+    /// A user-keyed namespace inlines every value whatever its size, exactly
+    /// as respcas always has: the block path is the content-addressed
+    /// namespaces' (ADR 0014), and giving it to this one would change the
+    /// durability and latency of writes no client asked to change. The
+    /// record still goes through the store's own inline write rather than a
+    /// bare tree insert, because that is where the record and the namespace's
+    /// usage counter are moved together -- an overwrite has to give back what
+    /// it displaced, and a blind insert cannot say what that was.
+    pub(crate) async fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
         self.refuse_unless_writable(Some(key))?;
 
         // Note: Authentication check is now handled by the CommandHandler
 
-        // Proceed with setting the key. A user-keyed namespace inlines every
-        // value whatever its size, exactly as respcas always has: the block
-        // path is the content-addressed namespaces' (ADR 0014), and giving
-        // it to this one would change the durability and latency of writes
-        // no client asked to change.
-        let data = value.to_vec();
-        let hash = ContentHash(Md5::digest(&data).into());
-        let size = data.len() as u64;
-        let obj_meta = Object::new(size, hash, ObjectData::Inline { data });
-        self.tree.read().unwrap().insert(key, obj_meta.to_vec())?;
+        let bucket = self.name();
+        self.cas
+            .store_inlined_object(&bucket, key, value.to_vec())
+            .await?;
         Ok(())
     }
 

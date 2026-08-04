@@ -606,7 +606,7 @@ impl CommandHandler {
             return self.ingest(mode, value).await;
         }
 
-        match self.namespace.set(&key, value) {
+        match self.namespace.set(&key, value).await {
             Ok(()) => Frame::SimpleString("OK".into()),
             Err(e) => {
                 error!("Error setting key {}: {}", shown(&key), e);
@@ -782,16 +782,29 @@ impl CommandHandler {
     }
 
     /// Handle NSINFO command - display information about a namespace
+    ///
+    /// `data_size_bytes` is what the namespace holds and `data_limits_bytes`
+    /// what it may hold (`0` for no limit) -- the pair an operator needs to
+    /// answer "how full is it", spelled the way zdb spells them.
     fn handle_nsinfo(&self, name: String) -> Frame {
         debug!("Handling NSINFO command for namespace: {}", name);
         match self.storage.get_namespace_meta(&name) {
             Ok(meta) => {
+                let usage = match self.storage.namespace_usage(&name) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Error reading the usage of namespace {}: {}", name, e);
+                        return Frame::Error(format!("ERR {}", e));
+                    }
+                };
+
                 // Format the namespace information as a multi-line string
                 let info = format!(
-                    "# namespace\nname: {}\npublic: {}\npassword: {}\ndata_limits_bytes: {}\nmode: {}\nworm: {}\nlocked: {}",
+                    "# namespace\nname: {}\npublic: {}\npassword: {}\ndata_size_bytes: {}\ndata_limits_bytes: {}\nmode: {}\nworm: {}\nlocked: {}",
                     meta.name,
                     if meta.public { "yes" } else { "no" },
                     if meta.password.is_some() { "yes" } else { "no" },
+                    usage,
                     meta.max_size.unwrap_or(0),
                     key_mode_name(meta.key_mode),
                     if meta.worm { "yes" } else { "no" },

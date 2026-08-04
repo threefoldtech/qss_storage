@@ -1089,6 +1089,100 @@ mod tests {
             .map(|block| block.rc())
     }
 
+    /// The bucket's usage counter, in logical bytes.
+    fn usage(fs: &CasFS, bucket: &str) -> Option<u64> {
+        fs.namespace_meta_store().bucket_usage(bucket).unwrap()
+    }
+
+    /// The per-bucket usage ledger: every object write and every delete moves
+    /// it, and the number it lands on is the sum of the records' sizes.
+    ///
+    /// LOGICAL bytes, deliberately: the same content stored in two buckets
+    /// costs one set of blocks on disk and counts in full against both, since
+    /// either of them can be the holder that keeps it alive. It is what
+    /// respcas spends a namespace quota in (`max_size`).
+    #[tokio::test]
+    async fn the_usage_counter_follows_the_records_it_counts() {
+        let (fs, _dir) = setup_test_fs(StorageEngine::Fjall, Hasher::Blake3W32);
+        fs.create_bucket("b").unwrap();
+        assert_eq!(usage(&fs, "b"), Some(0), "a fresh bucket counts nothing");
+
+        // A store adds its size, inline or block-backed alike.
+        fs.store_inlined_object("b", "small", vec![7u8; 40])
+            .await
+            .unwrap();
+        assert_eq!(usage(&fs, "b"), Some(40));
+
+        let big = put_blocks(&fs, "b", "big", vec![9u8; 3 * BLOCK_SIZE]).await;
+        assert_eq!(big.size(), 3 * BLOCK_SIZE as u64);
+        assert_eq!(usage(&fs, "b"), Some(40 + 3 * BLOCK_SIZE as u64));
+
+        // An overwrite applies the difference, in both directions.
+        fs.store_inlined_object("b", "small", vec![7u8; 100])
+            .await
+            .unwrap();
+        assert_eq!(usage(&fs, "b"), Some(100 + 3 * BLOCK_SIZE as u64));
+        fs.store_inlined_object("b", "big", vec![7u8; 10])
+            .await
+            .unwrap();
+        assert_eq!(
+            usage(&fs, "b"),
+            Some(110),
+            "the blocks it displaced are gone"
+        );
+
+        // A delete gives the bytes back, and deleting nothing changes nothing.
+        assert!(fs.delete_object("b", "small").await.unwrap());
+        assert_eq!(usage(&fs, "b"), Some(10));
+        assert!(!fs.delete_object("b", "small").await.unwrap());
+        assert_eq!(usage(&fs, "b"), Some(10));
+        assert!(fs.delete_object("b", "big").await.unwrap());
+        assert_eq!(usage(&fs, "b"), Some(0), "an emptied bucket counts nothing");
+
+        // A dropped bucket takes its counter with it: the name is free, and
+        // so is the budget of whatever is created under it next.
+        fs.store_inlined_object("b", "again", vec![1u8; 64])
+            .await
+            .unwrap();
+        assert_eq!(usage(&fs, "b"), Some(64));
+        fs.namespace_meta_store().drop_bucket("b").unwrap();
+        assert_eq!(usage(&fs, "b"), None);
+    }
+
+    /// A cross-namespace clone (ADR 0014) is a store on the ledger: the
+    /// destination is charged the full logical size, however few bytes moved.
+    #[tokio::test]
+    async fn a_clone_charges_the_destination_in_full() {
+        let (fs, _dir) = setup_test_fs(StorageEngine::Fjall, Hasher::Blake3W32);
+        fs.create_bucket("source").unwrap();
+        fs.create_bucket("dest").unwrap();
+
+        let obj = put_blocks(&fs, "source", "k", vec![3u8; 2 * BLOCK_SIZE]).await;
+        assert_eq!(usage(&fs, "source"), Some(obj.size()));
+        assert_eq!(usage(&fs, "dest"), Some(0));
+
+        fs.clone_object_by_reference("source", b"k", "dest", b"k")
+            .await
+            .unwrap()
+            .expect("the source is there");
+
+        assert_eq!(
+            usage(&fs, "dest"),
+            Some(obj.size()),
+            "a reference to content is a record of that size in this namespace"
+        );
+        assert_eq!(
+            usage(&fs, "source"),
+            Some(obj.size()),
+            "and the source is unmoved"
+        );
+
+        // The source letting go leaves the clone's charge exactly where it is.
+        fs.delete_object("source", "k").await.unwrap();
+        assert_eq!(usage(&fs, "source"), Some(0));
+        assert_eq!(usage(&fs, "dest"), Some(obj.size()));
+    }
+
     /// An INLINE write replacing a BLOCK-BACKED object: the case ADR 0008
     /// singles out. The new record names no blocks at all, so the release is
     /// the only thing standing between the overwrite and a permanent leak --

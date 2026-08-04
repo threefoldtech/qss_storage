@@ -9,7 +9,7 @@ use tracing::info;
 
 use cas_storage::metastore::store_header::{self, STORE_HEADER_VERSION_CAS_NAMESPACE};
 use cas_storage::{
-    CasFS, FjallStore, HeaderSpec, MetaError, MetaStore, MetaTreeExt, SharedBlockStore,
+    CasFS, FjallStore, HeaderSpec, MetaError, MetaStore, MetaTreeExt, Object, SharedBlockStore,
     SharedMetrics, StoreOptions,
 };
 
@@ -108,12 +108,81 @@ impl Storage {
             opts.verify_on_read,
         );
 
-        Ok(Self {
+        let storage = Self {
             store,
             db_path,
             data_dir,
             cas,
-        })
+        };
+        storage
+            .adopt_usage_ledger()
+            .map_err(|e| MetaError::OtherDBError(e.to_string()))?;
+
+        Ok(storage)
+    }
+
+    /// Gives every namespace that has no usage counter the one its records
+    /// add up to.
+    ///
+    /// A namespace written before the counter existed says "never accounted"
+    /// rather than "zero bytes", and a quota answered from that would hand a
+    /// full namespace an empty budget. So the number is derived once, here,
+    /// where nothing is serving yet: this runs at open, before the listener
+    /// accepts anything, so no write can race the sum.
+    ///
+    /// The cost is one point read per namespace on every open and one full
+    /// walk per unaccounted namespace, ever -- a namespace this build created
+    /// has its counter from its first moment ([`MetaStore::insert_bucket_if_absent`]).
+    fn adopt_usage_ledger(&self) -> Result<(), StorageError> {
+        for meta in self.iter_namespace()? {
+            let name = meta?.name;
+            if self.store.bucket_usage(&name)?.is_some() {
+                continue;
+            }
+
+            let total = self.sum_record_sizes(&name)?;
+            self.store.set_bucket_usage(&name, total)?;
+            info!("namespace {name} predates the usage ledger: adopted at {total} logical byte(s)");
+        }
+        Ok(())
+    }
+
+    /// The logical bytes a namespace's records add up to, read from the
+    /// records themselves.
+    fn sum_record_sizes(&self, name: &str) -> Result<u64, StorageError> {
+        let tree = self.get_namespace(name)?;
+        let mut total: u64 = 0;
+        for entry in tree.iter_all() {
+            let (_, raw) = entry.map_err(|e| StorageError::MetaError(e.to_string()))?;
+            let object =
+                Object::try_from(&*raw).map_err(|e| StorageError::MetaError(e.to_string()))?;
+            total = total.saturating_add(object.size());
+        }
+        Ok(total)
+    }
+
+    /// Logical bytes stored in `name`: what its records say a client put
+    /// there, which is what a `max_size` quota is spent in.
+    ///
+    /// Not disk: two namespaces holding one deduplicated value are each
+    /// charged in full, because either of them can be the holder that keeps
+    /// the bytes alive.
+    pub fn namespace_usage(&self, name: &str) -> Result<u64, StorageError> {
+        if !self.store.bucket_exists(name)? {
+            return Err(StorageError::NamespaceNotFound);
+        }
+        // The `None` case is the namespace created between this store's open
+        // and now by another process -- impossible, fjall locks the directory
+        // -- or one the adoption above has not seen. Summing is the honest
+        // answer either way.
+        match self.store.bucket_usage(name)? {
+            Some(bytes) => Ok(bytes),
+            None => {
+                let total = self.sum_record_sizes(name)?;
+                self.store.set_bucket_usage(name, total)?;
+                Ok(total)
+            }
+        }
     }
 
     /// Where the metadata database of the store at `data_dir` lives.

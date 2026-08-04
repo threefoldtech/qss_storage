@@ -75,6 +75,19 @@ fn select(conn: &mut Connection, name: &str) {
     let _: String = redis::cmd("SELECT").arg(name).query(conn).unwrap();
 }
 
+/// The logical bytes NSINFO says a namespace holds.
+fn usage(conn: &mut Connection, name: &str) -> u64 {
+    let info: String = redis::cmd("NSINFO")
+        .arg(name)
+        .query(conn)
+        .expect("NSINFO must answer");
+    info.lines()
+        .find_map(|line| line.strip_prefix("data_size_bytes: "))
+        .unwrap_or_else(|| panic!("NSINFO must report data_size_bytes:\n{info}"))
+        .parse()
+        .expect("the usage is a number")
+}
+
 /// Writes one of each kind of record and returns the cas key, so both halves
 /// of a restart test say the same thing about what was written.
 fn write_a_bit_of_everything(conn: &mut Connection, value: &[u8]) -> Vec<u8> {
@@ -148,6 +161,60 @@ fn killing_the_daemon_keeps_what_was_acknowledged() {
 
     let restarted = ChildServer::spawn(&data_dir);
     read_it_all_back(&mut restarted.connect(), &key, &value);
+}
+
+/// What a namespace holds is a number in the store, not one in the process.
+///
+/// The usage counter each namespace's quota is spent against moves inside the
+/// same transaction as the record that moved it, so a restart can only find
+/// the two agreeing. A counter kept in memory, or written beside the
+/// transaction, would pass every test that does not stop the daemon.
+#[test]
+fn what_a_namespace_holds_is_the_same_after_a_restart() {
+    let mut server = TestServer::new_durable();
+    let data_dir = server.data_dir().to_path_buf();
+
+    let before = {
+        let mut conn = server.connect();
+        let _: String = redis::cmd("NSNEW").arg("named").query(&mut conn).unwrap();
+        select(&mut conn, "named");
+        for i in 0..5u8 {
+            let _: String = redis::cmd("SET")
+                .arg(format!("key-{i}"))
+                .arg(vec![i; 1000])
+                .query(&mut conn)
+                .unwrap();
+        }
+        // One overwrite and one delete, so the number is not simply the sum
+        // of what was sent.
+        let _: String = redis::cmd("SET")
+            .arg("key-0")
+            .arg(vec![0u8; 10])
+            .query(&mut conn)
+            .unwrap();
+        let removed: i64 = redis::cmd("DEL").arg("key-4").query(&mut conn).unwrap();
+        assert_eq!(removed, 1);
+
+        cas_namespace(&mut conn, "blobs");
+        select(&mut conn, "blobs");
+        let value = big_value(0x65);
+        let _: Vec<u8> = redis::cmd("CSET").arg(&value).query(&mut conn).unwrap();
+
+        let named = usage(&mut conn, "named");
+        assert_eq!(named, 3010, "three untouched, one shortened, one deleted");
+        let blobs = usage(&mut conn, "blobs");
+        assert_eq!(blobs, value.len() as u64);
+        (named, blobs)
+    };
+    server.stop();
+
+    let restarted = TestServer::reopen(&data_dir);
+    let mut conn = restarted.connect();
+    assert_eq!(
+        (usage(&mut conn, "named"), usage(&mut conn, "blobs")),
+        before,
+        "the ledger is in the store, and the store came back"
+    );
 }
 
 /// The store format version is raised exactly when the store first holds a

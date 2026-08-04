@@ -48,6 +48,35 @@ pub const MULTIPART_PARTS_TREE: &str = "_MULTIPART_PARTS";
 /// and fsck address the tree by name.
 pub const UPLOADS_TREE: &str = "_UPLOADS";
 
+/// Tree holding the per-bucket usage counter: the logical bytes its records
+/// add up to, one 8-byte little-endian row per bucket name.
+///
+/// Lives in the namespace database beside `_BUCKETS` and the bucket trees
+/// themselves, which is what lets one transaction move a record and its
+/// bucket's counter together. Reserved-prefixed, so no bucket can collide
+/// with it and fsck's holder walk skips it like every other `_` tree.
+///
+/// A row of its own rather than a field of the bucket record: the counter
+/// moves on every write, and a read-modify-write of the whole metadata
+/// record would put a namespace's password and flags in the path of every
+/// SET -- where a configuration change landing between the read and the
+/// write would be silently overwritten.
+const DEFAULT_USAGE_TREE: &str = "_USAGE";
+
+/// Reads a usage counter row.
+///
+/// The width is exact: a row of any other length is damage, not a variant,
+/// and answering a quota from a misread number is worse than refusing to.
+fn decode_usage(bucket: &str, raw: &[u8]) -> Result<u64, MetaError> {
+    let bytes: [u8; 8] = raw.try_into().map_err(|_| {
+        MetaError::OtherDBError(format!(
+            "the usage counter of {bucket} is {} bytes, not 8",
+            raw.len()
+        ))
+    })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 impl MetaStore {
     /// Creates a new MetaStore instance with the given store implementation.
     ///
@@ -285,11 +314,59 @@ impl MetaStore {
         self.store
             .tree_open(DEFAULT_BUCKET_TREE)?
             .remove(name.as_bytes())?;
+        // The usage counter goes with the records it counted. A bucket
+        // recreated under the same name starts from nothing, which is what
+        // respcas's FLUSH means by emptying a namespace.
+        self.store
+            .tree_open(DEFAULT_USAGE_TREE)?
+            .remove(name.as_bytes())?;
         if self.bucket_exists(name)? {
             self.store.tree_delete(name)
         } else {
             Ok(())
         }
+    }
+
+    /// Logical bytes the records of `bucket` add up to, or `None` if the
+    /// bucket has no counter.
+    ///
+    /// LOGICAL: the sum of the `size` field of every object record, which is
+    /// what a client stored -- not what it costs on disk, which dedup and
+    /// block sharing make a property of the store rather than of a bucket.
+    /// respcas's namespace quota is spent in these bytes (`max_size`), and
+    /// two namespaces holding one deduplicated value are each charged for it,
+    /// because either of them can be the one that keeps it alive.
+    ///
+    /// The counter is maintained inside the same transaction as the record
+    /// mutation that moves it ([`Transaction::add_bucket_usage`]), so it
+    /// cannot drift from the records by crashing between the two.
+    ///
+    /// `None` means "never accounted", which is what a bucket written before
+    /// the counter existed says -- distinct from `Some(0)`, an empty bucket
+    /// that is being counted. A caller that cares (respcas, adopting a store
+    /// into the quota ledger) sums the records itself and writes the total
+    /// with [`set_bucket_usage`](Self::set_bucket_usage).
+    pub fn bucket_usage(&self, bucket: &str) -> Result<Option<u64>, MetaError> {
+        match self
+            .store
+            .tree_open(DEFAULT_USAGE_TREE)?
+            .get(bucket.as_bytes())?
+        {
+            Some(raw) => decode_usage(bucket, &raw).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes `bucket`'s usage counter outright.
+    ///
+    /// For the one caller that derives the number from the records rather
+    /// than from a delta: the adoption of a bucket that predates the counter.
+    /// Everything else moves it by a delta inside the transaction that moves
+    /// the records ([`Transaction::add_bucket_usage`]).
+    pub fn set_bucket_usage(&self, bucket: &str, bytes: u64) -> Result<(), MetaError> {
+        self.store
+            .tree_open(DEFAULT_USAGE_TREE)?
+            .insert(bucket.as_bytes(), bytes.to_le_bytes().to_vec())
     }
 
     /// Inserts a raw representation of a bucket into the meta store.
@@ -323,6 +400,11 @@ impl MetaStore {
 
         // Create the bucket tree if it doesn't exist
         self.store.tree_open(bucket_name)?;
+
+        // A bucket this build created is accounted from its first byte, so
+        // its counter reads zero rather than absent -- which is reserved for
+        // "written before there was a counter". See [`Self::bucket_usage`].
+        self.set_bucket_usage(bucket_name, 0)?;
 
         Ok(())
     }
@@ -369,7 +451,13 @@ impl MetaStore {
             tx.rollback();
             return Ok(false);
         }
-        if let Err(e) = tx.put_bucket_record(bucket_name, raw_bucket) {
+        // The record and the bucket's usage counter are claimed together: a
+        // bucket this build created is accounted from its first byte, and its
+        // counter reads zero rather than absent (see [`Self::bucket_usage`]).
+        let claimed = tx
+            .put_bucket_record(bucket_name, raw_bucket)
+            .and_then(|()| tx.reset_bucket_usage(bucket_name));
+        if let Err(e) = claimed {
             tx.rollback();
             return Err(e);
         }
@@ -788,6 +876,64 @@ impl Transaction {
     ) -> Result<(), MetaError> {
         self.backend
             .insert(DEFAULT_BUCKET_TREE, bucket_name.as_bytes(), raw_bucket)
+    }
+
+    /// Moves `bucket`'s usage counter by `delta` logical bytes inside this
+    /// transaction, and returns what it now reads.
+    ///
+    /// Called from the same transaction as the record mutation it accounts
+    /// for -- the counter and the records live in one database, so they
+    /// commit or roll back together and no crash can leave one without the
+    /// other. The deltas are: a stored record adds its size, a removed record
+    /// subtracts it, an overwrite applies the difference (which is what
+    /// [`replace_object`](Self::replace_object) returning the displaced
+    /// record is for), and a clone adds the full size in the DESTINATION
+    /// bucket -- a clone is a store on this ledger, however few bytes it
+    /// moves (ADR 0014).
+    ///
+    /// A decrement below zero is clamped and logged rather than wrapped: the
+    /// counter is bookkeeping, and a wrong number that is loudly wrong beats
+    /// eighteen quintillion bytes of quota.
+    pub fn add_bucket_usage(&mut self, bucket: &str, delta: i64) -> Result<u64, MetaError> {
+        let current = match self.backend.get(DEFAULT_USAGE_TREE, bucket.as_bytes())? {
+            Some(raw) => decode_usage(bucket, &raw)?,
+            None => 0,
+        };
+
+        let updated = if delta >= 0 {
+            current.saturating_add(delta.unsigned_abs())
+        } else {
+            let down = delta.unsigned_abs();
+            if down > current {
+                tracing::warn!(
+                    bucket = %bucket,
+                    usage = current,
+                    subtracted = down,
+                    "The usage counter would go below zero: clamping to 0"
+                );
+                0
+            } else {
+                current - down
+            }
+        };
+
+        self.backend.insert(
+            DEFAULT_USAGE_TREE,
+            bucket.as_bytes(),
+            updated.to_le_bytes().to_vec(),
+        )?;
+        Ok(updated)
+    }
+
+    /// Sets `bucket`'s usage counter to zero inside this transaction: the
+    /// counter a bucket starts life with, written with the record that claims
+    /// its name.
+    pub fn reset_bucket_usage(&mut self, bucket: &str) -> Result<(), MetaError> {
+        self.backend.insert(
+            DEFAULT_USAGE_TREE,
+            bucket.as_bytes(),
+            0u64.to_le_bytes().to_vec(),
+        )
     }
 
     /// The multipart claim (ADR 0003): reads AND removes the upload record
@@ -1261,6 +1407,43 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         assert!(!meta.bucket_exists("_private").unwrap());
+    }
+
+    /// The usage counter is transactional: a delta that was rolled back never
+    /// happened, and a decrement past zero clamps rather than wrapping.
+    #[test]
+    fn usage_deltas_commit_and_roll_back_with_their_transaction() {
+        let (meta, _dir) = test_store();
+        meta.insert_bucket("photos", BucketMeta::new("photos".to_string()).to_vec())
+            .unwrap();
+        assert_eq!(meta.bucket_usage("photos").unwrap(), Some(0));
+
+        let mut tx = meta.begin_transaction();
+        assert_eq!(tx.add_bucket_usage("photos", 4096).unwrap(), 4096);
+        tx.commit().unwrap();
+        assert_eq!(meta.bucket_usage("photos").unwrap(), Some(4096));
+
+        // Rolled back: the record it would have accounted for did not land
+        // either, so neither may the number.
+        let mut tx = meta.begin_transaction();
+        tx.add_bucket_usage("photos", 1_000_000).unwrap();
+        tx.rollback();
+        assert_eq!(meta.bucket_usage("photos").unwrap(), Some(4096));
+
+        // Down, and then past the floor.
+        let mut tx = meta.begin_transaction();
+        assert_eq!(tx.add_bucket_usage("photos", -96).unwrap(), 4000);
+        assert_eq!(
+            tx.add_bucket_usage("photos", -1_000_000).unwrap(),
+            0,
+            "a counter that would go negative is clamped, not wrapped"
+        );
+        tx.commit().unwrap();
+        assert_eq!(meta.bucket_usage("photos").unwrap(), Some(0));
+
+        // A bucket nothing ever accounted has no counter at all, which is not
+        // the same answer as zero.
+        assert_eq!(meta.bucket_usage("never-existed").unwrap(), None);
     }
 
     /// The holder enumeration ADR 0005 recounts from: every bucket tree and

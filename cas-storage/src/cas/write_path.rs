@@ -696,14 +696,29 @@ pub(super) async fn store_single_object_and_meta(
 /// acquires a stripe (hard rule 6, fjall is the leaf lock). Keeping the
 /// whole transaction inside a non-async function makes both true by
 /// construction rather than by inspection of an async frame.
+///
+/// The bucket's usage counter moves in the same transaction, by the
+/// difference between what is written and what it displaced -- so the ledger
+/// is exact over any interleaving of writers (the replace serializes them)
+/// and cannot survive a rollback that the record did not.
 fn replace_object_record(
     namespace: &MetaStore,
     bucket_name: &str,
     key: &[u8],
     raw_obj: Vec<u8>,
+    size: u64,
 ) -> Result<Option<Object>, MetaError> {
     let mut tx = namespace.begin_transaction();
-    match tx.replace_object(bucket_name, key, raw_obj) {
+    let outcome = tx
+        .replace_object(bucket_name, key, raw_obj)
+        .and_then(|displaced| {
+            let previous = displaced.as_ref().map_or(0, Object::size);
+            let delta = size as i64 - previous as i64;
+            tx.add_bucket_usage(bucket_name, delta)?;
+            Ok(displaced)
+        });
+
+    match outcome {
         Ok(displaced) => {
             tx.commit()?;
             Ok(displaced)
@@ -759,7 +774,8 @@ pub(super) async fn create_object_meta(
     object_data: ObjectData,
 ) -> Result<Object, MetaError> {
     let obj_meta = Object::new(size, hash, object_data);
-    let displaced = replace_object_record(&fs.namespace, bucket_name, key, obj_meta.to_vec())?;
+    let displaced =
+        replace_object_record(&fs.namespace, bucket_name, key, obj_meta.to_vec(), size)?;
 
     // Committed. Only now may the replaced object's references go.
     if let Some(old) = displaced {
