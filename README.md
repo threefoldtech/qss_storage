@@ -120,6 +120,13 @@ changing the block hash of a deployment means creating a new store.
 
 The respcas server implements some basic Redis commands and also provides additional commands for namespace and data management that are not part of the standard Redis protocol.
 
+A namespace can also be switched to content addressing
+(`NSSET <ns> key_mode cas`), where the key of every record is the BLAKE3-256
+of its value: the server can compute it and reply with it, or verify one the
+client computed, and `EXISTS` becomes the probe of a dedup upload. Large
+values are stored as deduplicated blocks by the same engine s3cas uses. See
+[the respcas README](./respcas/README.md#content-addressed-namespaces).
+
 ## Known issues
 
 ### s3cas
