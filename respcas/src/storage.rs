@@ -34,6 +34,11 @@ pub struct Storage {
     /// The metadata database's own directory: what the QSST header belongs
     /// to, and what a header error names.
     db_path: PathBuf,
+    /// The directory the operator named, which is the store. Kept apart from
+    /// `db_path` because the two are the same directory on a pre-0014 layout
+    /// and differ on this one, and the header sidecar belongs in THIS one
+    /// either way.
+    data_dir: PathBuf,
     /// The block engine over that same metadata store (ADR 0014).
     cas: CasFS,
 }
@@ -106,6 +111,7 @@ impl Storage {
         Ok(Self {
             store,
             db_path,
+            data_dir,
             cas,
         })
     }
@@ -144,10 +150,16 @@ impl Storage {
     ///
     /// Idempotent -- a store already at the raised version is left alone --
     /// so it costs a point read on every call after the first.
+    ///
+    /// The raise rewrites the header's sidecar copy as well, and that copy
+    /// belongs inside the store on both layouts: `data_dir` says where, since
+    /// on a pre-0014 store the database directory IS the store and deriving
+    /// the location from it would put the file one level above.
     fn declare_cas_namespaces(&self) -> Result<(), StorageError> {
         store_header::raise_version(
             &*self.store.get_underlying_store(),
             &self.db_path,
+            &self.data_dir,
             STORE_HEADER_VERSION_CAS_NAMESPACE,
         )?;
         Ok(())

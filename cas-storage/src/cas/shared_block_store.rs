@@ -109,6 +109,12 @@ impl SharedBlockStore {
             )));
         }
 
+        // The directory the blocks DATABASE lives in, which is also where its
+        // header sidecar belongs -- `<meta_root>/blocks/`, and not the blocks
+        // ROOT, which a meta-root/data-root split (ADR 0012) puts somewhere
+        // else entirely.
+        let store_dir = path.clone();
+
         path.push(BLOCKS_DB_DIR_NAME);
 
         // Canonicalize path to eliminate getcwd() syscalls in async operations
@@ -141,6 +147,7 @@ impl SharedBlockStore {
         let header = pair_the_roots(
             &meta_store,
             &path,
+            &store_dir,
             &blocks_root,
             header,
             &disk_writer,
@@ -311,6 +318,7 @@ impl SharedBlockStore {
 fn pair_the_roots(
     meta_store: &MetaStore,
     db_path: &Path,
+    store_dir: &Path,
     blocks_root: &Path,
     header: StoreHeader,
     writer: &AtomicBlockWriter,
@@ -325,7 +333,7 @@ fn pair_the_roots(
         })
     };
     let adopt = |id: StoreId| -> Result<StoreHeader, MetaError> {
-        store_header::adopt_store_id(&*meta_store.get_underlying_store(), db_path, header, id)
+        store_header::adopt_store_id(&*meta_store.get_underlying_store(), store_dir, header, id)
     };
 
     match (header.store_id(), writer.store_id_marker()) {

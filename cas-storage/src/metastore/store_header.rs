@@ -115,8 +115,14 @@ pub const STORE_HEADER_VERSION_CAS_NAMESPACE: u16 = 4;
 pub const SUPPORTED_STORE_HEADER_VERSIONS: &[u16] =
     &[STORE_HEADER_VERSION, STORE_HEADER_VERSION_CAS_NAMESPACE];
 
-/// File name of the sidecar copy written next to the db directory at
-/// creation. Recovery from it is a manual operation.
+/// File name of the sidecar copy written in the store directory at creation.
+/// Recovery from it is a manual operation.
+///
+/// The STORE directory, not the database directory, and the two are not
+/// always the same: a respcas store from before ADR 0014 keeps its database
+/// directly in the directory the operator named ([`write_sidecar`]), so the
+/// sidecar of such a store sits beside fjall's own files rather than one
+/// level up -- which is outside the store entirely.
 pub const STORE_HEADER_SIDECAR: &str = "store_header.bin";
 
 /// Width of the store id, in bytes: a UUID.
@@ -510,20 +516,29 @@ pub(crate) fn write_header(store: &dyn Store, header: &StoreHeader) -> Result<()
     tree.insert(STORE_HEADER_KEY, header.to_bytes().to_vec())
 }
 
-/// Writes the sidecar copy of the header next to the db directory.
+/// Writes the sidecar copy of the header into `store_dir`.
+///
+/// `store_dir` is the STORE directory -- the one an operator named -- and is
+/// passed in rather than derived from the database path, because the two
+/// layouts this workspace opens put the database in different places
+/// relative to it:
+///
+/// ```text
+/// <store>/db      the database of every store this build creates -> <store>/
+/// <store>         a respcas store from before ADR 0014            -> <store>/
+/// ```
+///
+/// Deriving it as the database's parent is right for the first and wrong for
+/// the second, where it names the store's own parent: raising such a store's
+/// version wrote a `store_header.bin` OUTSIDE the store and left the copy
+/// inside it stale. Only the caller knows which directory it opened, so only
+/// the caller can say.
 ///
 /// Best effort on purpose: the sidecar is a backup for manual recovery, so a
 /// store that is otherwise fine is not refused because this copy could not be
 /// written. A failure is logged, loudly enough to notice.
-pub(crate) fn write_sidecar(db_path: &Path, header: &StoreHeader) {
-    let Some(parent) = db_path.parent() else {
-        tracing::warn!(
-            "no parent directory for {}: store header sidecar not written",
-            db_path.display()
-        );
-        return;
-    };
-    let sidecar = parent.join(STORE_HEADER_SIDECAR);
+pub(crate) fn write_sidecar(store_dir: &Path, header: &StoreHeader) {
+    let sidecar = store_dir.join(STORE_HEADER_SIDECAR);
     if let Err(e) = std::fs::write(&sidecar, header.to_bytes()) {
         tracing::warn!(
             "could not write store header sidecar {}: {e}",
@@ -542,16 +557,17 @@ pub(crate) fn write_sidecar(db_path: &Path, header: &StoreHeader) {
 /// judgement.
 ///
 /// The sidecar is rewritten too, so the manual-recovery copy never claims a
-/// different identity than the record it copies.
+/// different identity than the record it copies. `store_dir` says where that
+/// copy belongs; see [`write_sidecar`].
 pub(crate) fn adopt_store_id(
     store: &dyn Store,
-    db_path: &Path,
+    store_dir: &Path,
     header: StoreHeader,
     id: StoreId,
 ) -> Result<StoreHeader, MetaError> {
     let adopted = header.with_store_id(id);
     write_header(store, &adopted)?;
-    write_sidecar(db_path, &adopted);
+    write_sidecar(store_dir, &adopted);
     Ok(adopted)
 }
 
@@ -568,6 +584,10 @@ pub(crate) fn adopt_store_id(
 /// -- it must therefore land before the metadata that older build cannot
 /// decode, never after.
 ///
+/// `store_dir` is where the sidecar copy belongs, which respcas knows and
+/// this function cannot derive: on the pre-0014 layout the database IS the
+/// store directory (see [`write_sidecar`]).
+///
 /// # Errors
 ///
 /// [`MetaError::Header`] if `version` is not one this build supports (a build
@@ -576,6 +596,7 @@ pub(crate) fn adopt_store_id(
 pub fn raise_version(
     store: &dyn Store,
     db_path: &Path,
+    store_dir: &Path,
     version: u16,
 ) -> Result<StoreHeader, MetaError> {
     if !SUPPORTED_STORE_HEADER_VERSIONS.contains(&version) {
@@ -591,7 +612,7 @@ pub fn raise_version(
     }
     let raised = StoreHeader { version, ..header };
     write_header(store, &raised)?;
-    write_sidecar(db_path, &raised);
+    write_sidecar(store_dir, &raised);
     tracing::info!(
         "raised the QSST store format version of {} from {} to {version}",
         db_path.display(),
@@ -775,7 +796,8 @@ mod tests {
     #[test]
     fn raising_the_version_is_one_way_and_idempotent() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("db");
+        let store_dir = dir.path().to_path_buf();
+        let db_path = store_dir.join("db");
         let (store, created) =
             MetaStore::open_or_create(db_path.clone(), Some(1), HeaderSpec::default(), fjall)
                 .expect("fresh directory must be created");
@@ -784,24 +806,26 @@ mod tests {
         let raised = raise_version(
             &*store.get_underlying_store(),
             &db_path,
+            &store_dir,
             STORE_HEADER_VERSION_CAS_NAMESPACE,
         )
         .unwrap();
         assert_eq!(raised.version(), STORE_HEADER_VERSION_CAS_NAMESPACE);
         assert_eq!(raised.store_id(), created.store_id(), "identity is kept");
 
-        // On disk, and in the sidecar next to it.
+        // On disk, and in the sidecar the store keeps beside its database.
         let on_disk = read_header(&*store.get_underlying_store(), &db_path)
             .unwrap()
             .unwrap();
         assert_eq!(on_disk, raised);
-        let sidecar = std::fs::read(db_path.parent().unwrap().join(STORE_HEADER_SIDECAR)).unwrap();
+        let sidecar = std::fs::read(store_dir.join(STORE_HEADER_SIDECAR)).unwrap();
         assert_eq!(StoreHeader::from_bytes(&sidecar).unwrap(), raised);
 
         // Idempotent, and never a downgrade.
         let again = raise_version(
             &*store.get_underlying_store(),
             &db_path,
+            &store_dir,
             STORE_HEADER_VERSION_CAS_NAMESPACE,
         )
         .unwrap();
@@ -809,14 +833,57 @@ mod tests {
         let down = raise_version(
             &*store.get_underlying_store(),
             &db_path,
+            &store_dir,
             STORE_HEADER_VERSION,
         )
         .unwrap();
         assert_eq!(down, raised, "a lower version leaves the header alone");
 
         // A version this build cannot open is not one it may write.
-        let err = raise_version(&*store.get_underlying_store(), &db_path, 99).unwrap_err();
+        let err =
+            raise_version(&*store.get_underlying_store(), &db_path, &store_dir, 99).unwrap_err();
         assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    /// A store whose database IS its own directory -- respcas before ADR
+    /// 0014 -- keeps its sidecar inside itself, and writes nothing above it.
+    ///
+    /// The layout the derived-from-the-database-path rule got wrong: it put
+    /// the raised copy in the store's PARENT, which is not part of any store,
+    /// and left the copy an operator would actually find stale at the old
+    /// version.
+    #[test]
+    fn a_store_that_is_its_own_database_keeps_its_sidecar_inside_itself() {
+        let outer = tempdir().unwrap();
+        let store_dir = outer.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        // The database directly in the store directory, which is what the
+        // pre-0014 layout is. Its creation is the OLD build's, and that build
+        // put the sidecar above the store; the store as found in the field is
+        // the one without it, so that is the store this test raises.
+        let (store, created) =
+            MetaStore::open_or_create(store_dir.clone(), Some(1), HeaderSpec::default(), fjall)
+                .expect("fresh directory must be created");
+        std::fs::remove_file(outer.path().join(STORE_HEADER_SIDECAR)).ok();
+
+        let raised = raise_version(
+            &*store.get_underlying_store(),
+            &store_dir,
+            &store_dir,
+            STORE_HEADER_VERSION_CAS_NAMESPACE,
+        )
+        .unwrap();
+        assert_eq!(raised.version(), STORE_HEADER_VERSION_CAS_NAMESPACE);
+        assert_ne!(raised.version(), created.version());
+
+        let sidecar = std::fs::read(store_dir.join(STORE_HEADER_SIDECAR))
+            .expect("the sidecar is inside the store");
+        assert_eq!(StoreHeader::from_bytes(&sidecar).unwrap(), raised);
+        assert!(
+            !outer.path().join(STORE_HEADER_SIDECAR).exists(),
+            "and nothing was written outside it"
+        );
     }
 
     /// The migration gate for ADR 0005's block record change: a v2 store
@@ -958,7 +1025,7 @@ mod tests {
                 MetaStore::open_or_create(db.clone(), Some(1), HeaderSpec::default(), fjall)
                     .unwrap();
             assert!(header.store_id().is_some(), "a new store mints its own");
-            adopt_store_id(&*meta.get_underlying_store(), &db, header, adopted).unwrap()
+            adopt_store_id(&*meta.get_underlying_store(), dir.path(), header, adopted).unwrap()
         };
         assert_eq!(created.store_id(), Some(adopted));
 

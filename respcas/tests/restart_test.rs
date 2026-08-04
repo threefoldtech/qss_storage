@@ -19,11 +19,35 @@ use common::{
     rewind_to_pre_0014_layout,
 };
 use redis::Connection;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 /// The address a client computes for itself.
 fn address(value: &[u8]) -> Vec<u8> {
     blake3::hash(value).as_bytes().to_vec()
+}
+
+/// Every header sidecar anywhere under `root`, sorted -- so a test can say
+/// which files exist rather than only that the ones it expected do.
+fn sidecars_under(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if entry.file_name() == "store_header.bin" {
+                found.push(path);
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found.sort();
+    found
 }
 
 /// A value that cannot fit in a record: several blocks of it.
@@ -259,22 +283,19 @@ fn no_block_file_exists_until_a_value_needs_one() {
 /// switched to the cas mode on it, block-backed values are written and read,
 /// and everything that was in it before is still in it.
 ///
-/// KNOWN DEVIATION, pinned below: on a store of this shape the header sidecar
-/// is written OUTSIDE the data directory. `write_sidecar`
-/// (`cas-storage/src/metastore/store_header.rs`) puts the file in
-/// `db_path.parent()`, which is right for the modern layout (`<data>/db` ->
-/// `<data>/`) and wrong for this one (`<data>` -> `<data>/..`). So raising
-/// the version drops a `store_header.bin` in the data directory's parent and
-/// leaves the copy inside the store stale at 3. The authoritative header is
-/// the record inside the database, so nothing is served wrongly and no older
-/// build is let in -- but a recovery tool reading the sidecar is told the
-/// wrong version, and a file appears where nothing should be writing files.
+/// The header sidecar is part of that: raising the store's version rewrites
+/// the copy INSIDE the store, whichever of the two layouts the database is
+/// in. It used to be derived as the database directory's parent, which on
+/// this layout is the store's own parent -- so the raise wrote a
+/// `store_header.bin` outside the store and left the copy an operator would
+/// find stale at 3.
 #[test]
 fn a_store_from_before_the_layout_takes_a_cas_namespace_across_a_restart() {
-    // Nested on purpose: the deviation above writes into the data directory's
-    // PARENT, and this test is not going to write into the system temp root.
+    // The temporary directory IS the store: nothing may be written above it,
+    // and this test would be writing into the system temp root if anything
+    // were.
     let dir = tempdir().expect("a temporary directory");
-    let data_dir = dir.path().join("store");
+    let data_dir = dir.path().to_path_buf();
 
     // Build a normal store with something in it, then rewind its layout.
     let mut server = TestServer::with(ServerConfig {
@@ -294,7 +315,6 @@ fn a_store_from_before_the_layout_takes_a_cas_namespace_across_a_restart() {
     server.stop();
     rewind_to_pre_0014_layout(&data_dir);
     assert_eq!(header_version(&data_dir), 3, "as an old store would be");
-    assert!(!dir.path().join("store_header.bin").exists());
 
     // A daemon on it: the old namespace is there, and a cas one can be made.
     let value = big_value(0x64);
@@ -324,16 +344,22 @@ fn a_store_from_before_the_layout_takes_a_cas_namespace_across_a_restart() {
     assert!(data_dir.join("blocks").join(".db").is_dir());
     assert!(block_files(&data_dir) > 1);
 
-    // The sidecar deviation, exactly as described above.
+    // The sidecar the raise rewrote is the one inside the store, and it is
+    // the only one: the store directory holds exactly one of them.
     assert_eq!(
         header_version(&data_dir),
-        3,
-        "the copy inside the store was not rewritten"
-    );
-    assert_eq!(
-        header_version(dir.path()),
         4,
-        "it was written one directory up instead"
+        "the copy inside the store says what the store says"
+    );
+    let mut expected = vec![
+        data_dir.join("store_header.bin"),
+        data_dir.join("blocks").join("store_header.bin"),
+    ];
+    expected.sort();
+    assert_eq!(
+        sidecars_under(&data_dir),
+        expected,
+        "one sidecar for the store, one for the blocks database it gained"
     );
 
     // And a restart on the rewound store finds both namespaces intact.

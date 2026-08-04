@@ -111,7 +111,20 @@ impl MetaStore {
                 let header =
                     StoreHeader::create(spec).map_err(|e| MetaError::header(&db_path, e))?;
                 store_header::write_header(&*meta.store, &header)?;
-                store_header::write_sidecar(&db_path, &header);
+                // The sidecar belongs in the STORE directory, which on this
+                // path is always the database's parent: every store this
+                // build CREATES has its database in a subdirectory of the
+                // directory the operator named. A store whose database is
+                // that directory (respcas before ADR 0014) is only ever
+                // opened, and the one write that rewrites its sidecar is
+                // told where to put it -- `store_header::raise_version`.
+                match db_path.parent() {
+                    Some(store_dir) => store_header::write_sidecar(store_dir, &header),
+                    None => tracing::warn!(
+                        "no parent directory for {}: store header sidecar not written",
+                        db_path.display()
+                    ),
+                }
                 tracing::debug!(
                     "created QSST store at {} (version {}, algo {}, width {})",
                     db_path.display(),
