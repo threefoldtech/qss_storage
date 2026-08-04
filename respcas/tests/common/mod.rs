@@ -576,6 +576,16 @@ pub struct ChildServer {
 impl ChildServer {
     /// Spawns a daemon on `data_dir` and waits until it is serving.
     pub fn spawn(data_dir: &Path) -> Self {
+        Self::spawn_with_config(data_dir, "")
+    }
+
+    /// Spawns a daemon whose `qss_storage.toml` is `config`, so a test can
+    /// assert on a knob that has no flag -- the only way such a knob can be
+    /// shown to reach the wire at all.
+    ///
+    /// The `[resp] data_dir`, `host` and `port` keys are still overridden by
+    /// flags, because the test picks those.
+    pub fn spawn_with_config(data_dir: &Path, config: &str) -> Self {
         fs::create_dir_all(data_dir).expect("the data directory must be creatable");
 
         // An OS-assigned port, released before the child is told to take it.
@@ -589,14 +599,14 @@ impl ChildServer {
                 .port()
         };
 
-        // An empty config file, so the daemon cannot pick up a
+        // Always a config file of our own, so the daemon cannot pick up a
         // qss_storage.toml from whatever directory the test run started in.
-        let config = data_dir.join("qss_storage.toml");
-        fs::write(&config, "").expect("the config file must be writable");
+        let config_path = data_dir.join("qss_storage.toml");
+        fs::write(&config_path, config).expect("the config file must be writable");
 
         let child = Command::new(env!("CARGO_BIN_EXE_respcas"))
             .arg("--config")
-            .arg(&config)
+            .arg(&config_path)
             .arg("--data-dir")
             .arg(data_dir)
             .arg("--host")

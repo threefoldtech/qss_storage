@@ -10,8 +10,9 @@
 
 mod common;
 
-use common::{TestServer, bulk, error, integer, open_store, record, simple};
+use common::{ChildServer, TestServer, bulk, error, integer, open_store, record, simple};
 use redis::Connection;
+use tempfile::tempdir;
 
 /// The sizes that matter: just under the old 16 KiB ceiling, exactly on it,
 /// just over it, a megabyte, and enough to need three 1 MiB blocks.
@@ -246,4 +247,49 @@ fn the_cap_bounds_every_argument_of_every_namespace() {
     assert_eq!(integer(&next.reply()), 0);
     next.send_command(&[b"GET", b"under"]);
     assert_eq!(bulk(&next.reply()).len(), CAP);
+}
+
+/// The cap the operator writes in the config file is the cap the wire
+/// enforces.
+///
+/// `max_value_size` has no flag, so the config file is the only way to set
+/// it, and `resolve`'s own tests only prove the number comes out of the file
+/// -- not that anything downstream is given it. This runs the real binary on
+/// a real `qss_storage.toml` and asks the socket, which is the only place the
+/// whole chain can be seen at once (ADR 0014).
+#[test]
+fn the_cap_in_the_config_file_is_the_cap_on_the_wire() {
+    const CAP: usize = 4096;
+
+    let dir = tempdir().expect("a temporary directory");
+    let server = ChildServer::spawn_with_config(
+        &dir.path().join("store"),
+        &format!("[resp]\nmax_value_size = {CAP}\n"),
+    );
+    let mut conn = server.connect();
+
+    let answer: String = redis::cmd("SET")
+        .arg("under")
+        .arg(vec![b'v'; CAP])
+        .query(&mut conn)
+        .expect("a value at the configured cap is accepted");
+    assert_eq!(answer, "OK");
+
+    let err = redis::cmd("SET")
+        .arg("over")
+        .arg(vec![b'v'; CAP + 1])
+        .query::<String>(&mut conn)
+        .expect_err("and one byte more is not");
+    let message = format!("{err}");
+    assert!(message.contains(&(CAP + 1).to_string()), "{message}");
+    assert!(message.contains(&CAP.to_string()), "{message}");
+    assert!(message.contains("max_value_size"), "{message}");
+
+    // The daemon is unharmed, and the built-in 64 MiB default is nowhere in
+    // sight -- the file's number is the one in force.
+    let mut next = server.connect();
+    let length: u64 = redis::cmd("LENGTH").arg("under").query(&mut next).unwrap();
+    assert_eq!(length, CAP as u64);
+    let present: i64 = redis::cmd("EXISTS").arg("over").query(&mut next).unwrap();
+    assert_eq!(present, 0);
 }
