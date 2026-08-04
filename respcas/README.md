@@ -56,12 +56,12 @@ By default, respcas listens on `127.0.0.1:6379` and can be accessed using any Re
 | AUTH <password>   | Authenticate as admin                    | `AUTH mypassword`                  |
 | SELECT <namespace> [password]| Switch to a different namespace (with optional password for protected namespaces) | `SELECT mynamespace` or `SELECT mynamespace mypassword` |
 | NSNEW <n>      | Create a new namespace (admin only)      | `NSNEW mynamespace`                |
-| NSINFO <n>     | Show info about a namespace              | `NSINFO mynamespace`               |
+| NSINFO <n>     | Show info about a namespace, including `data_size_bytes` (what it holds) and `data_limits_bytes` (what it may hold, `0` for no limit) | `NSINFO mynamespace`               |
 | NSLIST           | List all available namespaces            | `NSLIST`                           |
 | NSSET <n> <prop> <val> | Set a property for a namespace (admin only) | `NSSET mynamespace worm 1`         |
 | DBSIZE           | Get the number of keys in the current namespace (approximate) | `DBSIZE`                          |
 | SCAN [cursor]     | Incrementally iterate over keys in the current namespace | `SCAN 0` or `SCAN mycursor`        |
-| RSCAN [cursor]    | Incrementally iterate over keys in backward direction | `RSCAN 0` or `RSCAN mycursor`      |
+| RSCAN [cursor]    | Incrementally iterate over keys backward, largest key first. `RSCAN 0` starts at the end of the namespace, the mirror of `SCAN 0` | `RSCAN 0` or `RSCAN mycursor`      |
 
 - All commands are case-insensitive.
 - Commands may be sent as RESP arrays or as inline text (`SET key value`
@@ -89,6 +89,7 @@ Namespaces can be configured with various properties using the `NSSET` command. 
 | `lock` | 0 or 1 | Temporarily locks the namespace. When enabled (1), write operations are not allowed. |
 | `public` | 0 or 1 | Controls read access. When disabled (0), users must authenticate to perform read operations like GET and MGET. Default is enabled (1). |
 | `key_mode` | `userkey` or `cas` | What a key means here. `userkey` (the default) stores values under the key the client chose. `cas` makes the key the BLAKE3-256 of the value -- see below. Only settable while the namespace holds no keys. |
+| `max_size` | bytes | Most logical bytes the namespace may hold; `0` (the default) means no limit. A write whose size would take the namespace past it is refused before anything is stored, with the limit named in the error. |
 
 Example usage:
 ```
@@ -97,7 +98,37 @@ NSSET mynamespace worm 1                    # Enable WORM mode
 NSSET mynamespace lock 1                    # Lock namespace (read-only)
 NSSET mynamespace public 0                  # Require authentication for read operations
 NSSET mynamespace key_mode cas              # Address records by content (empty namespaces only)
+NSSET mynamespace max_size 1073741824       # Hold at most a GiB of logical data (0 = no limit)
 ```
+
+### What a size limit counts
+
+`max_size` is spent in LOGICAL bytes: the sum of the sizes of the records the
+namespace holds, which is what clients stored -- not what those records cost
+on disk, which deduplication and block sharing make a property of the store
+rather than of one namespace. `NSINFO` reports the running total as
+`data_size_bytes`, and it is maintained in the same transaction as the record
+that moves it, so it survives a restart and cannot drift by crashing.
+
+Consequences worth stating:
+
+- **A `SET` over an existing key spends only the difference**, so a record can
+  always be written smaller.
+- **A `DEL` gives the bytes back**, and `FLUSH` gives all of them back.
+- **A cross-namespace clone is a store.** Storing content another
+  content-addressed namespace already holds moves no bytes, but this
+  namespace gets a record of that size and can be the holder that keeps the
+  content alive -- so it is charged in full, and refused if it does not fit.
+- **A dedup hit in the SAME namespace is not a store**: nothing is written, so
+  nothing is charged and nothing is refused. `EXISTS`-then-`SET` keeps working
+  against a full namespace.
+- **`worm` and `lock` are answered first.** A namespace that is read-only says
+  so rather than saying it is full.
+- **The limit bounds what a namespace accepts, not what it can momentarily
+  hold.** The check happens before the bytes are written, and concurrent
+  writers can each pass a check the other invalidates, so a namespace can end
+  up over its limit by up to what the writes in flight add. Refusing exactly
+  would mean refusing after the blocks are on disk.
 
 ## Content-addressed namespaces
 

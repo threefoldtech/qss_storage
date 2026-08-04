@@ -384,6 +384,22 @@ fn parse_key_mode(value: &str) -> Result<KeyMode, String> {
     }
 }
 
+/// The limit `NSSET <ns> max_size <bytes>` names, in logical bytes.
+///
+/// `0` is not a limit of zero, it is the absence of one: that is the
+/// zdb-heritage spelling NSINFO already prints for an unbounded namespace
+/// (`data_limits_bytes: 0`), and a namespace that could hold nothing at all
+/// would be a namespace nobody could ask for.
+fn parse_max_size(value: &str) -> Result<Option<u64>, String> {
+    match value.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(_) => Err(format!(
+            "Invalid property value: {value} (max_size is a number of bytes, 0 for no limit)"
+        )),
+    }
+}
+
 /// `NSSET namespace property value`
 fn parse_nsset(args: &Args) -> Result<Command, CommandError> {
     args.arity_exact(4)?;
@@ -892,6 +908,10 @@ impl CommandHandler {
                             meta.password = Some(value);
                         }
                     }
+                    "max_size" => match parse_max_size(&value) {
+                        Ok(limit) => meta.max_size = limit,
+                        Err(e) => return Frame::Error(format!("ERR {e}")),
+                    },
                     _ => return Frame::Error(format!("ERR Unknown property: {}", property)),
                 }
 
@@ -899,6 +919,7 @@ impl CommandHandler {
                 let worm_value = meta.worm;
                 let locked_value = meta.locked;
                 let public_value = meta.public;
+                let max_size_value = meta.max_size;
 
                 // Persist the updated metadata
                 match self.storage.update_namespace_meta(&namespace, meta) {
@@ -912,6 +933,10 @@ impl CommandHandler {
                                 "worm" => props.worm = worm_value,
                                 "lock" => props.locked = locked_value,
                                 "public" => props.public = public_value,
+                                // Every connection already on this namespace
+                                // must see the new limit: it is what their
+                                // next write is measured against.
+                                "max_size" => props.max_size = max_size_value,
                                 _ => {} // Should never happen due to earlier check
                             }
                             debug!(

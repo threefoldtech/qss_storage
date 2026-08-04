@@ -159,6 +159,20 @@ async fn clone_from_another_namespace(
             continue;
         }
 
+        // A clone is a store on the quota ledger: no bytes move, but this
+        // namespace gets a record of the source's full logical size and can
+        // be the holder that keeps the content alive. So a namespace at its
+        // max_size refuses the clone exactly as it would refuse a write of
+        // the bytes -- and, as with a write, before anything is written. Only
+        // a namespace that HAS a limit pays for the source record's size.
+        if namespace.quota().is_some() {
+            let size = storage
+                .cas()
+                .get_object_meta(&source, key)?
+                .map_or(0, |object| object.size());
+            namespace.refuse_unless_room_for(size)?;
+        }
+
         let cloned = storage
             .cas()
             .clone_object_by_reference(&source, key, &this, key)

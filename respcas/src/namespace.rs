@@ -30,6 +30,11 @@ pub(crate) struct NamespaceProperties {
     /// `key_mode`, kept here because it decides what SET does and every
     /// command reads it.
     pub(crate) key_mode: KeyMode,
+    /// Most logical bytes this namespace may hold, or `None` for no limit
+    /// (the default, and what `NSSET <ns> max_size 0` means). The in-memory
+    /// copy of the persisted `max_size`: every write reads it, and a
+    /// namespace with no limit must not pay a lookup to find that out.
+    pub(crate) max_size: Option<u64>,
 }
 
 impl Default for NamespaceProperties {
@@ -40,6 +45,7 @@ impl Default for NamespaceProperties {
             locked: false,
             public: true, // Default to public access
             key_mode: KeyMode::UserKey,
+            max_size: None,
         }
     }
 }
@@ -231,6 +237,7 @@ impl Namespace {
         props.locked = meta.locked;
         props.public = meta.public;
         props.key_mode = meta.key_mode;
+        props.max_size = meta.max_size;
     }
 
     pub(crate) fn flush(&self, namespace_cache: &NamespaceCache) -> Result<()> {
@@ -254,6 +261,76 @@ impl Namespace {
     /// What a key means here (ADR 0014).
     pub(crate) fn key_mode(&self) -> KeyMode {
         self.properties.read().unwrap().key_mode
+    }
+
+    /// Most logical bytes this namespace may hold, or `None` if nothing
+    /// bounds it -- which is the default, and the reason every caller of this
+    /// asks BEFORE it goes looking for the numbers a quota is checked with.
+    pub(crate) fn quota(&self) -> Option<u64> {
+        self.properties.read().unwrap().max_size
+    }
+
+    /// Refuses a write that would take this namespace past `limit` bytes.
+    ///
+    /// `adding` is the logical size of the record about to be written and
+    /// `replacing` what the same key already holds -- an overwrite spends
+    /// only the difference, so shrinking a record is never refused.
+    ///
+    /// # Where this is checked, and what it does not promise
+    ///
+    /// Before the bytes are written, always: a client is told its write was
+    /// refused instead of discovering it in a namespace that is over its
+    /// limit. The reading of the counter and the write that moves it are not
+    /// one transaction, though, so concurrent writers can each pass a check
+    /// the other invalidates -- a namespace can end up over its limit by up
+    /// to what the writes in flight add. The limit bounds what a namespace
+    /// accepts, not what it can momentarily hold; making it exact would mean
+    /// refusing AFTER the blocks are on disk, which is the worse trade.
+    ///
+    /// A cross-namespace clone (ADR 0014) is checked here too, with the
+    /// source record's full size: no bytes move, but the destination gets a
+    /// record of that size and can be the holder that keeps the content
+    /// alive, so it is a store as far as the quota is concerned.
+    fn refuse_over_quota(&self, limit: u64, adding: u64, replacing: u64) -> Result<()> {
+        let namespace = self.name();
+        let usage = self
+            .cas
+            .namespace_meta_store()
+            .bucket_usage(&namespace)?
+            .unwrap_or(0);
+        let after = usage.saturating_sub(replacing).saturating_add(adding);
+
+        if after > limit {
+            return Err(anyhow::anyhow!(
+                "namespace {namespace} is limited to {limit} byte(s) (max_size) and holds \
+                 {usage}: storing {adding} more would need {after}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The quota check a write of `adding` bytes under `key` must pass.
+    ///
+    /// Costs nothing at all in a namespace with no limit, which is every
+    /// namespace until an operator says otherwise: the limit is read from
+    /// memory, and only a namespace that has one pays for the counter and for
+    /// the size of the record it is about to displace.
+    fn refuse_unless_within_quota(&self, key: &[u8], adding: u64) -> Result<()> {
+        let Some(limit) = self.quota() else {
+            return Ok(());
+        };
+        let replacing = self.length(key)?.unwrap_or(0);
+        self.refuse_over_quota(limit, adding, replacing)
+    }
+
+    /// The same check for a record this namespace does not hold yet: a
+    /// content-addressed write or a clone, both of which the caller has
+    /// already established are not present here (`content::ingest`).
+    pub(crate) fn refuse_unless_room_for(&self, adding: u64) -> Result<()> {
+        let Some(limit) = self.quota() else {
+            return Ok(());
+        };
+        self.refuse_over_quota(limit, adding, 0)
     }
 
     /// Refuses the write if the namespace is not accepting one.
@@ -302,6 +379,7 @@ impl Namespace {
     /// it displaced, and a blind insert cannot say what that was.
     pub(crate) async fn set(&self, key: &[u8], value: Bytes) -> Result<()> {
         self.refuse_unless_writable(Some(key))?;
+        self.refuse_unless_within_quota(key, value.len() as u64)?;
 
         // Note: Authentication check is now handled by the CommandHandler
 
@@ -325,6 +403,9 @@ impl Namespace {
     /// has established that the key is the value's address.
     pub(crate) async fn store_verified(&self, key: &[u8], value: Bytes) -> Result<()> {
         self.refuse_unless_writable(None)?;
+        // The address is not in this namespace -- `content::ingest` has just
+        // established that -- so the whole value is new here.
+        self.refuse_unless_room_for(value.len() as u64)?;
 
         let bucket = self.name();
         if value.len() <= self.cas.max_inlined_data_length() {
