@@ -1,27 +1,46 @@
 # Code Health: Bloat and Smell Findings
 
-Findings from a review of branch `refactor/cas-storage` at `e349d9d`.
+Findings from a review of branch `refactor/cas-storage` at `e349d9d`
+(2026-07-30). **This is a dated record, not a current review.** The finding
+text below is kept as written; what has changed since is recorded in the
+status banner on each finding and summarized in the live table under
+"Status at `62fdf27`".
 
-Each finding states what was actually verified. **Confirmed** means reproduced
-or read directly off the code. **By inspection** means read but not executed.
-**Needs decision** means the code is defensible and the question is intent.
+Each finding states what was actually verified *at the time*. **Confirmed**
+means reproduced or read directly off the code. **By inspection** means read
+but not executed. **Needs decision** means the code is defensible and the
+question is intent.
 
-Much of what follows lives inside `cas-storage/`, which is a vendored fork of
-`threefoldtech/s3-cas @ b28eac0`. Those findings are upstream's, not this
-repository's authorship -- but they are this repository's risk, and fixing them
-locally has a rebase cost. Where that tension applies it is called out.
+Much of what follows lives inside `cas-storage/`, which was vendored from
+`threefoldtech/s3-cas @ b28eac0`. The review weighed several findings against
+a rebase cost. That weighing is obsolete: the ownership decision of
+2026-07-30 (top of `cas-storage/EXTENSIONS.md`) makes this the primary home
+of the code, with no rebase to protect. Where a finding argues from rebase
+cost, read that argument as void.
 
-Baseline: this branch is clean under
-`cargo clippy --workspace --all-targets -- -D warnings` and passes 44 tests.
+Baseline at review time: the branch was clean under
+`cargo clippy --workspace --all-targets -- -D warnings` and passed 44 tests.
 Everything below is beyond what the gating lints catch.
+
+### Status legend
+
+| Marker | Meaning |
+|--------|---------|
+| **RESOLVED** | the code no longer does what the finding describes; the fixing commit or ADR is named |
+| **OBSOLETE** | the finding's premise no longer exists (the code, file or backend it describes is gone) |
+| **CLOSED** | investigated and deliberately not changed; the reason is recorded |
+| **OPEN** | still true at `62fdf27` |
+| **PARTIAL** | the named instances are fixed; the class has recurred or was never fully closed |
 
 ---
 
 ## Resolution status (2026-07-30, branch `development`)
 
 A remediation pass worked through the suggested order of work. The sections
-below are kept as written (point-in-time record); this table is the live
-status. Commits are on `development`.
+below are kept as written (point-in-time record). **This table is itself now
+dated**: it was the live status on 2026-07-30, and ten more ADRs were
+implemented after it (0003, 0005-0008, 0010-0014). The live status is the
+next table, "Status at `62fdf27`". Commits are on `development`.
 
 | Finding | Status | Commit(s) |
 |---------|--------|-----------|
@@ -86,9 +105,69 @@ before serving them.
 
 ---
 
+## Status at `62fdf27` (2026-08-04)
+
+Every finding re-checked against the code as it stands. This is the live
+table; the two above are dated records.
+
+| Finding | Status | Evidence |
+|---------|--------|----------|
+| H1 reachable panic | **RESOLVED** | `stores/fjall.rs:324` opens the partition and counts through a read transaction. `58ca932` |
+| H2 transmute + Send/Sync | **RESOLVED** | SAFETY argument at the transmute (`fjall.rs:312`), field order flagged load-bearing, `unsafe impl Sync` deleted with a `const _` in its place (`fjall.rs:645`, `:655`). `16591a5` |
+| H3 pointer-width format | **RESOLVED** | `metastore/constants.rs` and `PTR_SIZE` do not exist; every on-disk length/count is `u64`. `a0c6471` |
+| H4 MD5 content addressing | **RESOLVED** | blocks are BLAKE3-addressed, default width 32. `23ed542`, ADR 0002 |
+| H5 `unsafe impl Sync for BlockStream` | **RESOLVED** | deleted; `const _` static assertion at `block_stream.rs:206`. `16591a5` |
+| H6 `from_utf8_unchecked` | **RESOLVED** | zero occurrences in the workspace; the three surviving mentions are comments recording what upstream did. `16591a5` |
+| H7 Content-MD5 unverified | **RESOLVED** | `parse_content_md5` (`api.rs:180`) applied on both `put_object` and `upload_part`. `bf2ee1a` |
+| H8 `num_keys` unwrap | **RESOLVED** | `MetaStore::num_keys` returns `Result` (`meta_store.rs:416`). `58ca932` |
+| H9 `#[async_trait]` | **CLOSED** | still present at `api.rs:241` and `metrics.rs:1,354`; both are `impl S3`, and `s3s` defines that trait with the macro. Unchanged and correct |
+| H10 truncating casts | **PARTIAL** | the 12 audited sites are fixed (`382886e`), but the lint reports 18 again at HEAD as the workspace roughly tripled. Several are in test code; none re-open a client-influenced path the audit closed |
+| H11 mixed module style | **RESOLVED** | `metastore.rs`, `stores.rs` and `scrub.rs` are all the post-2018 form. `2cab26b` |
+| H12 `Durability` names transposed | **OBSOLETE** | the mapping was corrected (`7d61158`), then ADR 0010 deleted the `fdatasync` level. Two levels remain and `Fsync -> SyncAll` is right |
+| B1 two near-copy backends | **OBSOLETE** | the shared half was extracted (`541cc5d`), then ADR 0007 removed `fjall_notx` entirely (`af42256`) and the flavor layer was folded back in (`4610bde`). One backend, 899 lines |
+| B2 oversized functions | **PARTIAL** | the two named outliers are fixed -- `from_frame` is a 29-line dispatch table, `process` a 15-line delegate. `store_object` is 54 lines. But `poll_next` is still 149, `s3cas::main::run` grew 131 -> 175, and `clippy::too_many_lines` now fires 7 times (5 in production code) |
+| B3 edition split / toolchain | **RESOLVED** | every crate is edition 2024; `rust-toolchain.toml` pins 1.97 with a comment saying why. `e4a795b`, `0777c36` |
+| B4 pedantic and TODO backlog | **PARTIAL** | the substantive clusters were cleared (`4a90277`) and TODO/FIXME markers went 16 -> 9. Pedantic is 758 warnings at HEAD against 458 then, on a workspace ~3x the size; the mix is unchanged (missing backticks, `must_use`, `# Errors` sections) and still not worth chasing |
+| P1 ADRs describe a layout `main` lacks | **OPEN on `main`** | `origin/main` is still `c12f930`: separate `metastore` crate, `respd`, `s3fs.rs`. Fourteen ADRs now describe code only `development` has |
+| P2 `main` red in CI | **OPEN on `main`** | same cause as P1; not re-run, since the tree it describes is unchanged |
+| P3 missing CI gates | **RESOLVED** | `build.yaml` runs fmt, build, clippy `-Dwarnings`, test; `release.yaml` tests before building. `0777c36`, `50ec0ec` |
+| P4 `.gitignore` too narrow | **RESOLVED** | `/target`, `/data`, `.vscode`, `/qss_storage.toml`. `0777c36` |
+| P5 dangling deadlock-fix doc | **OBSOLETE** | `docs/arch/deadlock-fix.md` was reconstructed (`8e554b0`, rewritten `eade068`, corrected `b95180b`), and the file that cited it -- `cas/async_fs.rs` -- was itself deleted by ADR 0006's write-path reorder (`c5e2561`) |
+| P6 DBSIZE untested / naming | **RESOLVED** | `test_dbsize` in `respcas/tests/integration_test.rs:234`; `EXTENSIONS.md` records both the `tfstor` and the `respd` former names |
+
+Verification at `62fdf27`: `cargo fmt --all --check` clean,
+`cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test
+--workspace` 455 passing / 0 failing / 1 ignored (the ignored one is
+`batch_smoke_ab`, which writes hundreds of MiB with real fsyncs).
+
+Two findings deserve a note beyond the table:
+
+- **H10** is the only one whose *class* came back. The audit fixed the sites
+  that existed; nothing gates the lint, so new code reintroduces them. Either
+  turn `cast_possible_truncation` on in CI or stop claiming the class is
+  closed. This document now claims the sites, not the class.
+- **B2** measured the wrong thing to begin with. Line count found
+  `from_frame`, which was genuinely bad, and also `poll_next`, which is a
+  hand-rolled `Stream` state machine that does not decompose usefully.
+  `s3cas::main::run` grew because ADR 0003's GC task and ADR 0012's pairing
+  warning went into it; it is a bootstrap function, and long bootstraps are
+  not the same problem as long dispatchers.
+
+---
+
 ## Correctness and soundness
 
+The sections that follow are the 2026-07-30 text verbatim, each opened by a
+status banner checked against `62fdf27`. Line references inside the finding
+text are the ones the reviewer read; they are NOT current.
+
 ### H1. `unimplemented!()` reachable on default flags -- CONFIRMED
+
+> **RESOLVED** (`58ca932`). `Store::num_keys` on the fjall backend is
+> `stores/fjall.rs:324`: it opens the named partition and counts through a
+> read transaction, exactly as the finding proposed. `test_num_keys` in the
+> shared backend battery is the regression guard; `EXTENSIONS.md` records
+> the fix against upstream.
 
 `cas-storage/src/metastore/stores/fjall.rs:132-135`
 
@@ -132,6 +211,16 @@ paths.
 
 ### H2. Lifetime laundering plus unaudited `Send`/`Sync` -- by inspection
 
+> **RESOLVED** (`16591a5`). The transmute is still there and still necessary
+> (`fjall.rs:312`), but it now carries the two-fact SAFETY argument the
+> finding asked for, the field order is flagged as load-bearing on the
+> struct, and `unsafe impl Sync` is gone -- `fjall.rs:645` is a comment
+> saying so, backed by a `const _` static assertion at `:655`.
+> `unsafe impl Send` stays, with the honest version of its argument
+> (including the part that rests on no caller holding a transaction across
+> an `.await`). That transmute and that one impl are the only `unsafe` left
+> in `cas-storage`.
+
 `cas-storage/src/metastore/stores/fjall.rs:119-131, 156-157`
 
 ```rust
@@ -166,6 +255,13 @@ comment, add a compile-time guard against field reordering, and try deleting
 
 ### H3. On-disk format depends on host pointer width -- by inspection
 
+> **RESOLVED** (`a0c6471`, ADR 0002). `metastore/constants.rs` does not
+> exist and `PTR_SIZE` appears nowhere in the workspace. Every on-disk
+> length, count and refcount field is a fixed `u64` LE; `metastore/codec.rs`
+> gives all record types checked offset arithmetic and exact-length
+> enforcement; golden byte vectors pin each layout. The store header
+> supplies the version detection the finding said was missing.
+
 `cas-storage/src/metastore/constants.rs:4`, used in 19 places across
 `block.rs`, `bucket_meta.rs`, `multipart.rs`.
 
@@ -188,6 +284,21 @@ so it belongs with the ADR 0002 migration, which already plans a format
 transition.
 
 ### H4. MD5 content addressing under shared block storage -- by inspection
+
+> **RESOLVED** (`23ed542`, ADR 0002). Blocks are addressed by BLAKE3,
+> default width 32 bytes, recorded in the store header and immutable for the
+> life of the store. Untrusted multi-tenancy requires the default W32 store;
+> the 16-byte width is documented as a trusted-tenant option, so opting into
+> it opts out of this guarantee. No dedup-hit content verification was
+> built -- the ADR's "As implemented" section says why.
+>
+> The finding's last paragraph -- that MD5 survives for the S3 ETag and
+> carries no such risk -- is still true and is the reason `md-5` is still a
+> `cas-storage` dependency. `ContentHash`
+> (`metastore/content_hash.rs`) is the 16-byte newtype that keeps the ETag
+> from being confused with a block address, and it is also the record
+> envelope field respcas fills in for content-addressed writes where it
+> carries no authority.
 
 `cas-storage/src/cas/write_path.rs` (hashing),
 `cas-storage/src/cas/shared_block_store.rs` (sharing)
@@ -219,6 +330,12 @@ compatibility and carries no such risk.
 
 ### H5. `unsafe impl Sync` with no justification -- by inspection
 
+> **RESOLVED** (`16591a5`). Deleted. `block_stream.rs:193` is the comment
+> recording it, and `:206` a `const _` static assertion so a future
+> non-`Sync` field fails at the definition rather than being papered over.
+> It was never needed: every field is already `Sync`, including `open_fut`,
+> whose boxed future carries an explicit `+ Send + Sync` bound.
+
 `cas-storage/src/cas/block_stream.rs:46`
 
 ```rust
@@ -232,6 +349,15 @@ the code does not answer. Same recommendation as H2: try removing it and see
 what breaks.
 
 ### H6. `from_utf8_unchecked` on data read back from disk -- by inspection
+
+> **RESOLVED** (`16591a5`). `from_utf8_unchecked` appears nowhere in the
+> workspace; the three surviving mentions are comments in
+> `bucket_meta.rs:91`, `stores/fjall.rs:544` and `cas/multipart.rs:131`
+> recording what upstream did and what replaced it. Record decoders go
+> through `Reader::utf8` and return `FsError::InvalidUtf8`; the
+> `range_filter` site logs and skips, because the trait method's item type
+> is infallible. The `fjall_notx.rs` site in the finding's list went away
+> with the backend.
 
 Six sites: `bucket_meta.rs:97`, `stores/fjall.rs:390`,
 `stores/fjall_notx.rs:315`, `multipart.rs:93,108,124`.
@@ -258,6 +384,13 @@ which every one of these call sites is already positioned to return.
 
 ### H7. Client-supplied Content-MD5 accepted and ignored -- by inspection
 
+> **RESOLVED** (`bf2ee1a`). `parse_content_md5` (`api.rs:180`) rejects a
+> malformed header as `InvalidDigest`; a mismatch is `BadDigest`. Both
+> `put_object` (`api.rs:1134`) and `upload_part` (`api.rs:1237`) apply it --
+> the inlined path checks before storing, the streamed path rolls the object
+> back, and `upload_part` fails before the part is registered. Missing
+> Content-Length no longer panics `put_object` either.
+
 `s3cas/src/api.rs:676`
 
 ```rust
@@ -270,6 +403,12 @@ nothing. Low effort to implement given the write path already computes the
 object MD5.
 
 ### H8. `unwrap()` on a fallible store call in a facade method
+
+> **RESOLVED** (`58ca932`). `MetaStore::num_keys` returns
+> `Result<usize, MetaError>` (`meta_store.rs:416`). No in-tree caller needed
+> changing -- `s3cas inspect` goes through `Store::num_keys` directly -- so
+> it was a free signature change here and a breaking one for upstream's
+> public API, which `EXTENSIONS.md` records.
 
 `cas-storage/src/metastore/meta_store.rs:363`
 
@@ -284,6 +423,15 @@ Swallows the `Result` into a panic in a method whose doc comment says it is
 `Result<usize, MetaError>`.
 
 ### H9. `#[async_trait]` still present -- needs decision
+
+> **CLOSED, no change.** Both occurrences survive at `api.rs:241` and
+> `metrics.rs:1,354`, and both are correct: they are `impl S3 for S3Cas` and
+> `impl S3 for MetricFs<T>`, the same upstream `s3s::S3` trait, which `s3s`
+> declares with `#[async_trait::async_trait]`. Every impl must match its
+> macro-expanded boxed-future signatures, and `s3s` pulls the crate in
+> regardless, so hand-writing `Pin<Box<dyn Future>>` shims would remove
+> nothing from the dependency tree. Revisit only if `s3s` moves to native
+> AFIT. Nothing else in the workspace uses the crate.
 
 `s3cas/src/api.rs:83`, `s3cas/src/metrics.rs:1,258`
 
@@ -309,6 +457,21 @@ already removed there as dead weight, so the direction of travel is established.
 
 ### H10. Truncating casts in size and offset arithmetic -- by inspection
 
+> **PARTIAL** (`382886e` for the sites; the class is open). The twelve sites
+> were audited individually: client-influenced ones (`put_object`
+> Content-Length, `BlockStream` range seek/read, `upload_part` size) became
+> `try_from` with an error, provably-bounded ones carry an `#[allow]` with
+> the bounding argument, and `debug_assert` comparisons were flipped to the
+> lossless direction. Those fixes hold.
+>
+> The lint is not clean at `62fdf27`: `-W clippy::cast_possible_truncation`
+> reports 18 sites, in `block_stream.rs`, `gc.rs`, `uploads.rs`, `block.rs`,
+> `scrub/passes.rs`, `api.rs`, `respcas/src/{cmd,namespace,resp}.rs` and
+> test modules. The workspace roughly tripled in the meantime and nothing
+> gates the lint, so new code reintroduces the pattern. None of the new
+> sites re-open a path the audit closed, but the honest reading is that the
+> SITES were fixed and the CLASS was not.
+
 12 `clippy::cast_possible_truncation` hits under `-W clippy::pedantic`,
 including `size as u64`, `part_number as i64`, and `count as i64` in
 `s3cas/src/api.rs`. In a storage system these sit on the paths that compute
@@ -319,10 +482,24 @@ externally influenced.
 
 ### H11. Mixed module style within one crate -- cosmetic
 
+> **RESOLVED** (`2cab26b`). Converted by `git mv`. The crate is uniformly
+> post-2018: `cas.rs` + `cas/`, `metastore.rs` + `metastore/`, `stores.rs` +
+> `stores/`, and `scrub.rs` + `scrub/` was written that way from the start.
+
 `cas-storage/src/cas.rs` + `cas/` (post-2018 form) sits next to
 `cas-storage/src/metastore/mod.rs` (pre-2018 form). Pick one.
 
 ### H12. `Durability` names appear transposed -- needs decision
+
+> **OBSOLETE** (`7d61158`, then ADR 0010). The mapping was first corrected to
+> match POSIX -- `Fsync -> SyncAll`, `Fdatasync -> SyncData` -- with the
+> default moved to `fsync`, so the persist behaviour was bit-for-bit
+> unchanged and only explicit flag users saw a difference. ADR 0010 then
+> deleted the `fdatasync` level outright: once the sync boundary moved to
+> the ack, the two syscalls were indistinguishable in speed and in crash
+> safety, so the knob named a dead tradeoff. Two levels remain, `fsync` and
+> `buffer`, and the parser refuses the removed name with the two valid ones
+> in the message. There is nothing left to name wrongly.
 
 `cas-storage/src/metastore/stores/fjall.rs:45-49`
 
@@ -346,6 +523,21 @@ performance based on the flag names.
 ## Bloat and duplication
 
 ### B1. Two near-copy store backends
+
+> **OBSOLETE** (`541cc5d`, then ADR 0007 at `af42256`, then `4610bde`). The
+> shared half was first extracted to `stores/fjall_common.rs`, generic over
+> a `FjallFlavor` trait. ADR 0007 then removed the non-transactional backend
+> entirely, and with one flavor left the generic layer was folded back in:
+> `stores/fjall.rs` is 899 lines and is the only backend. `StorageEngine`
+> survives as the config and CLI surface with one variant, and `FromStr`
+> rejects `fjall_notx` with the migration path (use `fjall` with
+> `durability = "buffer"`).
+>
+> Both caveats the finding raised are void. The rebase argument died with
+> the 2026-07-30 ownership decision. The "both backends earn their
+> existence" argument was answered by ADR 0007 on its merits: the notx
+> backend's weaker guarantees were not a tier anyone wanted once durability
+> became a per-store setting.
 
 `cas-storage/src/metastore/stores/fjall.rs` (433 lines) and
 `fjall_notx.rs` (358 lines): 791 lines total, of which **235 lines are
@@ -371,6 +563,21 @@ local refactor. Worth a decision either way rather than drift.
 
 ### B2. Oversized functions
 
+> **PARTIAL** (`721b53a`, `cfb271b`). At `62fdf27` the same five, measured
+> the same way: `from_frame` 388 -> 29 (a dispatch table over per-command
+> parsers, `cmd.rs:400`), `process` 212 -> 15 (a delegate to `Session`),
+> `store_object` 161 -> 54 (`write_path.rs:607`), `poll_next` 147 -> 149
+> (`block_stream.rs:215`), `s3cas::main::run` 131 -> 175 (`main.rs:360`).
+> `clippy::too_many_lines` fires 7 times, 5 of them in production code
+> (`block_stream.rs`, `group_commit.rs`, `object.rs`, `scrub/engine.rs`,
+> `main.rs`).
+>
+> The two the finding singled out are fixed. The two that grew are a
+> hand-rolled `Stream` state machine and a bootstrap function that absorbed
+> ADR 0003's GC task and ADR 0012's pairing warning; neither is the
+> one-`match`-does-everything shape that made `from_frame` worth splitting.
+> The `// TODO: Fix this crap` the finding quoted from `poll_next` is gone.
+
 Measured by brace matching, production code only:
 
 | Lines | Location |
@@ -394,6 +601,12 @@ workspace's bluntest comment (`block_stream.rs:117`, `// TODO: Fix this crap`).
 
 ### B3. Edition split across the workspace
 
+> **RESOLVED** (`e4a795b`, `0777c36`). `[workspace.package]` declares edition
+> 2024 and every member inherits it; `cas-storage` keeps an explicit `2024`
+> that now agrees with the default. `rust-toolchain.toml` pins channel 1.97
+> with `rustfmt` and `clippy`, and carries a comment saying the pin is
+> deliberate because CI gates on toolchain-sensitive lints.
+
 | Crate | Edition |
 |-------|---------|
 | workspace `[workspace.package]` | 2018 |
@@ -415,6 +628,26 @@ nature. A new stable release can turn CI red without a code change. Pinning is
 cheap insurance.
 
 ### B4. Pedantic lint and TODO backlog
+
+> **PARTIAL** (`4a90277`). The substantive clusters were cleared:
+> `unnecessary_wraps` and `unused_self` sites fixed, `once_cell::Lazy` ->
+> `std::sync::LazyLock`, dead internal macros deleted (only `try_!` was
+> used, and its `TODO: remove` went with them), the bucket-count `FIXME`
+> replaced by a real count at startup, `CreateBucketOutput.location` filled.
+> Note one item of that pass was later reversed on purpose: respcas's
+> handlers were de-async'd because fjall is sync, and ADR 0014 made
+> `CommandHandler::execute` async again, because the block engine is not.
+>
+> The counts at `62fdf27`: 758 pedantic warnings (was 458) on a workspace
+> roughly three times the size, and 9 `TODO`/`FIXME` markers (was 16). The
+> pedantic mix is unchanged and still stylistic -- 126 missing backticks,
+> 116 `must_use_candidate`, 109 missing `# Errors` sections, 70
+> `uninlined_format_args`. Of the behaviour-tied TODOs the finding tabled,
+> `api.rs:51` and `api.rs:676` are gone, `internal_macros.rs:2` is gone,
+> `fs.rs`'s "very much not optimal" and `meta_store.rs`'s `list_buckets`
+> pagination remain (now `fs.rs:327` and `meta_store.rs:313`), as does the
+> metrics multiple-instance note (`metrics.rs:130`), left open as a
+> single-instance-by-design decision.
 
 458 warnings under `-W clippy::pedantic --all-targets`. Most are stylistic
 (`doc_markdown`, `must_use_candidate`, `uninlined_format_args`) and not worth
@@ -444,6 +677,13 @@ problem at the scale the README describes.
 
 ### P1. ADRs describe a layout `main` does not have
 
+> **OPEN on `main`**, resolved on `development` (`9a2d8c8`). `origin/main` is
+> still `c12f930`: a separate `metastore` crate, `respd/` rather than
+> `respcas/`, `s3cas/src/s3fs.rs` rather than `api.rs`, and two ADRs rather
+> than fourteen. Everything this document describes lives on `development`.
+> The gap has widened rather than closed since the finding was written --
+> merging is a decision, not a documentation task.
+
 `docs/adr/0001-initial-architecture-overview.md` (9 references to
 `cas-storage`) and `0002` (5 references) document the consolidated three-crate
 layout. On `main` that layout does not exist -- `main` still has a separate
@@ -453,6 +693,11 @@ Resolved by merging this branch. Until then, `main`'s architecture
 documentation describes code that is not in `main`.
 
 ### P2. `main` is red in CI
+
+> **OPEN on `main`**, green on `development`. Not re-verified: `main`'s tree
+> is byte-identical to what the reviewer observed, so the six clippy errors
+> are still in it. `development` is clean under the gate, including benches.
+> Same cause and same fix as P1.
 
 `.github/workflows/build.yaml` runs
 `cargo clippy --workspace --all-features -- -Dwarnings`. On `main`'s layout,
@@ -465,12 +710,24 @@ one by the auto-deref fix carried in `e349d9d`.
 
 ### P3. Missing CI gates
 
+> **RESOLVED** (`0777c36`, `50ec0ec`). `build.yaml` runs
+> `cargo fmt --all -- --check`, build, `clippy --workspace --all-features
+> -- -Dwarnings` and `test --workspace`, on push and pull request to both
+> `main` and `development`. There is no explicit toolchain install step,
+> deliberately: rustup reads `rust-toolchain.toml`. `release.yaml` runs
+> `cargo test --workspace` as a gating job before either build job, and lost
+> its deprecated `actions-rs` stable-override.
+
 - No `cargo fmt --check`. Formatting drift is currently caught only by local
   hooks, inconsistently.
 - No `rust-toolchain.toml` (see B3).
 - `release.yaml` builds but does not test.
 
 ### P4. `.gitignore` is too narrow
+
+> **RESOLVED** (`0777c36`). Now `/target`, `/data`, `.vscode` and
+> `/qss_storage.toml` -- the last so an operator's local config cannot be
+> committed over the example.
 
 Contents are `/target` and `.vscode`. Notably absent: the `data/` directory
 that the servers write into by default. In the pre-rename checkout, `data/`
@@ -479,6 +736,16 @@ committed. Adding `/data` is a one-line fix.
 
 ### P5. Dangling documentation reference
 
+> **OBSOLETE.** Fixed twice over. The rationale was reconstructed from the
+> code as `docs/arch/deadlock-fix.md` (`8e554b0`, rewritten from primary
+> sources at `eade068`, corrected against the ADR 0006 review at `b95180b`);
+> the original document and the commit that was supposed to carry it exist
+> in no reachable history. Then the file that cited it was itself deleted:
+> ADR 0006's write-path reorder (`c5e2561`) removed `cas/async_fs.rs` and
+> the `AsyncFileSystem` trait, replacing the injection seam with
+> `BlockDiskOps` in `cas/block_disk.rs`. The reconstructed document is kept
+> because it explains a deadlock that was real.
+
 `cas-storage/src/cas/async_fs.rs:6` cites `docs/arch/deadlock-fix.md`. Neither
 that file nor `docs/arch/` exists; `docs/` holds only `refcount.md` and
 `adr/`. Either the document was never carried over from upstream or it was
@@ -486,6 +753,14 @@ lost. Since it explains why the `AsyncFileSystem` abstraction exists at all,
 the missing rationale is worth reconstructing.
 
 ### P6. Test and naming gaps
+
+> **RESOLVED** (`cfb271b`, `9dabfe1`). `test_dbsize` is at
+> `respcas/tests/integration_test.rs:234`. `EXTENSIONS.md` carries the
+> naming note the finding proposed, and has since gained a second one:
+> `respd` is the former name of the `respcas` crate and binary (renamed
+> 2026-08-02, `7d812da`), so documents dated before that keep the old name.
+> The `tfstor-extension` markers are still spelled that way, still on
+> purpose.
 
 - `DBSIZE` has no test, despite being one of the two commands that motivated
   promoting `BaseMetaTree::len` out of `#[cfg(test)]`. Reading the code says it
@@ -499,6 +774,11 @@ the missing rationale is worth reconstructing.
 ---
 
 ## Suggested order of work
+
+> **Historical.** Items 1 and 3 through 8 were all worked; item 2 (merging
+> to `main`) was not, and is the only entry still live. What is left of this
+> review at `62fdf27` is P1/P2 on `main`, the recurrence of H10's class, and
+> the two long functions under B2 that were never the point.
 
 1. **H1** -- confirmed panic on a default code path, and the fix is a few lines
    delegating to `read_tx().len()`. Fix in place.
