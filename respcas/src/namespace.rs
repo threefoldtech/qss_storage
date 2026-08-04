@@ -260,12 +260,17 @@ impl Namespace {
             ));
         }
 
-        let occupied = match worm_guards_key {
-            Some(key) => self.exists(key)?,
-            None => false,
-        };
-        if props.worm && occupied {
-            return Err(anyhow::anyhow!("ERR: Namespace is protected by worm mode"));
+        if props.worm {
+            // The lookup is inside the branch: an ordinary write must not pay
+            // a read to find out that the namespace it is writing to is not
+            // write-once.
+            let occupied = match worm_guards_key {
+                Some(key) => self.exists(key)?,
+                None => false,
+            };
+            if occupied {
+                return Err(anyhow::anyhow!("ERR: Namespace is protected by worm mode"));
+            }
         }
 
         Ok(())
