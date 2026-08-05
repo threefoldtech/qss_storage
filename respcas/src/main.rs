@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 use cas_storage::StoreOptions;
@@ -107,17 +107,6 @@ fn resolve(flags: Opt, config: &QssStorageConfig) -> Result<ResolvedConfig, conf
     })
 }
 
-/// Loads the config file and says where it came from, so an operator can tell
-/// from the log which file (if any) the process is actually running on.
-fn load_config(explicit: Option<&Path>) -> Result<QssStorageConfig> {
-    let (config, source) = config::load(explicit)?;
-    match source {
-        Some(path) => info!("configuration loaded from {}", path.display()),
-        None => info!("no configuration file found, using built-in defaults"),
-    }
-    Ok(config)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -125,7 +114,7 @@ async fn main() -> Result<()> {
 
     // Parse command line arguments
     let opt = Opt::parse();
-    let file = load_config(opt.config.as_deref())?;
+    let file = config::load_and_log(opt.config.as_deref())?;
     let cfg = resolve(opt, &file)?;
 
     info!("Data directory: {:?}", cfg.data_dir);
@@ -156,6 +145,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use cas_storage::{Durability, Hasher};
+    use std::path::Path;
 
     fn config(text: &str) -> QssStorageConfig {
         config::parse(text, Path::new("test.toml")).expect("test config must parse")

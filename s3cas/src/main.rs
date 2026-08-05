@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -170,17 +170,6 @@ fn resolve_server(flags: ServerConfig, config: &QssStorageConfig) -> Result<Reso
     })
 }
 
-/// Loads the config file and says where it came from, so an operator can tell
-/// from the log which file (if any) the process is actually running on.
-fn load_config(explicit: Option<&Path>) -> Result<QssStorageConfig> {
-    let (config, source) = config::load(explicit)?;
-    match source {
-        Some(path) => info!("configuration loaded from {}", path.display()),
-        None => info!("no configuration file found, using built-in defaults"),
-    }
-    Ok(config)
-}
-
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Inspect DB
@@ -241,7 +230,7 @@ fn main() -> Result<()> {
             meta_root,
             metadata_db,
         } => {
-            let file = load_config(config.as_deref())?;
+            let file = config::load_and_log(config.as_deref())?;
             let store = StoreOptions::resolve(metadata_db, None, None, None, &file.store)?;
             match command {
                 InspectCommand::NumKeys { bucket_name } => {
@@ -268,17 +257,17 @@ fn main() -> Result<()> {
             }
         }
         Command::Retrieve(args) => {
-            let file = load_config(args.config.as_deref())?;
+            let file = config::load_and_log(args.config.as_deref())?;
             let store = StoreOptions::resolve(args.metadata_db, None, None, None, &file.store)?;
             retrieve(args, store)?
         }
         Command::Check(args) => {
-            let file = load_config(args.config.as_deref())?;
+            let file = config::load_and_log(args.config.as_deref())?;
             let store = StoreOptions::resolve(args.metadata_db, None, None, None, &file.store)?;
             check_integrity(args, store)?
         }
         Command::Server(flags) => {
-            let file = load_config(flags.config.as_deref())?;
+            let file = config::load_and_log(flags.config.as_deref())?;
             let resolved = resolve_server(flags, &file)?;
             run(resolved)?;
         }
@@ -537,6 +526,7 @@ async fn run(args: ResolvedServerConfig) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use cas_storage::Hasher;
+    use std::path::Path;
 
     /// Flags with nothing set except the credentials, which the server refuses
     /// to start without.

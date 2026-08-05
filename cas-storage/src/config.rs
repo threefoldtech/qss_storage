@@ -412,6 +412,18 @@ pub fn load(explicit: Option<&Path>) -> Result<(QssStorageConfig, Option<PathBuf
     }
 }
 
+/// [`load`], plus the operator-facing provenance line: which file (if any)
+/// the process is actually running on. Every daemon logs it through here so
+/// the message stays word-identical, and greppable, across their logs.
+pub fn load_and_log(explicit: Option<&Path>) -> Result<QssStorageConfig, ConfigError> {
+    let (config, source) = load(explicit)?;
+    match source {
+        Some(path) => tracing::info!("configuration loaded from {}", path.display()),
+        None => tracing::info!("no configuration file found, using built-in defaults"),
+    }
+    Ok(config)
+}
+
 /// The search path used when `--config` was not given: working directory
 /// first, then the system-wide location.
 pub fn default_candidates() -> Vec<PathBuf> {
