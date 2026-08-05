@@ -90,8 +90,14 @@ fi
 # stopped rebuilding the binaries and a run measured a respcas three commits
 # behind. The build flag is fixed; this is the check that would have caught
 # it anyway, and will catch the next thing that does the same.
+# examples/ is pruned along with target/ and .git/: an example is its own
+# cargo target and never links into a binary, so cargo is right not to
+# relink s3cas when one changes -- and a check that demanded it would fail
+# a campaign for editing a test-harness tool. The examples are still built
+# by the driver, so one that stopped compiling fails there instead.
 newest_source=$(find "$QSSRT_REPO_ROOT" \
-    \( -name target -o -name .git -o -path '*/.claude/worktrees' \) -prune -o \
+    \( -name target -o -name .git -o -name examples \
+        -o -path '*/.claude/worktrees' \) -prune -o \
     \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -print0 2>/dev/null |
     xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -n 1)
 stale=""
