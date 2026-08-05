@@ -2,3 +2,8 @@
 /data
 .vscode
 /qss_storage.toml
+# A daemon started without --meta-root writes its store into its cwd;
+# these are that store's names, and a live database is never a commit.
+/blocks
+/db
+/store_header.bin
