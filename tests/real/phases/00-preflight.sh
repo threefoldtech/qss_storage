@@ -90,34 +90,40 @@ fi
 # stopped rebuilding the binaries and a run measured a respcas three commits
 # behind. The build flag is fixed; this is the check that would have caught
 # it anyway, and will catch the next thing that does the same.
-# examples/ is pruned along with target/ and .git/: an example is its own
-# cargo target and never links into a binary, so cargo is right not to
-# relink s3cas when one changes -- and a check that demanded it would fail
-# a campaign for editing a test-harness tool. The examples are still built
-# by the driver, so one that stopped compiling fails there instead.
-newest_source=$(find "$QSSRT_REPO_ROOT" \
-    \( -name target -o -name .git -o -name examples \
-        -o -path '*/.claude/worktrees' \) -prune -o \
-    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -print0 2>/dev/null |
-    xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -n 1)
+# Cargo is the authority on what a binary is built from, and it writes the
+# answer down: target/release/<bin>.d lists every source that went into it.
+#
+# A hand-rolled "newest .rs in the tree" rule was tried first and is wrong
+# in both directions. It called the daemons stale for an edit to a
+# test-harness example and for a `cargo add --dev`, neither of which cargo
+# relinks for -- and a rule that cries wolf on a campaign that is correctly
+# built teaches its reader to pass --no-build, which is the failure it
+# exists to prevent.
 stale=""
+unchecked=""
 for bin in s3cas respcas qss-storage-fsck; do
     [ -x "$QSSRT_BIN_DIR/$bin" ] || continue
+    dep_file="$QSSRT_BIN_DIR/$bin.d"
+    if [ ! -r "$dep_file" ]; then
+        unchecked="$unchecked $bin"
+        continue
+    fi
     built=$(stat -c %Y "$QSSRT_BIN_DIR/$bin" 2>/dev/null)
-    if [ -n "$newest_source" ] && [ "${built:-0}" -lt "${newest_source:-0}" ]; then
-        stale="$stale $bin"
+    # The dep file is make-style: "<target>: <source> <source> ...".
+    newest=$(tr ' ' '\n' <"$dep_file" | sed '/^$/d;/:$/d' |
+        xargs stat -c %Y 2>/dev/null | sort -rn | head -n 1)
+    if [ -n "$newest" ] && [ "${built:-0}" -lt "$newest" ]; then
+        stale="$stale $bin(src $(date -d "@$newest" +%H:%M:%S) > bin $(date -d "@$built" +%H:%M:%S))"
     fi
 done
-if [ -z "$newest_source" ]; then
-    check_skip "the binaries are newer than the source they are built from" \
-        "could not read source timestamps"
-elif [ -n "$stale" ]; then
-    check_fail "the binaries are newer than the source they are built from" \
-        "stale:$stale -- newest source $(date -d "@$newest_source" -Is), \
-rebuild with cargo build --release --workspace --bins --examples"
+if [ -n "$stale" ]; then
+    check_fail "each binary is newer than the sources cargo built it from" \
+        "stale:$stale -- rebuild with cargo build --release --workspace --bins --examples"
+elif [ -n "$unchecked" ]; then
+    check_skip "each binary is newer than the sources cargo built it from" \
+        "no cargo dep-info for:$unchecked"
 else
-    check_pass "the binaries are newer than the source they are built from" \
-        "newest source $(date -d "@$newest_source" -Is)"
+    check_pass "each binary is newer than the sources cargo built it from"
 fi
 
 # --- the configuration -------------------------------------------------
