@@ -6,7 +6,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use http_body_util::Full;
 use prometheus::Encoder;
-use tracing::{Level, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use cas_storage::StoreOptions;
@@ -210,10 +210,14 @@ pub enum InspectCommand {
     Header,
 }
 
+/// `RUST_LOG` decides; an unset environment keeps today's `info`, so the
+/// per-request PUT/GET lines stay unless an operator asks them away
+/// (`RUST_LOG=warn`, or `RUST_LOG=s3cas=warn` to keep dependencies out
+/// of the decision).
 fn setup_tracing() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }

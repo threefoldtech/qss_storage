@@ -30,7 +30,7 @@ dotenv = { version = "0.15" }
 openssl = { version = "0.10.81", features = ["vendored"] }
 prometheus = { version = "0.14.0", features = ["process"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 s3s = { git = "https://github.com/Nugine/s3s", rev = "2236b1c" }
 bytes = "1.12.1"
 hyper-util = { version = "0.1.20", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
