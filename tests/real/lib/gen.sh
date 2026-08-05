@@ -51,6 +51,40 @@ gen_file() {
     gen_stream "$1" "$2" >"$3"
 }
 
+# --- many files at once -------------------------------------------------
+#
+# gen_file costs about four forks -- two sha256sum, one openssl, one head --
+# which is nothing beside a 250 GiB object and everything beside a 1 KiB
+# one. Measured on the campaign rig, the terabyte phase's tiny band spent
+# 71.5 seconds per 10,000-file shard, of which ~47 was generation, at 8,283
+# forks per second with the disk 95% idle. Three million objects would have
+# been 5.8 hours of forking to store a few minutes of data.
+#
+# cas-storage/examples/qssgen.rs does a whole shard in one process at ~37,000
+# files/s -- the same bytes, which is the only reason it may be used at all:
+# the verification path re-derives content with gen_stream, so a generator
+# that differed anywhere would fail the campaign rather than speed it up.
+# The selftest compares the two.
+
+gen_have_fast() { [ -x "$QSSRT_BIN_DIR/examples/qssgen" ]; }
+
+# gen_files <manifest> -- materialises every file named in a TSV of
+# <path> <object-key> <size> lines. Falls back to the shell generator when
+# the fast one is not built, so the harness never depends on it.
+gen_files() {
+    local manifest="$1"
+    if gen_have_fast; then
+        "$QSSRT_BIN_DIR/examples/qssgen" \
+            --seed "${QSSRT_SEED:-qss-realtest}" <"$manifest" 2>/dev/null
+        return $?
+    fi
+    local dest key size
+    while IFS=$'\t' read -r dest key size; do
+        [ -n "$dest" ] || continue
+        gen_file "$key" "$size" "$dest" || return 1
+    done <"$manifest"
+}
+
 # gen_md5 <key> <size> -- the MD5 of the generated content, which is also
 # the ETag a single-part PUT of it must answer.
 gen_md5() {

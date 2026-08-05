@@ -97,6 +97,48 @@ hand=$(
 st_eq 'multipart etag is md5-of-md5s with a part count' \
     "$hand" "$(gen_multipart_etag k1 $total $part)"
 
+# --- the fast generator is the same generator --------------------------
+#
+# qssgen exists only to avoid four forks per file. The moment its bytes
+# differ from gen_stream's anywhere, it stops being an optimisation and
+# becomes corruption that passes its own write and fails verification --
+# because verification re-derives content with gen_stream. So the two are
+# compared here, across the size classes the bands actually use, including
+# the boundaries where a chunked implementation goes wrong: one byte, one
+# under and one over the 1 MiB chunk, and a size that is not a multiple of
+# the AES block.
+if gen_have_fast; then
+    gen_fast_same=1
+    for spec in "k1 1" "k1 15" "k1 1024" "k1 1048575" "k1 1048576" "k1 1048577" \
+        "mid/s0007/k000123-5242880 5242880" "tiny/s00000/k00000000 1024"; do
+        set -- $spec
+        if [ "$(gen_stream "$1" "$2" | sha256sum)" != \
+            "$("$QSSRT_BIN_DIR/examples/qssgen" --seed "$QSSRT_SEED" \
+                --stdout "$1" "$2" 2>/dev/null | sha256sum)" ]; then
+            st_no 'qssgen produces the same bytes as gen_stream' \
+                "differs at key [$1] size [$2]"
+            gen_fast_same=0
+            break
+        fi
+    done
+    [ "$gen_fast_same" = 1 ] &&
+        st_ok 'qssgen produces the same bytes as gen_stream'
+
+    # And the manifest path lands them in the right files, which is the
+    # form the bands use.
+    gen_dir=$(mktemp -d)
+    printf '%s\t%s\t%s\n' "$gen_dir/a" k1 1024 >"$gen_dir/manifest"
+    printf '%s\t%s\t%s\n' "$gen_dir/b" k2 4096 >>"$gen_dir/manifest"
+    gen_files "$gen_dir/manifest"
+    st_eq 'gen_files writes the manifest 1st file' \
+        "$(gen_stream k1 1024 | sha256sum)" "$(sha256sum <"$gen_dir/a")"
+    st_eq 'gen_files writes the manifest 2nd file' \
+        "$(gen_stream k2 4096 | sha256sum)" "$(sha256sum <"$gen_dir/b")"
+    rm -rf "$gen_dir"
+else
+    st_ok 'qssgen not built: the shell generator is the only path (skipped)'
+fi
+
 # --- the check vocabulary and the grading fold -------------------------
 
 QSSRT_RUN_DIR=$(mktemp -d)

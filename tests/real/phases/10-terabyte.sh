@@ -248,12 +248,16 @@ band_mid() {
             rm -rf "$stage"
             mkdir -p "$stage"
             n=0
+            : >"$stage.manifest"
             while [ "$n" -lt "$shard_keys" ]; do
                 size=$(mid_size_for "$shard" "$n")
                 key=$(printf 'k%06d-%s' "$n" "$size")
-                gen_file "mid/$label/$key" "$size" "$stage/$key"
+                printf '%s\t%s\t%s\n' "$stage/$key" "mid/$label/$key" "$size" \
+                    >>"$stage.manifest"
                 n=$((n + 1))
             done
+            gen_files "$stage.manifest"
+            rm -f "$stage.manifest"
             push_with_retry "mid.$label" "$stage" "mid/$label/" || {
                 rm -rf "$stage"
                 return 1
@@ -290,11 +294,15 @@ band_hundred() {
             rm -rf "$stage"
             mkdir -p "$stage"
             n=0
+            : >"$stage.manifest"
             while [ "$n" -lt "$per_shard" ] && [ $((done_keys + n)) -lt "$count" ]; do
                 key=$(printf 'k%06d' $((done_keys + n)))
-                gen_file "hundred/$label/$key" "$hundred_size" "$stage/$key"
+                printf '%s\t%s\t%s\n' "$stage/$key" "hundred/$label/$key" \
+                    "$hundred_size" >>"$stage.manifest"
                 n=$((n + 1))
             done
+            gen_files "$stage.manifest"
+            rm -f "$stage.manifest"
             push_with_retry "hundred.$label" "$stage" "hundred/$label/" || {
                 rm -rf "$stage"
                 return 1
@@ -325,11 +333,15 @@ band_tiny() {
             rm -rf "$stage"
             mkdir -p "$stage"
             n=0
+            : >"$stage.manifest"
             while [ "$n" -lt "$tiny_shard" ] && [ $((done_keys + n)) -lt "$tiny_count" ]; do
                 key=$(printf 'k%08d' $((done_keys + n)))
-                gen_file "tiny/$label/$key" "$tiny_size" "$stage/$key"
+                printf '%s\t%s\t%s\n' "$stage/$key" "tiny/$label/$key" \
+                    "$tiny_size" >>"$stage.manifest"
                 n=$((n + 1))
             done
+            gen_files "$stage.manifest"
+            rm -f "$stage.manifest"
             push_with_retry "tiny.$label" "$stage" "tiny/$label/" || {
                 rm -rf "$stage"
                 return 1
