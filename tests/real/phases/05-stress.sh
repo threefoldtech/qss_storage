@@ -100,6 +100,7 @@ stress_worker() {
 
 deadline=$(($(date +%s) + seconds))
 pids=()
+perf_begin "s3-stress"
 for w in $(seq 1 "$workers"); do
     stress_worker "$w" "$deadline" &
     pids+=($!)
@@ -110,6 +111,14 @@ total_ops=0
 for w in $(seq 1 "$workers"); do
     total_ops=$((total_ops + $(cat "$QSSRT_PHASE_DIR/ops-w$w.count" 2>/dev/null || echo 0)))
 done
+
+# The worker loop is PUT -> GET+verify -> (every third) DELETE, and the
+# counter counts loop iterations. So the bytes that crossed the wire are one
+# PUT plus one GET per iteration -- twice the object size -- and calling it
+# one would halve a number that is the point of the phase.
+perf_end "s3-stress" "$total_ops" "$((total_ops * obj_size * 2))" \
+    "$workers workers, PUT+GET+every-third-DELETE at $(qssrt_human "$obj_size")"
+
 record "stress-operations" "$total_ops"
 [ "$seconds" -gt 0 ] && record "stress-ops-per-second" $((total_ops / seconds))
 

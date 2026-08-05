@@ -192,7 +192,11 @@ set +a
 
 if [ "$QSSRT_BUILD" = 1 ]; then
     printf 'building release binaries...\n'
-    if ! (cd "$QSSRT_REPO_ROOT" && cargo build --release --workspace \
+    # --examples too: the campaign's BLAKE3 helper (cas-storage/examples/
+    # b3sum.rs) is what makes ADR 0014's client-hashed path testable, and an
+    # example that stopped compiling would otherwise be discovered as a
+    # missing binary halfway through phase 4.
+    if ! (cd "$QSSRT_REPO_ROOT" && cargo build --release --workspace --examples \
         >"$QSSRT_RUN_DIR/build.log" 2>&1); then
         printf 'cargo build --release failed; see %s\n' "$QSSRT_RUN_DIR/build.log" >&2
         exit 2
@@ -200,6 +204,15 @@ if [ "$QSSRT_BUILD" = 1 ]; then
 fi
 
 s3_setup_client
+
+# The devices every bandwidth number in this run is measured against,
+# resolved once and exported: a phase that resolved them itself could pick a
+# different answer than the phase before it, and the report would be summing
+# two different disks.
+QSSRT_PERF_DEVICES="$(perf_devices "$QSSRT_MOUNT")"
+export QSSRT_PERF_DEVICES
+perf_rig_record
+perf_sampler_start
 
 {
     printf 'run\t%s\n' "$(basename "$QSSRT_RUN_DIR")"
@@ -211,6 +224,10 @@ s3_setup_client
     printf 'scale\t%s\n' "$QSSRT_SCALE"
     printf 'seed\t%s\n' "$QSSRT_SEED"
     printf 'mount\t%s\n' "$QSSRT_MOUNT"
+    printf 'fstype\t%s\n' "$(stat -f -c %T "$QSSRT_MOUNT" 2>/dev/null)"
+    printf 'mount_options\t%s\n' \
+        "$(findmnt -no OPTIONS --target "$QSSRT_MOUNT" 2>/dev/null)"
+    printf 'perf_devices\t%s\n' "$QSSRT_PERF_DEVICES"
     printf 'store\t%s\n' "$QSSRT_STORE_ROOT"
     printf 'rail_waived\t%s\n' "${QSSRT_UNSAFE_ALLOW_ANY_PATH:-0}"
     printf 'aws\t%s\n' "$("$QSSRT_AWS" --version 2>&1 | head -n 1)"
@@ -264,8 +281,18 @@ QSSRT_PHASE_DIR="$QSSRT_RUN_DIR" \
     QSSRT_PHASE_CHECKS="$QSSRT_RUN_DIR/teardown.tsv" \
     s3d_ensure_stopped
 respcas_ensure_stopped
+perf_sampler_stop
 
+# The free space the run ends on, so the report can say what the store cost
+# on this filesystem rather than only how fast it was written.
+printf 'fs_free_bytes_end\t%s\n' "$(qssrt_free_bytes "$QSSRT_MOUNT")" \
+    >>"$QSSRT_RUN_DIR/rig.tsv"
+printf 'store_bytes_end\t%s\n' "$(qssrt_du_bytes "$QSSRT_STORE_ROOT")" \
+    >>"$QSSRT_RUN_DIR/rig.tsv"
+
+report_render "$QSSRT_RUN_DIR"
 code=$(verdict_render "$QSSRT_RUN_DIR")
 printf '\n%s\n' "$(head -n 3 "$QSSRT_RUN_DIR/verdict.md" | tail -n 1)"
 printf 'verdict: %s\n' "$QSSRT_RUN_DIR/verdict.md"
+printf 'report:  %s\n' "$QSSRT_RUN_DIR/report.md"
 exit "$code"

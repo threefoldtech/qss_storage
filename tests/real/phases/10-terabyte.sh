@@ -173,6 +173,8 @@ band_giants() {
             check_fail "giant $i uploads" "3 attempts failed"
         fi
     done
+    QSSRT_BAND_OBJECTS=$giant_count
+    QSSRT_BAND_BYTES=$((giant_count * giant_size))
     check_pass "giants band filled" \
         "$giant_count x $(qssrt_human "$giant_size"), client-driven multipart"
 }
@@ -226,6 +228,8 @@ band_mid() {
         filled=$((filled + shard_bytes))
         shard=$((shard + 1))
     done
+    QSSRT_BAND_OBJECTS=$((shard * shard_keys))
+    QSSRT_BAND_BYTES=$filled
     record "mid-band-bytes" "$(qssrt_human "$filled")"
     record "mid-band-shards" "$shard"
     check_pass "mid band filled" \
@@ -265,6 +269,8 @@ band_hundred() {
         done_keys=$((done_keys + per_shard))
         shard=$((shard + 1))
     done
+    QSSRT_BAND_OBJECTS=$count
+    QSSRT_BAND_BYTES=$((count * hundred_size))
     record "hundred-band-objects" "$count"
     check_pass "hundred band filled" "$count x $(qssrt_human "$hundred_size")"
 }
@@ -298,6 +304,8 @@ band_tiny() {
         done_keys=$((done_keys + tiny_shard))
         shard=$((shard + 1))
     done
+    QSSRT_BAND_OBJECTS=$tiny_count
+    QSSRT_BAND_BYTES=$((tiny_count * tiny_size))
     record "tiny-band-objects" "$tiny_count"
     check_pass "tiny band filled" "$tiny_count x $(qssrt_human "$tiny_size")"
 }
@@ -337,6 +345,8 @@ band_dedup() {
         done
     done
     local grew=$(($(qssrt_block_bytes "$QSSRT_S3_STORE") - before_bytes))
+    QSSRT_BAND_OBJECTS=$((count * 2))
+    QSSRT_BAND_BYTES=$((dedup_object * count * 2))
     record "dedup-band-logical" "$(qssrt_human $((dedup_total * 2)))"
     record "dedup-band-stored-growth" "$(qssrt_human "$grew")"
     # Post-0008 this is an equality claim with one block of slack, not a
@@ -353,11 +363,22 @@ band_dedup() {
 # --- the fill -----------------------------------------------------------
 
 fill_t0=$(date +%s)
-band_giants
-band_mid
-band_hundred
-band_tiny
-band_dedup
+run_band() {
+    local name="$1"
+    QSSRT_BAND_OBJECTS=0
+    QSSRT_BAND_BYTES=0
+    perf_begin "tb-$name"
+    "band_$name"
+    local rc=$?
+    perf_end "tb-$name" "$QSSRT_BAND_OBJECTS" "$QSSRT_BAND_BYTES" "terabyte band"
+    return $rc
+}
+
+run_band giants
+run_band mid
+run_band hundred
+run_band tiny
+run_band dedup
 fill_elapsed=$(($(date +%s) - fill_t0))
 record "fill-wall-seconds" "$fill_elapsed"
 record "fill-block-bytes" "$(qssrt_human "$(qssrt_block_bytes "$QSSRT_S3_STORE")")"
@@ -462,8 +483,16 @@ fsck_assert_leak_only "the at-capacity recount stays leak-class only"
 # --- the full scrub at capacity -----------------------------------------
 
 store_bytes=$(qssrt_block_bytes "$QSSRT_S3_STORE")
+store_files=$(qssrt_block_file_count "$QSSRT_S3_STORE")
 t0=$(date +%s)
+# The read pass over the whole filled store, with no daemon running: the
+# one window in the campaign where device reads should track logical bytes
+# one to one, and therefore the honest read-bandwidth number for this
+# filesystem at capacity.
+perf_begin "tb-scrub-at-capacity"
 fsck_run scrub-at-capacity --scrub
+perf_end "tb-scrub-at-capacity" "$store_files" "$store_bytes" \
+    "full scrub of the filled store, daemon stopped"
 scrub_seconds=$(($(date +%s) - t0))
 record "scrub-wall-seconds" "$scrub_seconds"
 [ "$scrub_seconds" -gt 0 ] &&

@@ -56,7 +56,17 @@ put_and_verify() {
     QSSRT_BLOCK_DELTA=0
     before=$(qssrt_block_file_count "$QSSRT_S3_STORE")
 
-    if ! s3_put_generated "$BUCKET" "$key" "$size"; then
+    # One measured window per size. These are single-object PUTs, so the
+    # object rate is not the interesting number -- the bandwidth at each
+    # size is, and so is what the device did underneath it. A 1-byte PUT
+    # and a 4 GiB PUT are the same operation to the client and completely
+    # different operations to the disk.
+    perf_begin "s3-put-$size"
+    s3_put_generated "$BUCKET" "$key" "$size"
+    local put_rc=$?
+    perf_end "s3-put-$size" 1 "$size" "single-part PUT"
+
+    if [ "$put_rc" != 0 ]; then
         check_fail "PUT $key ($size bytes)" "$(tail -c 300 "$QSSRT_LAST_OUT" 2>/dev/null)"
         return 1
     fi
@@ -207,11 +217,18 @@ while [ "$i" -lt "$keys" ]; do
     gen_stream "many/$(printf 'k%06d' "$i")" 16 >"$stage/$(printf 'k%06d' "$i")"
     i=$((i + 1))
 done
+# The small-object rate, which is the number the size sweep above cannot
+# show: $keys objects of 16 bytes each, so the cost is per object and the
+# bytes are nearly free.
+perf_begin "s3-put-many-small"
 assert_ok "upload $keys keys for the pagination corpus" \
     s3_put_dir "$stage" "$BUCKET" "many/"
+perf_end "s3-put-many-small" "$keys" "$((keys * 16))" "16-byte objects via aws s3 cp"
 rm -rf "$stage"
 
+perf_begin "s3-list-paginated"
 listed_manual=$(s3_list_v2_manual "$BUCKET" "many/" | sort -u | wc -l)
+perf_end "s3-list-paginated" "$listed_manual" 0 "hand-driven ListObjectsV2 continuation"
 listed_v2=$(s3_list_v2_paginated "$BUCKET" "many/" | sort -u | wc -l)
 listed_v1=$(s3_list_v1_paginated "$BUCKET" "many/" | sort -u | wc -l)
 listed_ls=$(s3_list_ls "$BUCKET" "many/" | sort -u | wc -l)

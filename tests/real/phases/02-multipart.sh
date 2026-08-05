@@ -43,9 +43,15 @@ key="client/multipart"
 body="$(qssrt_scratch)/mp-body"
 gen_file "$key" "$size" "$body"
 
+# The concurrent-upload number: aws-cli drives QSSRT_S3_CONCURRENCY parts
+# at once at the pinned chunk size, so this window is the closest thing the
+# campaign has to a "how fast can one client fill this store" figure.
 start=$(date +%s)
+perf_begin "s3-multipart-client"
 assert_ok "aws s3 cp uploads $(qssrt_human "$size") as client-driven multipart" \
     s3cmd cp --quiet "$body" "s3://$BUCKET/$key"
+perf_end "s3-multipart-client" 1 "$size" \
+    "$QSSRT_S3_CONCURRENCY concurrent parts of $QSSRT_MULTIPART_CHUNKSIZE"
 elapsed=$(($(date +%s) - start))
 [ "$elapsed" -gt 0 ] && record "client-multipart-MBps" $((size / elapsed / 1048576))
 rm -f "$body"

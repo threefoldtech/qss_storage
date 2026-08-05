@@ -140,6 +140,43 @@ total=$(qssrt_total_bytes "$QSSRT_STORE_ROOT")
 record "filesystem-total" "$(qssrt_human "${total:-0}")"
 record "filesystem-free" "$(qssrt_human "${free:-0}")"
 
+# --- what the numbers will have been measured on -----------------------
+#
+# Every bandwidth figure this run produces is a figure for THIS filesystem
+# with THESE options on THIS device. Recorded here as well as in rig.tsv so
+# that a verdict read on its own still says what it was measured on -- a
+# MiB/s with no mount options beside it is a number, not a measurement.
+record "fs-type" "$(stat -f -c %T "$QSSRT_MOUNT" 2>/dev/null)"
+record "fs-source" "$(findmnt -no SOURCE --target "$QSSRT_MOUNT" 2>/dev/null)"
+record "fs-mount-options" "$(findmnt -no OPTIONS --target "$QSSRT_MOUNT" 2>/dev/null)"
+record "perf-devices" "${QSSRT_PERF_DEVICES:-none}"
+
+# Discard is not decoration on a campaign that fills a terabyte: without it
+# the device's own garbage collection is measured instead of the store's,
+# and the second half of a fill reads slower than the first for reasons
+# nothing in this repository caused. Recorded, never graded -- the campaign
+# does not get to have an opinion about how the operator mounted the disk.
+mount_opts=$(findmnt -no OPTIONS --target "$QSSRT_MOUNT" 2>/dev/null)
+bch_flags=""
+for d in ${QSSRT_PERF_DEVICES:-}; do
+    [ -r "/sys/fs/bcachefs/$d/internal/flags" ] &&
+        bch_flags=$(cat "/sys/fs/bcachefs/$d/internal/flags" 2>/dev/null)
+done
+if printf '%s' "$mount_opts" | grep -q 'discard' ||
+    printf '%s' "$bch_flags" | grep -q 'discard_mount_opt_set'; then
+    check_pass "the filesystem is mounted with discard" \
+        "$(qssrt_oneline "${mount_opts}${bch_flags:+ | $bch_flags}")"
+else
+    check_find "the filesystem is mounted with discard" \
+        "no discard in [$mount_opts]; on a fill this large the device's own GC will show up in the bandwidth curve"
+fi
+
+for d in ${QSSRT_PERF_DEVICES:-}; do
+    record "device-$d-model" "$(tr -s ' ' <"/sys/block/$d/device/model" 2>/dev/null)"
+    record "device-$d-scheduler" "$(cat "/sys/block/$d/queue/scheduler" 2>/dev/null)"
+    record "device-$d-rotational" "$(cat "/sys/block/$d/queue/rotational" 2>/dev/null)"
+done
+
 # What the selected phases will write. The terabyte is its own arithmetic;
 # everything else is dominated by phase 1's single-part object and phase 2's
 # multipart, plus stress.

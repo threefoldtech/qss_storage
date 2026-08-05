@@ -40,8 +40,12 @@ export QSSRT_LIB_DIR
 . "$QSSRT_LIB_DIR/lib/fsck.sh"
 # shellcheck source=tests/real/lib/crash.sh
 . "$QSSRT_LIB_DIR/lib/crash.sh"
+# shellcheck source=tests/real/lib/perf.sh
+. "$QSSRT_LIB_DIR/lib/perf.sh"
 # shellcheck source=tests/real/lib/verdict.sh
 . "$QSSRT_LIB_DIR/lib/verdict.sh"
+# shellcheck source=tests/real/lib/report.sh
+. "$QSSRT_LIB_DIR/lib/report.sh"
 
 # --- phase lifecycle ---------------------------------------------------
 

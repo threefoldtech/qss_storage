@@ -21,7 +21,14 @@ record "store-block-bytes" "$(qssrt_human "$store_bytes")"
 record "store-block-files" "$store_files"
 
 start=$(date +%s)
+# The scrub is the campaign's only pure-read pass over everything: it opens
+# every block file and hashes it, with no daemon running and no client in
+# the way. So this window is the store's read bandwidth ceiling on this
+# filesystem, and the one place device read bytes should track logical
+# bytes almost exactly.
+perf_begin "fsck-scrub"
 fsck_run scrub --scrub
+perf_end "fsck-scrub" "$store_files" "$store_bytes" "full scrub, daemon stopped"
 elapsed=$(($(date +%s) - start))
 record "scrub-wall-seconds" "$elapsed"
 [ "$elapsed" -gt 0 ] &&
