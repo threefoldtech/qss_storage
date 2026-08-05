@@ -77,6 +77,43 @@ else
         "profile is $QSSRT_PROFILE: this measures something we do not ship"
 fi
 
+# The binaries have to be newer than the code they claim to be.
+#
+# A campaign measuring a stale binary is not a wrong campaign, it is a
+# campaign about a different program -- and every number and verdict it
+# produces is attributed to the source it was launched from. Nothing else
+# here would notice: the build step reports success, the phases pass, and
+# run.env records a git SHA the binaries were never built from.
+#
+# This exists because `cargo build --examples` REPLACES cargo's default
+# target selection instead of adding to it, so the driver's build silently
+# stopped rebuilding the binaries and a run measured a respcas three commits
+# behind. The build flag is fixed; this is the check that would have caught
+# it anyway, and will catch the next thing that does the same.
+newest_source=$(find "$QSSRT_REPO_ROOT" \
+    \( -name target -o -name .git -o -path '*/.claude/worktrees' \) -prune -o \
+    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -print0 2>/dev/null |
+    xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -n 1)
+stale=""
+for bin in s3cas respcas qss-storage-fsck; do
+    [ -x "$QSSRT_BIN_DIR/$bin" ] || continue
+    built=$(stat -c %Y "$QSSRT_BIN_DIR/$bin" 2>/dev/null)
+    if [ -n "$newest_source" ] && [ "${built:-0}" -lt "${newest_source:-0}" ]; then
+        stale="$stale $bin"
+    fi
+done
+if [ -z "$newest_source" ]; then
+    check_skip "the binaries are newer than the source they are built from" \
+        "could not read source timestamps"
+elif [ -n "$stale" ]; then
+    check_fail "the binaries are newer than the source they are built from" \
+        "stale:$stale -- newest source $(date -d "@$newest_source" -Is), \
+rebuild with cargo build --release --workspace --bins --examples"
+else
+    check_pass "the binaries are newer than the source they are built from" \
+        "newest source $(date -d "@$newest_source" -Is)"
+fi
+
 # --- the configuration -------------------------------------------------
 
 if [ -f "$QSSRT_DAEMON_CONFIG" ]; then

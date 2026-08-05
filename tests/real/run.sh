@@ -192,11 +192,16 @@ set +a
 
 if [ "$QSSRT_BUILD" = 1 ]; then
     printf 'building release binaries...\n'
-    # --examples too: the campaign's BLAKE3 helper (cas-storage/examples/
-    # b3sum.rs) is what makes ADR 0014's client-hashed path testable, and an
-    # example that stopped compiling would otherwise be discovered as a
-    # missing binary halfway through phase 4.
-    if ! (cd "$QSSRT_REPO_ROOT" && cargo build --release --workspace --examples \
+    # --bins AND --examples, both spelled out.
+    #
+    # Cargo's target-selection flags REPLACE the default selection rather
+    # than adding to it, so `--examples` alone builds the examples and not
+    # the binaries. With the binaries already present from an earlier build
+    # that is silent: the campaign starts, reports a successful build in a
+    # tenth of a second, and measures whatever binary happened to be lying
+    # in target/release -- which is how a run came to test a respcas that
+    # was three commits behind its own source. --bins puts them back.
+    if ! (cd "$QSSRT_REPO_ROOT" && cargo build --release --workspace --bins --examples \
         >"$QSSRT_RUN_DIR/build.log" 2>&1); then
         printf 'cargo build --release failed; see %s\n' "$QSSRT_RUN_DIR/build.log" >&2
         exit 2
