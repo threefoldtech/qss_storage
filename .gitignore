@@ -7,3 +7,6 @@
 /blocks
 /db
 /store_header.bin
+
+# Python bytecode from the campaign's own tools
+__pycache__/

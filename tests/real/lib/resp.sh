@@ -51,7 +51,50 @@ vk_pipe() {
 # the start of the phase script is the tripwire". Deriving it from the
 # dispatch table is the only way that tripwire can fire without a human
 # noticing first.
+#
+# The whole cmd/ tree, not cmd.rs alone. The dispatch table moved into
+# cmd/parse.rs when cmd.rs was split (831a2ec) and this function kept
+# reading the file it used to be in -- so it returned the empty string, the
+# comparison against the pinned list failed, and the phase reported a
+# surface change that had not happened while a real one (CSET, ADR 0014)
+# went uncovered underneath it. A tripwire that fires on its own absence is
+# worse than none: it trains its reader to ignore it.
 resp_surface_from_source() {
-    grep -oE '^[[:space:]]*"[A-Z]+" =>' "$QSSRT_REPO_ROOT/respcas/src/cmd.rs" |
-        tr -d ' "=>' | sort | tr '\n' ' ' | sed 's/ $//'
+    local dir="$QSSRT_REPO_ROOT/respcas/src"
+    cat "$dir/cmd.rs" "$dir"/cmd/*.rs 2>/dev/null |
+        grep -oE '^[[:space:]]*"[A-Z]+" =>' |
+        tr -d ' "=>' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
+
+# --- the binary-safe client ---------------------------------------------
+#
+# valkey-cli stays the client for everything it can express. These wrap the
+# campaign's own client for the two things it cannot: keys containing NUL
+# (ADR 0014 mode B) and many in-flight commands over stable connections.
+
+respcli() {
+    python3 "$QSSRT_REAL_DIR/tools/respcli.py" \
+        -H "$QSSRT_RESP_HOST" -p "$QSSRT_RESP_PORT" "$@"
+}
+
+# One command in a namespace, reply rendered as asked (text/raw/hex/len).
+# Arguments accept the tool's encodings: hex:..., @file, rand:N.
+resp_cmd() {
+    local ns="$1" reply="$2"
+    shift 2
+    respcli -s "$ns" cmd --reply "$reply" "$@"
+}
+
+# Same, with a namespace password.
+resp_cmd_auth() {
+    local ns="$1" pw="$2" reply="$3"
+    shift 3
+    respcli -s "$ns" -w "$pw" cmd --reply "$reply" "$@"
+}
+
+# BLAKE3-256 of a file, as hex -- the address ADR 0014 puts on the wire.
+resp_b3() { "$QSSRT_BIN_DIR/examples/b3sum" <"$1"; }
+
+# Is the hasher built? Phases degrade to SKIP rather than FAIL without it:
+# a missing dev tool is not a storage defect.
+resp_have_b3() { [ -x "$QSSRT_BIN_DIR/examples/b3sum" ]; }
