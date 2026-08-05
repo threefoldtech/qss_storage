@@ -215,16 +215,21 @@ perf_sampler_start() {
     [ -f "$QSSRT_RUN_DIR/sampler.pid" ] && return 0
     (
         printf 'epoch\tread_mib_s\twrite_mib_s\tutil_pct\tdiscard_mib_s\n'
-        local prev now
+        # No `local` here: this is a subshell, not a function, and bash
+        # refuses it -- which with stderr on /dev/null is a silent refusal.
         prev=$(perf_snapshot)
         while :; do
             sleep "$step"
             now=$(perf_snapshot)
+            # `exit`, not `next`: awk forbids next inside BEGIN, and gawk
+            # errors out on it rather than skipping. With the sampler's
+            # stderr discarded that error was invisible, so bandwidth.tsv
+            # held its header and nothing else for a whole run.
             awk -F'\t' -v a="$prev" -v b="$now" '
                 BEGIN {
                     split(a, s, "\t"); split(b, e, "\t")
                     secs = (e[1] - s[1]) / 1000000000.0
-                    if (secs <= 0) next
+                    if (secs <= 0) exit
                     printf "%d\t%.1f\t%.1f\t%.1f\t%.1f\n",
                         e[1] / 1000000000,
                         (e[2] - s[2]) * 512 / secs / 1048576,
