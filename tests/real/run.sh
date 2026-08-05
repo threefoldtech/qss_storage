@@ -265,6 +265,15 @@ for nn in $(qssrt_plan); do
     phase_dir="$QSSRT_RUN_DIR/phase-$name"
     mkdir -p "$phase_dir"
 
+    # Where this invocation's check lines begin. A phase re-run inside an
+    # existing run directory appends to the same checks file (deliberately:
+    # three crash cycles run twice read as six). But a decision about THIS
+    # invocation has to be made from this invocation's lines -- the refusal
+    # test below used to grep the whole file, so a preflight failure that
+    # had since been fixed refused every later resume, forever.
+    before=0
+    [ -f "$phase_dir/checks.tsv" ] && before=$(wc -l <"$phase_dir/checks.tsv")
+
     # stdin from /dev/null: a client tool that decides to go interactive
     # (valkey-cli with no command, aws with a prompt) would otherwise block
     # the whole campaign on a terminal read that never comes.
@@ -272,17 +281,19 @@ for nn in $(qssrt_plan); do
     rc=$?
     tail -n 3 "$phase_dir/log"
 
+    # This invocation's check lines, and only those.
+    this_run=$(tail -n "+$((before + 1))" "$phase_dir/checks.tsv" 2>/dev/null)
+
     # A phase that died without recording a failure gets one: an exit code
     # nobody wrote down is exactly the kind of silence this campaign exists
     # to remove.
-    if [ "$rc" -gt 1 ] &&
-        ! grep -q '^FAIL'$'\t' "$phase_dir/checks.tsv" 2>/dev/null; then
+    if [ "$rc" -gt 1 ] && ! printf '%s\n' "$this_run" | grep -q '^FAIL'$'\t'; then
         printf 'FAIL\tphase %s exited %s without recording a failure\tsee %s/log\n' \
             "$name" "$rc" "$phase_dir" >>"$phase_dir/checks.tsv"
     fi
 
-    # Preflight is the rail. If it refused, nothing after it should run.
-    if [ "$nn" = "00" ] && grep -q '^FAIL'$'\t' "$phase_dir/checks.tsv" 2>/dev/null; then
+    # Preflight is the rail. If it refused THIS TIME, nothing after it runs.
+    if [ "$nn" = "00" ] && printf '%s\n' "$this_run" | grep -q '^FAIL'$'\t'; then
         printf 'preflight refused; stopping\n'
         break
     fi
