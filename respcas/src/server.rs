@@ -297,6 +297,10 @@ impl Session {
             Ok(namespace_obj) => {
                 let is_authenticated =
                     self.namespace_password_accepted(&namespace, password.as_deref());
+                // Read before the namespace is handed to the handler: the
+                // reply below is a promise about what this session may do,
+                // and `public` is half of the answer.
+                let is_public = namespace_obj.is_public();
 
                 // Replace the handler with one bound to the new namespace
                 let mut new_handler = CommandHandler::new(
@@ -308,11 +312,27 @@ impl Session {
                 new_handler.set_namespace_authenticated(is_authenticated);
                 self.handler = new_handler;
 
-                if is_authenticated {
-                    Frame::SimpleString("OK".into())
-                } else {
-                    // Access is still granted, but writes will be refused
-                    Frame::SimpleString("OK (read-only access)".into())
+                // SELECT reports what it granted. It grants the session
+                // either way -- refusing here would leave the connection
+                // switched to a namespace it was told it could not have --
+                // but it has to name the access honestly, and there are
+                // three outcomes, not two:
+                //
+                //   authenticated            read and write
+                //   public, no password      read only  (`may_read` is
+                //                            `public || authenticated`)
+                //   private, no password     neither
+                //
+                // The third used to answer "OK (read-only access)" as well,
+                // which promised a read the very next GET refused. A client
+                // that believed it reported a working read-only connection
+                // and then failed on first use.
+                match (is_authenticated, is_public) {
+                    (true, _) => Frame::SimpleString("OK".into()),
+                    (false, true) => Frame::SimpleString("OK (read-only access)".into()),
+                    (false, false) => {
+                        Frame::SimpleString("OK (no access without the namespace password)".into())
+                    }
                 }
             }
             Err(e) => {

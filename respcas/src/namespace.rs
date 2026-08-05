@@ -250,6 +250,18 @@ impl Namespace {
         self.properties.read().unwrap().key_mode
     }
 
+    /// Whether reads are open to a connection that has not given the
+    /// namespace password.
+    ///
+    /// The two protections are independent and guard different verbs: the
+    /// password guards writing, `public` guards reading. So an
+    /// unauthenticated connection to a public namespace reads and cannot
+    /// write, and to a private one can do neither -- which is what SELECT
+    /// has to be able to say.
+    pub(crate) fn is_public(&self) -> bool {
+        self.properties.read().unwrap().public
+    }
+
     /// Most logical bytes this namespace may hold, or `None` if nothing
     /// bounds it -- which is the default, and the reason every caller of this
     /// asks BEFORE it goes looking for the numbers a quota is checked with.

@@ -22,8 +22,10 @@ fn a_private_namespace_refuses_reads_until_the_password_is_given() {
     let mut client = server.connect();
     assert_eq!(
         select(&mut client, "private"),
-        "OK (read-only access)",
-        "SELECT reports what it granted rather than refusing"
+        "OK (no access without the namespace password)",
+        "SELECT reports what it granted rather than refusing -- and on a \
+         private namespace it granted nothing, so it must not answer \
+         read-only and be refuted by the next GET"
     );
 
     let err = redis::cmd("GET")
@@ -66,7 +68,7 @@ fn a_private_namespace_refuses_reads_until_the_password_is_given() {
     let mut wrong = server.connect();
     assert_eq!(
         select_with(&mut wrong, "private", "not-the-password"),
-        "OK (read-only access)"
+        "OK (no access without the namespace password)"
     );
     assert!(
         redis::cmd("GET")

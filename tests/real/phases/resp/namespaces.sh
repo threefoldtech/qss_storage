@@ -96,32 +96,32 @@ else
     check_find "NSINFO reports the password is set" "$(qssrt_oneline "$prot_info")"
 fi
 
-# What a password actually gates here is WRITING, not entering.
+# What a password gates here is WRITING; what `public` gates is READING.
 #
-# server.rs answers an unauthenticated SELECT of a private namespace with
-# "OK (read-only access)" and refuses writes on that connection afterwards.
-# So the assertion is not that SELECT is refused -- it is not, by design --
-# but that the degraded session is genuinely read-only. Asserting the
-# refusal at SELECT would have been asserting a design this daemon does not
-# have, and would have passed only if someone changed it.
+# SELECT grants the session either way rather than refusing, and reports
+# what it granted -- which on a private namespace is nothing. It used to
+# answer "read-only access" there too, promising a read the very next GET
+# refused; the campaign caught that and it is fixed, so the assertion is now
+# that the greeting and the enforcement agree.
 no_pw=$(printf 'SELECT %s\n' "$prot_ns" | vk 2>&1)
 record "select-private-no-password" "$(qssrt_oneline "$no_pw")"
-if printf '%s' "$no_pw" | grep -qi 'read-only'; then
-    check_pass "SELECT of a private namespace without a password is read-only" \
+if printf '%s' "$no_pw" | grep -qi 'no access'; then
+    check_pass "SELECT of a private namespace without a password grants nothing, and says so" \
         "$(qssrt_oneline "$no_pw")"
+elif printf '%s' "$no_pw" | grep -qi 'read-only'; then
+    check_fail "SELECT of a private namespace without a password grants nothing, and says so" \
+        "answered read-only, but a private namespace refuses reads too: $(qssrt_oneline "$no_pw")"
 else
-    check_fail "SELECT of a private namespace without a password is read-only" \
+    check_fail "SELECT of a private namespace without a password grants nothing, and says so" \
         "$(qssrt_oneline "$no_pw")"
 fi
 
 bad_pw=$(printf 'SELECT %s wrong-password\n' "$prot_ns" | vk 2>&1)
 record "select-private-wrong-password" "$(qssrt_oneline "$bad_pw")"
-if printf '%s' "$bad_pw" | grep -qi 'read-only'; then
-    check_pass "SELECT with the wrong password is read-only, not authenticated" \
-        "$(qssrt_oneline "$bad_pw")"
+if printf '%s' "$bad_pw" | grep -qi 'no access'; then
+    check_pass "a wrong password is the same as no password" "$(qssrt_oneline "$bad_pw")"
 else
-    check_fail "SELECT with the wrong password is read-only, not authenticated" \
-        "$(qssrt_oneline "$bad_pw")"
+    check_fail "a wrong password is the same as no password" "$(qssrt_oneline "$bad_pw")"
 fi
 
 # The authenticated session first, so there is something to read.
@@ -163,14 +163,14 @@ else
         "the read was served: $(qssrt_oneline "$ro_read")"
 fi
 
-# SELECT still greets that session with "OK (read-only access)" even though
-# it has no read access either. The enforcement is right and nothing leaks;
-# the reply is what is wrong, and a client that believes it will report a
-# working read-only connection that errors on the first GET.
-if printf '%s' "$no_pw" | grep -qi 'read-only' &&
-    printf '%s' "$ro_read" | grep -qi 'authentication required for read'; then
-    check_find "SELECT calls a private namespace 'read-only access' but denies reads too" \
-        "reply was [$(qssrt_oneline "$no_pw")], the GET after it was [$(qssrt_oneline "$ro_read")]"
+# The greeting and the enforcement have to agree. This is the regression
+# guard for the finding this phase raised on its first real run: a SELECT
+# that says "read-only access" on a namespace whose next GET is refused.
+if printf '%s' "$no_pw" | grep -qi 'read-only'; then
+    check_fail "SELECT's greeting agrees with what the next command is allowed to do" \
+        "greeting [$(qssrt_oneline "$no_pw")] promises reads, the GET answered [$(qssrt_oneline "$ro_read")]"
+else
+    check_pass "SELECT's greeting agrees with what the next command is allowed to do"
 fi
 
 assert_eq "the value an unauthenticated write tried to replace is intact" \
