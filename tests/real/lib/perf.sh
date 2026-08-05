@@ -212,7 +212,19 @@ _perf_slug() {
 # the middle of a fill that an average hides.
 perf_sampler_start() {
     local out="${QSSRT_RUN_DIR:?}/bandwidth.tsv" step="${QSSRT_PERF_SAMPLE:-10}"
-    [ -f "$QSSRT_RUN_DIR/sampler.pid" ] && return 0
+    # A pid FILE is not a running sampler. Continuing a campaign into an
+    # existing run directory finds the previous invocation's file, whose
+    # process died with that invocation -- and taking the file as proof left
+    # the rest of the run with no curve at all, which reads as an idle disk
+    # rather than as a missing measurement.
+    local prev
+    if [ -f "$QSSRT_RUN_DIR/sampler.pid" ]; then
+        prev=$(cat "$QSSRT_RUN_DIR/sampler.pid" 2>/dev/null)
+        if [ -n "$prev" ] && kill -0 "$prev" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$QSSRT_RUN_DIR/sampler.pid"
+    fi
     (
         printf 'epoch\tread_mib_s\twrite_mib_s\tutil_pct\tdiscard_mib_s\n'
         # No `local` here: this is a subshell, not a function, and bash
