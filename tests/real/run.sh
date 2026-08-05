@@ -179,7 +179,14 @@ qssrt_phase_script() {
 
 # --- the run -----------------------------------------------------------
 
-QSSRT_RUN_DIR="$QSSRT_RESULTS_ROOT/$(date +%Y%m%dT%H%M%S)"
+# A new directory per run, unless the caller names one.
+#
+# The override is for continuing a campaign that was interrupted, or whose
+# remaining phases are being re-run against the same store: pointing at the
+# existing directory keeps one verdict and one report covering the whole
+# campaign, instead of splitting it across two run directories that each
+# describe half of it and neither of which is the answer.
+QSSRT_RUN_DIR="${QSSRT_RUN_DIR:-$QSSRT_RESULTS_ROOT/$(date +%Y%m%dT%H%M%S)}"
 mkdir -p "$QSSRT_RUN_DIR/daemon"
 export QSSRT_RUN_DIR
 

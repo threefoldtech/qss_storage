@@ -403,10 +403,29 @@ run_band() {
     local name="$1"
     QSSRT_BAND_OBJECTS=0
     QSSRT_BAND_BYTES=0
+
+    # A band that resumes entirely from checkpoints writes nothing, and a
+    # perf row for it would divide a band's worth of bytes by the fraction
+    # of a second it took to notice they were already there. That is how a
+    # fill came to report 228,480,036 MiB/s. Stamps created during the band
+    # are the test -- cheap, and exactly the question being asked.
+    local stamps_before stamps_after
+    stamps_before=$(find "$CK" -name "$name.*.done" 2>/dev/null | wc -l)
+
     perf_begin "tb-$name"
     "band_$name"
     local rc=$?
-    perf_end "tb-$name" "$QSSRT_BAND_OBJECTS" "$QSSRT_BAND_BYTES" "terabyte band"
+
+    stamps_after=$(find "$CK" -name "$name.*.done" 2>/dev/null | wc -l)
+    if [ "$stamps_after" -gt "$stamps_before" ]; then
+        perf_end "tb-$name" "$QSSRT_BAND_OBJECTS" "$QSSRT_BAND_BYTES" \
+            "terabyte band, $((stamps_after - stamps_before)) shard(s) written here"
+    else
+        # Close the window without recording it: the measurement would be
+        # about a previous run's disk.
+        perf_end "tb-$name" 0 0 "resumed from checkpoints, wrote nothing"
+        log "band $name resumed entirely from checkpoints: no rate recorded"
+    fi
     return $rc
 }
 
