@@ -96,6 +96,14 @@ impl NamespaceCache {
             "Creating new namespace object for existing namespace: {}",
             name
         );
+        Ok(self.insert_new(name, tree))
+    }
+
+    /// Wrap a freshly opened tree as a cached `Namespace`: default
+    /// properties, synced from stored metadata, published under the write
+    /// lock. The open-existing and create paths must do these steps
+    /// identically -- this is the single place they happen.
+    fn insert_new(&self, name: String, tree: Arc<dyn MetaTreeExt + Send + Sync>) -> Arc<Namespace> {
         let props = NamespaceProperties {
             namespace_name: name.clone(),
             ..Default::default()
@@ -117,7 +125,7 @@ impl NamespaceCache {
             namespaces.insert(name, namespace.clone());
         }
 
-        Ok(namespace)
+        namespace
     }
 
     /// Update all instances of a namespace in the cache
@@ -158,28 +166,7 @@ impl NamespaceCache {
                     }
                     Err(e) => return Err(e),
                 };
-                let props = NamespaceProperties {
-                    namespace_name: name.clone(),
-                    ..Default::default()
-                };
-                let namespace = Arc::new(Namespace {
-                    tree: RwLock::new(tree),
-                    properties: RwLock::new(props),
-                    cas: self.storage.cas().clone(),
-                });
-
-                // Sync properties with metadata
-                if let Ok(meta) = self.storage.get_namespace_meta(&name) {
-                    namespace.sync_properties_from_meta(&meta);
-                }
-
-                // Store in cache
-                {
-                    let mut namespaces = self.namespaces.write().unwrap();
-                    namespaces.insert(name, namespace.clone());
-                }
-
-                Ok(namespace)
+                Ok(self.insert_new(name, tree))
             }
         }
     }
