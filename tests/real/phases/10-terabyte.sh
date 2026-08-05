@@ -60,13 +60,49 @@ s3_ensure_bucket "$BUCKET"
 
 # --- checkpoints --------------------------------------------------------
 
-CK="$QSSRT_RESULTS_ROOT/tb-checkpoint/${QSSRT_SEED}-scale${QSSRT_SCALE:-1}"
+# A checkpoint says "this shard is already in the store". That claim is only
+# ever true of ONE store, so the checkpoint set is keyed by the store's own
+# identity -- the 32-byte header the store writes when it is created, which
+# is fresh for every store (ADR 0012's pairing identity).
+#
+# It used to be keyed by seed and scale alone, under the results root, where
+# --fresh does not reach: --fresh wipes the store's directories, and the
+# stamps from the previous store survived to describe data that no longer
+# existed. The next run then skipped every band it had a stamp for and
+# reported each one "filled" against an empty disk -- a terabyte verdict on
+# 30 GB, with no failure anywhere to notice it by. Caught on 2026-08-05 by
+# 237 stamps dated 2026-08-01.
+#
+# Keyed this way a wiped store cannot inherit them, however it was wiped:
+# by --fresh, by hand, or by a mkfs.
+ck_store_identity() {
+    local header="$QSSRT_S3_STORE/store_header.bin"
+    if [ -r "$header" ]; then
+        sha256sum "$header" | cut -c1-16
+    else
+        # No header means no store to have written anything, so no
+        # checkpoint could describe it. A name nothing else uses.
+        printf 'nostore'
+    fi
+}
+
+CK="$QSSRT_RESULTS_ROOT/tb-checkpoint/${QSSRT_SEED}-scale${QSSRT_SCALE:-1}-$(ck_store_identity)"
 mkdir -p "$CK"
 ck_done() { [ -f "$CK/$1.done" ]; }
 ck_stamp() { : >"$CK/$1.done"; }
+record "tb-checkpoint-set" "$(basename "$CK")"
 resumed=$(find "$CK" -name '*.done' 2>/dev/null | wc -l)
 [ "$resumed" -gt 0 ] &&
     record "tb-resumed-with-checkpoints" "$resumed"
+
+# A resumed run is a legitimate thing; a resumed run that resumes EVERYTHING
+# is not, because then the fill wrote nothing and the bands' pass lines are
+# about a previous run's disk. Said out loud rather than left for the reader
+# of a suspiciously fast phase.
+if [ "$resumed" -gt 0 ]; then
+    check_skip "the fill starts from an empty store" \
+        "$resumed checkpoints from an earlier run against this same store are being resumed"
+fi
 
 # --- the kill watcher ---------------------------------------------------
 

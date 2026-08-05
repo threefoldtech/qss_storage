@@ -193,4 +193,20 @@ rail_fresh() {
     done
     mkdir -p "$root"
     check_pass "--fresh: store wiped" "$root"
+
+    # The terabyte phase's checkpoints describe shards that are in the store
+    # that was just deleted. Phase 10 keys its checkpoint set by the store's
+    # identity so it cannot pick these up anyway; removing them here keeps
+    # the results root from accumulating a directory per wiped store, and
+    # keeps the two mechanisms from disagreeing about what --fresh means.
+    local ckroot="$QSSRT_RESULTS_ROOT/tb-checkpoint"
+    if [ -d "$ckroot" ]; then
+        local stamps
+        stamps=$(find "$ckroot" -name '*.done' 2>/dev/null | wc -l)
+        rm -rf "${ckroot:?}"
+        [ "${stamps:-0}" -gt 0 ] &&
+            check_pass "--fresh: terabyte checkpoints cleared" \
+                "$stamps stamp(s) described the store that was just wiped"
+    fi
+    return 0
 }
