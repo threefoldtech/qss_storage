@@ -173,6 +173,67 @@ async fn two_members_of_one_group_over_one_new_block_insert_once_and_bump_once()
     assert_eq!(stats.degraded, 0, "nothing here should have failed");
 }
 
+/// The plant gate: counts stagings so a poison plant can wait for
+/// every member's dedup pre-read, and holds the committer's renames
+/// until the poison is in place. Ordering by cause, not by clock --
+/// the 100ms sleep this replaced lost to a starved scheduler about
+/// once in twenty loaded suite runs: the poisoned member's pre-read
+/// slid past the plant, the PUT died before the station, and there
+/// was no group left to degrade (126/900 replay scenarios under
+/// 6-way starvation, every one on the pre-read path).
+#[derive(Debug)]
+struct PlantGateOps {
+    real: RealDiskOps,
+    staged: AtomicUsize,
+    armed: AtomicBool,
+    released: AtomicBool,
+}
+
+impl PlantGateOps {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            real: RealDiskOps,
+            staged: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        })
+    }
+}
+
+impl BlockDiskOps for PlantGateOps {
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.real.create_dir_all(path)
+    }
+    fn write_new_file(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        self.real.write_new_file(path, contents)?;
+        self.staged.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn fsync_file(&self, path: &Path, data_only: bool) -> io::Result<()> {
+        self.real.fsync_file(path, data_only)
+    }
+    fn fsync_dir(&self, path: &Path) -> io::Result<()> {
+        self.real.fsync_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // The store-id marker rename at creation passes; only renames
+        // after arming (the members' landings) wait for the plant.
+        while self.armed.load(Ordering::SeqCst) && !self.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.real.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.real.remove_file(path)
+    }
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        self.real.list_dir(path)
+    }
+    fn device_of(&self, path: &Path) -> io::Result<Option<u64>> {
+        self.real.device_of(path)
+    }
+}
+
 /// One poisoned member fails; every stranger in its group acks.
 ///
 /// The poison is a block record that will not decode, planted while
@@ -186,11 +247,13 @@ async fn a_poisoned_member_fails_alone_and_its_group_acks() {
     const STRANGERS: usize = 3;
 
     let dir = tempdir().unwrap();
-    let (shared, fs) = windowed_store(dir.path(), Some(64), None);
+    let gate = PlantGateOps::new();
+    let (shared, fs) = windowed_store(dir.path(), Some(64), Some(gate.clone()));
 
     let poisoned_content = distinct_blocks("poisoned", 1);
     let poisoned_id = shared.hasher().hash(&poisoned_content);
 
+    gate.armed.store(true, Ordering::SeqCst);
     let mut handles = Vec::new();
     handles.push({
         let fs = fs.clone();
@@ -204,17 +267,23 @@ async fn a_poisoned_member_fails_alone_and_its_group_acks() {
         }));
     }
 
-    // Every member has staged, synced and queued by now, and the
-    // committer is waiting out its window. Garbage where the poisoned
-    // member's block record belongs: its `bump_block_rc` cannot
-    // decode it, which fails the transaction the whole group shares.
-    tokio::time::sleep(WINDOW / 5).await;
+    // The plant must land after every member's dedup pre-read and
+    // before any group's transaction. Both edges are causal: a member
+    // that has staged is past its pre-read, and a committer that
+    // cannot rename cannot have reached its transaction. Garbage
+    // where the poisoned member's block record belongs: its
+    // `bump_block_rc` cannot decode it, which fails the transaction
+    // the whole group shares.
+    while gate.staged.load(Ordering::SeqCst) < STRANGERS + 1 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     shared
         .meta_store()
         .get_tree(crate::metastore::DEFAULT_BLOCK_TREE)
         .unwrap()
         .insert(poisoned_id.as_slice(), vec![0xffu8; 3])
         .unwrap();
+    gate.released.store(true, Ordering::SeqCst);
 
     let mut results = Vec::new();
     for handle in handles {
