@@ -87,17 +87,24 @@ s3_put_generated() {
 
 # The object's bytes on stdout, streamed through a FIFO.
 #
-# The obvious spellings are both wrong. `s3api get-object <outfile>` writes
-# its JSON summary to stdout as well as the body to the file, so "outfile =
-# /dev/stdout" corrupts the stream. And the high-level `aws s3 cp s3://... -`
-# switches to RANGED downloads above multipart_threshold -- which this
-# server does not implement correctly, so every large object would come back
-# empty and every byte-comparison in the campaign would fail for a reason
-# that has nothing to do with what it is testing.
+# The obvious spelling is wrong: `s3api get-object <outfile>` writes its
+# JSON summary to stdout as well as the body to the file, so "outfile =
+# /dev/stdout" corrupts the stream.
 #
-# So: one unranged GET, body into a FIFO, JSON to /dev/null. The ranged
-# download path is not swept under the carpet -- it gets its own explicit
-# checks in phase 1, which is where a finding about it belongs.
+# The other spelling, `aws s3 cp s3://... -`, switches to RANGED downloads
+# above multipart_threshold. When this file was written that was unusable --
+# ranged GET was broken and every large object came back empty -- but
+# 116d5e4 fixed it eighty minutes later the same night, and both forms of
+# the ranged download have been verified correct since.
+#
+# It is still not what this reader uses, for a reason that outlives the bug.
+# The ranged path is what phase 1 GRADES. A reader built on it would turn
+# any future ranged regression into a byte-comparison failure in every phase
+# at once -- every object in the campaign apparently corrupt, with nothing
+# saying where the fault is.
+#
+# So: one unranged GET, body into a FIFO, JSON to /dev/null. Phase 1 checks
+# the ranged path explicitly, which is where a finding about it belongs.
 s3_get_stream() {
     local bucket="$1" key="$2" fifo status
     # BASHPID, not $$: $$ is the MAIN shell's pid even inside a subshell,
