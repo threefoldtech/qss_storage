@@ -1,0 +1,15 @@
+[package]
+name = "respload"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "RESP2 load generator and binary-safe client, for respcas and any other RESP2 server"
+
+[[bin]]
+name = "respload"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
