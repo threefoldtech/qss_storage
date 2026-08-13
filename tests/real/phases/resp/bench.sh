@@ -54,7 +54,10 @@ resp_bench() {
     errors=$(awk -F'\t' 'NR==2{print $7}' "$out")
     p50=$(awk -F'\t' 'NR==2{print $8}' "$out")
     p99=$(awk -F'\t' 'NR==2{print $10}' "$out")
-    first_error=$(awk -F'\t' 'NR==2{print $14}' "$out")
+    # Column 15, not 14: the driver's row ends misses<TAB>first_error, and
+    # reading 14 put the miss count where the error text belongs -- so a leg
+    # that failed reported "0" as its reason.
+    first_error=$(awk -F'\t' 'NR==2{print $15}' "$out")
 
     perf_end "$label" "$ops" "$bytes" \
         "$conns conns, pipeline $depth, $(qssrt_human "$size") values"
